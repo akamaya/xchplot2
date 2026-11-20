@@ -111,7 +111,7 @@ cmake -S "$root/llvm/llvm" -B "$root/build" -G Ninja `
     "-DCMAKE_PREFIX_PATH=$root/level-zero-install" `
     -DLLVM_TOOL_BUGPOINT_BUILD=OFF -DOPENMP_ENABLE_LIBOMPTARGET=OFF `
     -DLLVM_INCLUDE_TESTS=OFF
-$jobs = if ($arm64) { 4 } else { 2 }
+$jobs = 24
 cmake --build "$root/build" --target install --parallel $jobs
 python ci/release/check-cuda-ptx.py $acpp "$prefix/bin/clang++.exe" `
     "$prefix/bin/llc.exe" "$env:CUDA_PATH/bin/nvcc.exe" "$env:CUDA_PATH/bin/ptxas.exe"

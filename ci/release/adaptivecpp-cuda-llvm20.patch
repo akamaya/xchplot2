@@ -23,7 +23,7 @@ and upstream's upward rounding can select a target newer than the GPU.
 +       // ponytail: LLVM 20 targets; refresh when the release compiler changes.
 +       {100, 86},
 +       {120, 87}};
-
+ 
    if(sm_version < sm_min_ptx_version.front()[0]) {
      ptx_target = sm_version;
 @@ -90,11 +84,11 @@

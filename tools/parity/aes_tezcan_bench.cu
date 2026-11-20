@@ -174,7 +174,7 @@ int main(int argc, char** argv)
     if (argc > 1) n_states = std::strtoull(argv[1], nullptr, 10);
     n_states = (n_states + 31) & ~uint64_t(31);
     uint64_t n_batches = n_states / 32;
-    int rounds = pos2gpu::kAesPairingRounds;
+    int rounds = argc > 2 ? std::atoi(argv[2]) : pos2gpu::kAesPairingRounds;
 
     std::printf("aes_tezcan_bench  n_states=%llu  rounds/hash=%d (=%d AES rounds/hash)\n",
                 (unsigned long long)n_states, rounds, rounds * 2);
@@ -263,3 +263,4 @@ int main(int argc, char** argv)
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     return 0;
 }
+

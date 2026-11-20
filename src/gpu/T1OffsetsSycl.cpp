@@ -195,16 +195,18 @@ static void launch_t1_match_diag_probe(
     if (!sampled_groups || !n_buckets) return;
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> sT_local{sycl::range<1>{16 * 256}, h};
+        sycl::local_accessor<sycl::vec<uint32_t, 4>, 1> sT_local{
+            sycl::range<1>{1024}, h};
         h.parallel_for(
             sycl::nd_range<2>{sycl::range<2>{n_buckets, sampled_groups * threads},
                               sycl::range<2>{1, threads}},
             [=, keys_copy = keys](sycl::nd_item<2> it) {
-                uint32_t* sT = &sT_local[0];
+                uint32_t* sT = reinterpret_cast<uint32_t*>(&sT_local[0]);
                 uint32_t local_id = uint32_t(it.get_local_id(1));
+                // V4INIT: 16x replicated T0, 128-bit stores.
                 #pragma unroll 1
-                for (uint32_t i = local_id; i < 16 * 256; i += uint32_t(threads)) {
-                    sT[i] = d_aes_tables[i / 16];
+                for (uint32_t j = local_id; j < 1024; j += uint32_t(threads)) {
+                    sT_local[j] = sycl::vec<uint32_t, 4>(d_aes_tables[j / 4]);
                 }
                 it.barrier(sycl::access::fence_space::local_space);
                 sT += (local_id & 15u);
@@ -327,8 +329,8 @@ static void launch_t1_match_all_buckets_compact(
     auto const production_start = std::chrono::steady_clock::now();
 
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> sT_local{
-            sycl::range<1>{16 * 256}, h};
+        sycl::local_accessor<sycl::vec<uint32_t, 4>, 1> sT_local{
+            sycl::range<1>{1024}, h};
         // Up to 512 pairs in each 256-lane group. Larger groups use the
         // original divergent pairing loop; no candidate is dropped.
         constexpr uint32_t pair_cap = 512;
@@ -344,11 +346,12 @@ static void launch_t1_match_all_buckets_compact(
             },
             [=, keys_copy = keys](sycl::nd_item<2> it) {
                 // Cooperative load of AES T-tables into local memory.
-                uint32_t* sT = &sT_local[0];
+                uint32_t* sT = reinterpret_cast<uint32_t*>(&sT_local[0]);
                 size_t local_id = it.get_local_id(1);
+                // V4INIT: 16x replicated T0, 128-bit stores.
                 #pragma unroll 1
-                for (size_t i = local_id; i < 16 * 256; i += threads) {
-                    sT[i] = d_aes_tables[i / 16];
+                for (size_t j = local_id; j < 1024; j += threads) {
+                    sT_local[j] = sycl::vec<uint32_t, 4>(d_aes_tables[j / 4]);
                 }
                 it.barrier(sycl::access::fence_space::local_space);
                 sT += (local_id & 15);
@@ -560,8 +563,8 @@ void launch_t1_match_all_buckets(
         reinterpret_cast<unsigned long long*>(d_out_count);
 
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> sT_local{
-            sycl::range<1>{16 * 256}, h};
+        sycl::local_accessor<sycl::vec<uint32_t, 4>, 1> sT_local{
+            sycl::range<1>{1024}, h};
 
         h.parallel_for(
             sycl::nd_range<2>{
@@ -571,11 +574,12 @@ void launch_t1_match_all_buckets(
             },
             [=, keys_copy = keys](sycl::nd_item<2> it) {
                 // Cooperative load of AES T-tables into local memory.
-                uint32_t* sT = &sT_local[0];
+                uint32_t* sT = reinterpret_cast<uint32_t*>(&sT_local[0]);
                 size_t local_id = it.get_local_id(1);
+                // V4INIT: 16x replicated T0, 128-bit stores.
                 #pragma unroll 1
-                for (size_t i = local_id; i < 16 * 256; i += threads) {
-                    sT[i] = d_aes_tables[i / 16];
+                for (size_t j = local_id; j < 1024; j += threads) {
+                    sT_local[j] = sycl::vec<uint32_t, 4>(d_aes_tables[j / 4]);
                 }
                 it.barrier(sycl::access::fence_space::local_space);
                 sT += (local_id & 15);

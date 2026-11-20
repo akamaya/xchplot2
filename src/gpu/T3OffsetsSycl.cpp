@@ -25,7 +25,7 @@
 
 namespace pos2gpu {
 
-// Experimental T3 Tezcan AES. 16 equivalent T0 copies are interleaved in
+// Experimental T3 Tezcan AES. 32 equivalent T0 copies are interleaved in
 // work-group local memory; distinct local lanes use different bank replicas.
 static inline AesState t3c_tezcan_round(
     AesState s, const AesState& key, const uint32_t* t, uint32_t bank)
@@ -797,9 +797,9 @@ static void launch_t3_match_all_buckets_compact(
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> sT_local{
             sycl::range<1>{16 * 256}, h};
-        // At most 512 candidate pairs. Local memory: 16 KiB AES +
-        // 8 KiB pair metadata + 4 KiB xbits + a counter.
-        constexpr uint32_t pair_cap = 512;
+        // At most 300 candidate pairs. Local memory: 32 KiB AES +
+        // ~4.7 KiB pair metadata + ~2.3 KiB xbits + a counter.
+        constexpr uint32_t pair_cap = 330;
         sycl::local_accessor<uint64_t, 1> pairs_l{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint64_t, 1> pairs_r{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint32_t, 1> pairs_xl{sycl::range<1>{pair_cap}, h};
@@ -1200,9 +1200,9 @@ static void launch_t3_match_section_pair_compact(
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> sT_local{
             sycl::range<1>{16 * 256}, h};
-        // At most 512 candidate pairs. Local memory: 16 KiB AES +
-        // 8 KiB pair metadata + 4 KiB xbits + a counter.
-        constexpr uint32_t pair_cap = 512;
+        // At most 300 candidate pairs. Local memory: 32 KiB AES +
+        // ~4.7 KiB pair metadata + ~2.3 KiB xbits + a counter.
+        constexpr uint32_t pair_cap = 330;
         sycl::local_accessor<uint64_t, 1> pairs_l{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint64_t, 1> pairs_r{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint32_t, 1> pairs_xl{sycl::range<1>{pair_cap}, h};
@@ -1517,9 +1517,9 @@ static void launch_t3_match_section_pair_split_compact(
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> sT_local{
             sycl::range<1>{16 * 256}, h};
-        // At most 512 candidate pairs. Local memory: 16 KiB AES +
-        // 8 KiB pair metadata + 4 KiB xbits + a counter.
-        constexpr uint32_t pair_cap = 512;
+        // At most 300 candidate pairs. Local memory: 32 KiB AES +
+        // ~4.7 KiB pair metadata + ~2.3 KiB xbits + a counter.
+        constexpr uint32_t pair_cap = 330;
         sycl::local_accessor<uint64_t, 1> pairs_l{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint64_t, 1> pairs_r{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint32_t, 1> pairs_xl{sycl::range<1>{pair_cap}, h};

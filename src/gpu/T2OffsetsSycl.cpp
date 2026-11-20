@@ -606,7 +606,7 @@ static void launch_t2_match_all_buckets_compact(
         sycl::local_accessor<uint32_t, 1> sT_local{
             sycl::range<1>{16 * 256}, h};
         // 512 candidate pairs of 2x u64 = 8 KiB plus 16 KiB AES table.
-        constexpr uint32_t pair_cap = 512;
+        constexpr uint32_t pair_cap = 480;
         sycl::local_accessor<uint64_t, 1> pairs_l{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint64_t, 1> pairs_r{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint32_t, 1> total_local{sycl::range<1>{1}, h};
@@ -1155,7 +1155,7 @@ static void launch_t2_match_section_pair_split_compact(
         sycl::local_accessor<uint32_t, 1> sT_local{
             sycl::range<1>{16 * 256}, h};
         // 512 candidate pairs of 2x u64 = 8 KiB plus 16 KiB AES table.
-        constexpr uint32_t pair_cap = 512;
+        constexpr uint32_t pair_cap = 480;
         sycl::local_accessor<uint64_t, 1> pairs_l{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint64_t, 1> pairs_r{sycl::range<1>{pair_cap}, h};
         sycl::local_accessor<uint32_t, 1> total_local{sycl::range<1>{1}, h};

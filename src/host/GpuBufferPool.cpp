@@ -147,16 +147,15 @@ inline void* sycl_alloc_host_or_throw(size_t bytes, sycl::queue& q,
 
 } // namespace
 
-GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
-    : k(k_), strength(strength_), testnet(testnet_)
+GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
 {
     if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
     if (k < 18 || k > 28 || (k & 1)) throw std::invalid_argument("k must be even in [18, 28]");
     sycl::queue& q = sycl_backend::queue();
-
+    Sizing result;
     int const num_section_bits = (k < 28) ? 2 : (k - 26);
-    total_xs = 1ULL << k;
-    cap      = max_pairs_per_section(k, num_section_bits) * (1ULL << num_section_bits);
+    result.total_xs = 1ULL << k;
+    result.cap      = max_pairs_per_section(k, num_section_bits) * (1ULL << num_section_bits);
 
     // d_storage must hold EITHER total_xs XsCandidateGpu (8 B each) OR
     // THREE cap-sized uint32 key/val arrays during sort. Only three, not
@@ -166,19 +165,19 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     // keys_in slot inside d_storage was never read. Dropping it saves
     // cap·4 B (~1.09 GiB at k=28) — enough to close the 0.71 GiB pool
     // shortfall on 12 GiB cards.
-    storage_bytes = std::max(
-        static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu),
-        static_cast<size_t>(cap) * 3 * sizeof(uint32_t));
+    result.storage_bytes = std::max(
+        static_cast<size_t>(result.total_xs) * sizeof(XsCandidateGpu),
+        static_cast<size_t>(result.cap) * 3 * sizeof(uint32_t));
 
     // d_pair_a holds the *match output* of the current phase: T1 SoA
     // (meta·8 B + mi·4 B = 12 B), T2 SoA (meta·8 B + mi·4 B + xbits·4 B =
     // 16 B), then T3 (T3PairingGpu, 8 B). Worst case is T2 at 16 B/entry.
     // It does NOT alias the Xs construction scratch — that's d_pair_b.
-    pair_a_bytes = std::max({
-        static_cast<size_t>(cap) * sizeof(T1PairingGpu),
-        static_cast<size_t>(cap) * sizeof(T2PairingGpu),
-        static_cast<size_t>(cap) * sizeof(T3PairingGpu),
-        static_cast<size_t>(cap) * sizeof(uint64_t),
+    result.pair_a_bytes = std::max({
+        static_cast<size_t>(result.cap) * sizeof(T1PairingGpu),
+        static_cast<size_t>(result.cap) * sizeof(T2PairingGpu),
+        static_cast<size_t>(result.cap) * sizeof(T3PairingGpu),
+        static_cast<size_t>(result.cap) * sizeof(uint64_t),
     });
 
     // d_pair_b holds the *sort output* of the current phase (sorted T1
@@ -201,13 +200,13 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     // matters.
     void* const xs_split_sentinel = reinterpret_cast<void*>(uintptr_t{1});
     launch_construct_xs(dummy_plot_id, k, testnet,
-                                   nullptr, nullptr, &xs_temp_bytes, q,
+                                   nullptr, nullptr, &result.xs_temp_bytes, q,
                                    xs_split_sentinel);
-    pair_b_bytes = std::max({
-        static_cast<size_t>(cap) * sizeof(uint64_t),                          // sorted T1 meta
-        static_cast<size_t>(cap) * (sizeof(uint64_t) + sizeof(uint32_t)),     // sorted T2 meta+xbits
-        static_cast<size_t>(cap) * sizeof(uint64_t),                          // T3 frags out
-        xs_temp_bytes,                                                        // Xs aliased scratch (3·N·u32 + cub)
+    result.pair_b_bytes = std::max({
+        static_cast<size_t>(result.cap) * sizeof(uint64_t),                          // sorted T1 meta
+        static_cast<size_t>(result.cap) * (sizeof(uint64_t) + sizeof(uint32_t)),     // sorted T2 meta+xbits
+        static_cast<size_t>(result.cap) * sizeof(uint64_t),                          // T3 frags out
+        result.xs_temp_bytes,                                                        // Xs aliased scratch (3·N·u32 + cub)
     });
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
@@ -216,16 +215,35 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         nullptr, s_pairs,
         static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
         static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-        cap, 0, k, q);
+        result.cap, 0, k, q);
     size_t s_keys = 0;
     launch_sort_keys_u64(
         nullptr, s_keys,
         static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
-        cap, 0, 2 * k, q);
-    sort_scratch_bytes = std::max(s_pairs, s_keys);
+        result.cap, 0, 2 * k, q);
+    result.sort_scratch_bytes = std::max(s_pairs, s_keys);
 
-    pinned_bytes = cap * sizeof(uint64_t);
+    result.pinned_bytes = result.cap * sizeof(uint64_t);
 
+    return result;
+}
+
+GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_device_bytes)
+    : k(k_), strength(strength_), testnet(testnet_)
+{
+    if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (k < 18 || k > 28 || (k & 1)) throw std::invalid_argument("k must be even in [18, 28]");
+    sycl::queue& q = sycl_backend::queue();
+    auto const sizes = sizing(k, testnet);
+
+    total_xs = sizes.total_xs;
+    cap = sizes.cap;
+    storage_bytes = sizes.storage_bytes;
+    pair_a_bytes = sizes.pair_a_bytes;
+    pair_b_bytes = sizes.pair_b_bytes;
+    xs_temp_bytes = sizes.xs_temp_bytes;
+    sort_scratch_bytes = sizes.sort_scratch_bytes;
+    pinned_bytes = sizes.pinned_bytes;
     // Check VRAM before attempting allocation so we can give a useful
     // diagnostic instead of a generic allocation failure. The margin covers
     // GPU driver/context state, sort scratch, AES T-tables, and other small
@@ -256,7 +274,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         size_t const margin = vram_safety_margin();
         DeviceMemInfo const mem = query_device_memory();
         size_t const total_b = mem.total_bytes;
-        size_t const free_b  = mem.free_bytes;
+        size_t const free_b = max_device_bytes ? std::min<uint64_t>(mem.free_bytes, max_device_bytes) : mem.free_bytes;
         if (!vram_fits(free_b, required_device, margin)) {
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
             InsufficientVramError e(
@@ -364,6 +382,18 @@ uint64_t* GpuBufferPool::ensure_pinned(int idx)
     return h_pinned_t3[idx];
 }
 
+void GpuBufferPool::release_pinned(int idx)
+{
+    if (idx < 0 || idx >= kNumPinnedBuffers)
+        throw std::runtime_error("GpuBufferPool::release_pinned: idx out of range");
+    std::lock_guard<std::mutex> lk(pinned_mu_[idx]);
+    if (!h_pinned_t3[idx]) return;
+    sycl::queue& q = sycl_backend::queue();
+    q.wait_and_throw();
+    sycl::free(h_pinned_t3[idx], q);
+    h_pinned_t3[idx] = nullptr;
+}
+
 GpuBufferPool::~GpuBufferPool()
 {
     sycl::queue& q = sycl_backend::queue();
@@ -390,11 +420,10 @@ bool cuda_query_device_memory(int device_ordinal,
 // asking CMake for HIP would add a build-time dependency and a libamdhip64 link
 // to every build, including the NVIDIA ones that will never call this. On a
 // ROCm build AdaptiveCpp has already loaded the HIP runtime into the process,
-// so the symbol is simply there; on any other build the lookup fails once and
-// we fall back exactly as before. Nothing about a non-AMD build changes.
+// so the symbol is simply there; on any other build the lookup fails once.
 //
-// Without this an AMD card gets free_bytes = total_bytes (see below), and the
-// tier picker sizes against VRAM the driver, the display server and everything
+// Using free_bytes = total_bytes would size the picker against VRAM the
+// driver, the display server and everything
 // else on the card have already taken — an 8 GB card reports 8192 MB free,
 // picks plain (needs 7802), actually has ~7400, and OOMs mid-plot. Same bug the
 // NVIDIA path had.
@@ -411,12 +440,9 @@ auto runtime_symbol(void* handle, char const* name)
 
 // Free VRAM on Level Zero (Intel), via Sysman.
 //
-// Needed because AdaptiveCpp 25.10 exposes NO free-memory query of any kind, so
-// query_device_memory() falls back to global_mem_size — the device TOTAL. On an
-// Arc B580 that hands the picker 11605 MiB and pretends the Level Zero context,
-// the compositor and every other tenant do not exist. The CUDA path does not
-// have this problem: cudaMemGetInfo runs after context creation, so its number
-// is genuinely free.
+// AdaptiveCpp 25.10 exposes no free-memory query. Its global_mem_size is the
+// allocation cap, which cannot account for context, display, or other users'
+// allocations. Admission therefore requires a valid driver reading.
 //
 // SYSMAN, not the core API, is the only place free memory lives.
 // zeDeviceGetMemoryProperties reports physical size and nothing about usage.
@@ -425,8 +451,8 @@ auto runtime_symbol(void* handle, char const* name)
 // zesInit() rather than ZES_ENABLE_SYSMAN=1: the env var must be set before the
 // L0 driver initialises, and by the time anything here runs the SYCL runtime
 // has long since done that. zesInit is a separate sysman init with no such
-// ordering constraint. A loader too old to export it simply fails the dlsym and
-// we fall back to the total, which is the pre-existing behaviour.
+// ordering constraint. A loader too old to export it leaves the probe
+// unavailable, so admission fails closed.
 //
 // The ABI below is declared locally, NOT included, so the build never depends
 // on level_zero headers being installed — same reason hip_query_device_memory
@@ -598,12 +624,16 @@ std::vector<ZesMemHandle> const& zes_memory_modules(int rank)
 
 // Sums every memory module on the device — a multi-tile part reports one per
 // tile. Returns false unless at least one module answered.
-bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes)
+bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes,
+                            bool host_unified_memory)
 {
     ZesApi const& api = zes_api();
     if (!api.ready) return false;
     auto const& mods = zes_memory_modules(rank);
     if (mods.empty()) return false;
+    // Integrated modules expose the same host counters. Never add duplicate
+    // system-memory readings as if they were independent device heaps.
+    if (host_unified_memory && mods.size() != 1) return false;
 
     // Per-module logging fires once: the watchdog polls every 20 ms and this
     // is a diagnostic, not a trace.
@@ -790,6 +820,7 @@ struct ProbeTarget {
     int           ordinal = 0;   // index within that runtime, not the SYCL index
     std::uint64_t global_mem = 0;  // the device's own global_mem_size, for
                                    // sanity-checking whatever the runtime says
+    bool          host_unified_memory = false;
 };
 
 ProbeTarget probe_target_for(int device_ordinal)
@@ -830,6 +861,8 @@ ProbeTarget probe_target_for(int device_ordinal)
                                                        : ProbeRuntime::None;
             t.global_mem =
                 devs[idx].get_info<sycl::info::device::global_mem_size>();
+            if (rt == ProbeRuntime::LevelZero)
+                t.host_unified_memory = devs[idx].get_info<sycl::info::device::host_unified_memory>();
             if (rt != ProbeRuntime::None) {
                 // Rank among devices sharing this backend — that IS the
                 // runtime's own ordinal, whereas idx counts every vendor.
@@ -841,9 +874,8 @@ ProbeTarget probe_target_for(int device_ordinal)
             }
         }
     } catch (...) {
-        // Device enumeration can throw on a half-broken driver. An
-        // unprobeable device falls back to the device total, which is what
-        // this function returning None means.
+        // Device enumeration can throw on a half-broken driver. Returning
+        // None leaves the probe unavailable, so admission fails closed.
     }
 
     std::lock_guard<std::mutex> lk(m);
@@ -893,8 +925,17 @@ bool device_memory_probe(int device_ordinal,
     }
 
     if (target.runtime == ProbeRuntime::LevelZero) {
+        // Integrated Sysman readings include host allocations and cache
+        // reclamation. They cannot establish a dedicated GPU memory peak.
+        if (physical_space && target.host_unified_memory) return false;
+        std::optional<std::uint64_t> shared_host_total;
+        if (target.host_unified_memory) {
+            size_t host_free = 0, host_total = 0;
+            if (!host_memory_probe(host_free, host_total)) return false;
+            shared_host_total = host_total;
+        }
         size_t f = 0, t = 0;
-        bool const got = ze_query_device_memory(target.ordinal, f, t);
+        bool const got = ze_query_device_memory(target.ordinal, f, t, target.host_unified_memory);
         static std::atomic<bool> logged_l0{false};
         if (zes_debug() && !logged_l0.exchange(true, std::memory_order_relaxed)) {
             std::fprintf(stderr,
@@ -914,7 +955,7 @@ bool device_memory_probe(int device_ordinal,
             // reading on the B580, where sysman correctly reports free against
             // PHYSICAL memory (12216 MiB) rather than allocatable (11605).
             VramReading reading;
-            if (validate_sysman_reading(f, t, target.global_mem, reading)) {
+            if (validate_sysman_reading(f, t, target.global_mem, reading, shared_host_total)) {
                 free_bytes  = size_t(physical_space ? reading.free_physical
                                                     : reading.free);
                 total_bytes = size_t(physical_space ? reading.total_physical
@@ -922,8 +963,8 @@ bool device_memory_probe(int device_ordinal,
                 return true;
             }
             ZDBG("REJECTED: free=%llu MiB / sysman_total=%llu MiB are not "
-                 "self-consistent, or the total is nowhere near the device's "
-                 "%llu MiB — refusing to act on it (ABI mismatch?)",
+                 "consistent with the device's %llu MiB allocation cap "
+                 "and its memory domain — refusing to act on it",
                  (unsigned long long)(f >> 20),
                  (unsigned long long)(t >> 20),
                  (unsigned long long)(target.global_mem >> 20));

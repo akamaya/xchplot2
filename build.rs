@@ -379,43 +379,6 @@ fn command_runs(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Locate `ld.lld` either on PATH or in the conventional LLVM-{16..20}
-/// install prefixes. Mirrors the find_program HINTS list in
-/// CMakeLists.txt's FetchContent block. AdaptiveCpp's CMake aborts
-/// with "Cannot find ld.lld" without it.
-fn ld_lld_findable() -> bool {
-    if command_runs("ld.lld") { return true; }
-    for p in &[
-        "/usr/lib/llvm-20/bin/ld.lld", "/usr/lib/llvm-19/bin/ld.lld",
-        "/usr/lib/llvm-18/bin/ld.lld", "/usr/lib/llvm-17/bin/ld.lld",
-        "/usr/lib/llvm-16/bin/ld.lld",
-        "/usr/lib/llvm20/bin/ld.lld",  "/usr/lib/llvm19/bin/ld.lld",
-        "/usr/lib/llvm18/bin/ld.lld",
-        "/usr/lib64/llvm20/bin/ld.lld", "/usr/lib64/llvm19/bin/ld.lld",
-        "/usr/lib64/llvm18/bin/ld.lld",
-        "/opt/llvm-20/bin/ld.lld", "/opt/llvm-19/bin/ld.lld",
-        "/opt/llvm-18/bin/ld.lld",
-    ] {
-        if std::path::Path::new(p).exists() { return true; }
-    }
-    false
-}
-
-/// True when AdaptiveCpp is already installed — at $ACPP_PREFIX if
-/// set, otherwise the install-deps.sh default of /opt/adaptivecpp; also
-/// recognize the per-user ~/.local install made by the CMake fallback.
-/// When this is true the FetchContent fallback won't fire and
-/// AdaptiveCpp's own build-time deps (notably ld.lld) aren't needed
-/// for our build.
-fn adaptivecpp_installed() -> bool {
-    let prefix = env::var("ACPP_PREFIX")
-        .unwrap_or_else(|_| "/opt/adaptivecpp".to_string());
-    let local = format!("{}/.local", env::var("HOME").unwrap_or_default());
-    [prefix, local].iter().any(|root| std::path::Path::new(&format!(
-        "{root}/lib/cmake/AdaptiveCpp/adaptivecpp-config.cmake"
-    )).exists())
-}
-
 /// Detect a container engine on PATH, preferring podman (matches
 /// scripts/build-container.sh's default). Used to phrase the preflight
 /// panic differently when the user already has tooling that lets them
@@ -438,12 +401,6 @@ fn preflight(build_cuda_on: bool) -> Vec<String> {
     }
     if !command_runs("c++") && !command_runs("g++") && !command_runs("clang++") {
         missing.push("C++20 compiler (g++ ≥ 13 or clang++ ≥ 18) — apt install build-essential, dnf install gcc-c++, or pacman -S base-devel".into());
-    }
-    // ld.lld is only required when FetchContent will rebuild
-    // AdaptiveCpp; a pre-installed AdaptiveCpp linked against ld.lld
-    // at its own install time, so consumers don't need it again.
-    if !adaptivecpp_installed() && !ld_lld_findable() {
-        missing.push("ld.lld (apt: lld-18, dnf/pacman: lld) — required by AdaptiveCpp's FetchContent build".into());
     }
     if build_cuda_on && !detect_nvcc() {
         missing.push(
@@ -627,6 +584,11 @@ fn main() {
         .arg(format!("-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"))
         .arg(format!("-DACPP_TARGETS={acpp_targets}"))
         .arg(format!("-DXCHPLOT2_BUILD_CUDA={build_cuda}"));
+    if let Ok(value) = env::var("WITH_LEVEL_ZERO_BACKEND") {
+        configure.arg(format!("-DWITH_LEVEL_ZERO_BACKEND={value}"));
+    } else {
+        configure.arg("-UWITH_LEVEL_ZERO_BACKEND");
+    }
 
     // Hand CMake the exact nvcc preflight just validated. enable_language(CUDA)
     // otherwise runs CMake's own toolkit search, which covers $CUDAToolkit_ROOT,
@@ -648,7 +610,7 @@ fn main() {
         .status()
         .expect("failed to invoke cmake — is it installed?");
     if !status.success() {
-        panic!("cmake configure failed");
+        panic!("cmake configure failed; see the diagnostics above. For native build dependencies, run {}", manifest_dir.join("scripts/install-deps.sh").display());
     }
 
     // ---- build only the static libs we need; skip the cmake-built
@@ -687,12 +649,28 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
     println!("cargo:rustc-link-arg=-Wl,--start-group");
     println!("cargo:rustc-link-lib=static=xchplot2_cli");
+    let group_link = cmake_build.join("group-link.txt");
+    if group_link.exists() {
+        println!("cargo:rustc-link-lib=static=xchplot2_groups");
+        println!("cargo:rustc-link-lib=static=pos2_pr118_grow_worker_host");
+        println!("cargo:rustc-link-lib=static=pos2_pr118_grow_network");
+    }
     println!("cargo:rustc-link-lib=static=pos2_gpu_host");
     println!("cargo:rustc-link-lib=static=pos2_gpu");
     println!("cargo:rustc-link-lib=static=pos2_keygen");
     println!("cargo:rustc-link-lib=static=fse");
     println!("cargo:rustc-link-lib=static=pos2_sha256");
     println!("cargo:rustc-link-arg=-Wl,--end-group");
+    if group_link.exists() {
+        for library in std::fs::read_to_string(&group_link)
+            .expect("read grouped CLI TLS libraries")
+            .lines()
+        {
+            if !library.is_empty() {
+                println!("cargo:rustc-link-arg={library}");
+            }
+        }
+    }
 
     // ---- AdaptiveCpp runtime ----
     // The static archives produced by CMake reference hipsycl::rt::* symbols
@@ -866,12 +844,9 @@ fn main() {
     // gfx1013 spoof) fails at first queue construction with
     // "No matching device" because HIP can't initialise.
     //
-    // We pass the full .so path (rather than `cargo:rustc-link-lib=amdhip64`
-    // which becomes `-lamdhip64`) because the SSCP path emits no host-
-    // side HIP symbol references, and the linker's default --as-needed
-    // would drop a name-only -l flag from NEEDED. A positional path
-    // argument bypasses --as-needed and keeps the library in the link.
-    // Same approach as CMakeLists.txt's `link_libraries(.../libamdhip64.so)`.
+    // The SSCP path emits no host-side HIP symbol references. Wrap the
+    // resolved runtime path with --no-as-needed/--as-needed below so it
+    // stays in DT_NEEDED, matching CMakeLists.txt's HIP runtime link.
     let rocm_root = env::var("ROCM_PATH")
         .unwrap_or_else(|_| "/opt/rocm".to_string());
     // <root>/lib is AMD's own installer layout. Multilib distros package the
@@ -931,9 +906,25 @@ fn main() {
     // ---- rebuild triggers ----
     for p in &[
         "src", "tools", "keygen-rs/src", "keygen-rs/Cargo.toml",
-        "keygen-rs/Cargo.lock", "CMakeLists.txt", "cmake", "build.rs",
+        "keygen-rs/Cargo.lock", "CMakeLists.txt", "cmake", "contrib", "build.rs",
     ] {
         println!("cargo:rerun-if-changed={p}");
+    }
+    // CMake refreshes the embedded revision on every build. Run it again when
+    // a checkout advances even if no compiler input changed in that commit.
+    if manifest_dir.join(".git").exists() {
+        for name in ["HEAD", "index", "packed-refs", "refs"] {
+            if let Ok(output) = Command::new("git").current_dir(&manifest_dir)
+                .args(["rev-parse", "--git-path", name]).output() {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout);
+                    let path = manifest_dir.join(path.trim());
+                    if path.exists() {
+                        println!("cargo:rerun-if-changed={}", path.display());
+                    }
+                }
+            }
+        }
     }
     // Every env var read anywhere in this script must appear here, or a
     // user flipping it (e.g. XCHPLOT2_BUILD_CUDA=OFF after a failed
@@ -950,6 +941,7 @@ fn main() {
         "AdaptiveCpp_ROOT",
         "ROCM_PATH",
         "XCHPLOT2_BUILD_CUDA",
+        "WITH_LEVEL_ZERO_BACKEND",
         "XCHPLOT2_FORCE_GFX_SPOOF",
         "XCHPLOT2_NO_GFX_SPOOF",
     ] {

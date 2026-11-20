@@ -1,0 +1,1255 @@
+#include "host/GroupFarmAdapters.hpp"
+#include "host/GroupNativeIdentity.hpp"
+#include <iostream>
+
+using namespace group_grow;
+using namespace group_grow::farm;
+namespace fs = std::filesystem;
+template<class F> void rejects(F operation, char const* message)
+{ bool failed = false; try { operation(); } catch (std::exception const&) { failed = true; } require(failed, message); }
+void append(std::vector<uint8_t>& out, uint64_t value, size_t bytes, bool little = false)
+{ for (size_t i = 0; i < bytes; ++i) out.push_back(uint8_t(value >> (8 * (little ? i : bytes - i - 1)))); }
+std::vector<uint8_t> legacy(bool compressed)
+{
+    std::vector<uint8_t> out;
+    std::string magic = compressed ? "PLOT" : std::string("Proof of Space Plot\0", 19);
+    out.insert(out.end(), magic.begin(), magic.end());
+    if (compressed) append(out, 2, 4, true);
+    out.insert(out.end(), 32, 0x12); out.push_back(32);
+    if (!compressed) { append(out, 4, 2); for (char c : std::string("v1.0")) out.push_back(uint8_t(c)); }
+    append(out, 112, 2); out.insert(out.end(), 32, 0x34); out.insert(out.end(), 48, 0x56); out.insert(out.end(), 32, 0x9a);
+    if (compressed) { append(out, 1, 4, true); out.push_back(5); }
+    size_t const first = out.size() + 80;
+    for (unsigned i = 0; i < 10; ++i) append(out, first + 8 * i, 8);
+    out.resize(first + 128); return out;
+}
+void write(fs::path const& file, std::vector<uint8_t> const& bytes)
+{ std::ofstream out(file, std::ios::binary); out.write(reinterpret_cast<char const*>(bytes.data()), bytes.size()); require(bool(out), "fixture write failed"); }
+void durable_native_identity(fs::path const& directory)
+{
+    using file_io::DurableIdentity;
+    require(file_io::valid_durable_identity({}) && !file_io::has_durable_identity({}), "absent native evidence gained authority");
+    DurableIdentity windows{DurableIdentity::Scheme::windows_file_id, "ntfs:12345678-1234-1234-1234-123456789abc:1", std::string(32, '1')};
+    require(file_io::has_durable_identity(windows), "full NTFS evidence failed its bounded shape");
+    for (char sentinel : {'0', 'f'})
+    {
+        auto invalid = windows; invalid.object.assign(32, sentinel);
+        require(!file_io::valid_durable_identity(invalid), "unsupported NTFS file-ID sentinel gained authority");
+        invalid = windows; std::string volume(36, sentinel); for (size_t index : {8, 13, 18, 23}) volume[index] = '-';
+        invalid.filesystem = "ntfs:" + volume + ":1";
+        require(!file_io::valid_durable_identity(invalid), "unsupported native volume UUID sentinel gained authority");
+        DurableIdentity native{DurableIdentity::Scheme::linux_handle, "btrfs:" + std::string(32, sentinel), "12345678", 1};
+        require(!file_io::valid_durable_identity(native), "unsupported filesystem UUID sentinel gained authority");
+        native.filesystem = "tmpfs:" + std::string(16, sentinel);
+        require(!file_io::valid_durable_identity(native), "unsupported tmpfs instance sentinel gained authority");
+    }
+    for (auto filesystem : {"ntfs:1234:1", "ntfs:12345678-1234-1234-1234-123456789abc:", "ntfs:12345678-1234-1234-1234-123456789abc:invalid"})
+    { auto invalid = windows; invalid.filesystem = filesystem; require(!file_io::valid_durable_identity(invalid), "malformed native volume evidence gained authority"); }
+    fs::create_directory(directory);
+    struct Remove { fs::path path; ~Remove() { std::error_code error; fs::remove_all(path, error); } } remove{directory};
+    auto const original = directory / "source", renamed = directory / "renamed";
+    write(original, {1, 2, 3});
+    struct Close { int fd; ~Close() { file_io::close_file(fd); } } source{
+        file_io::open_file(original, file_io::read_only | file_io::no_follow | file_io::close_on_exec)};
+    require(source.fd >= 0, "cannot pin durable-identity fixture");
+    DurableIdentity saved;
+    if (file_io::capture_durable_identity(source.fd, &saved))
+    {
+        require(saved == DurableIdentity{} && !file_io::matches_durable_identity(source.fd, saved),
+            "unsupported native capture retained partial authority");
+        return;
+    }
+    require(file_io::matches_durable_identity(source.fd, saved) && !file_io::matches_durable_identity(source.fd, {}),
+        "native evidence did not require an exact prospective capture");
+    auto altered = saved; altered.object.back() = altered.object.back() == '0' ? '1' : '0';
+    require(!file_io::matches_durable_identity(source.fd, altered), "tampered object handle gained authority");
+    require(!file_io::rename_file(original, renamed, false), "cannot rename durable-identity fixture");
+    Close reopened{file_io::open_file(renamed, file_io::read_only | file_io::no_follow | file_io::close_on_exec)};
+    require(reopened.fd >= 0 && file_io::matches_durable_identity(reopened.fd, saved), "rename lost its native generation handle");
+    write(original, {1, 2, 3});
+    Close substitute{file_io::open_file(original, file_io::read_only | file_io::no_follow | file_io::close_on_exec)};
+    require(substitute.fd >= 0 && !file_io::matches_durable_identity(substitute.fd, saved), "same-byte source substitute reused native authority");
+    Close root{file_io::open_file(directory, file_io::read_only | file_io::directory | file_io::no_follow | file_io::close_on_exec)};
+    DurableIdentity parent;
+    require(root.fd >= 0 && !file_io::capture_durable_identity(root.fd, &parent) && parent.filesystem == saved.filesystem &&
+        parent != saved && !file_io::matches_durable_identity(root.fd, saved), "filesystem token authorized a different native object");
+}
+void inventory(fs::path const& directory)
+{
+    fs::create_directories(directory / "nested"); write(directory / "og.plot", legacy(false)); write(directory / "nested" / "bb.plot", legacy(true));
+    write(directory / "unknown.drplot", {1, 2, 3});
+    PlotGroupFile::Header h{}; h.magic = PlotGroupFile::MAGIC; h.version = PlotGroupFile::FORMAT_VERSION;
+    h.group_id = PlotGroupId(std::string(64, 'a')); h.k = 18; h.strength = 2; h.group_size = 4; h.memo_length = 112; h.chunk_index_offset = 200;
+    std::vector<uint8_t> group(256); std::memcpy(group.data(), &h, sizeof(h));
+    std::fill(group.begin() + sizeof(h), group.begin() + sizeof(h) + 112, uint8_t(0x7b)); write(directory / "group.gplot", group);
+    for (uint8_t meta : {128, 255})
+    {
+        auto header = h; header.meta_group = meta; auto bytes = group; std::memcpy(bytes.data(), &header, sizeof(header));
+        InventoryPlot plot; plot.identity.stamp.bytes = bytes.size(); inventory_detail::header(plot, bytes);
+        require(plot.header_validated && plot.algorithm == PlotAlgorithm::pos2 && plot.meta_group == meta && plot.members == h.group_size,
+            "valid ordinary-group meta byte was rejected or changed by inventory");
+    }
+    std::array<fs::path, 1> roots{directory}; auto observed = scan_farm_inventory(roots);
+    require(observed.complete && observed.plots.size() == 4, "bounded inventory omitted files");
+    auto find = [&](std::string const& name) -> InventoryPlot const&
+    { auto at = std::find_if(observed.plots.begin(), observed.plots.end(), [&](auto const& p) { return p.relative_path == name; }); require(at != observed.plots.end(), "missing fixture path"); return *at; };
+    auto const og = find("og.plot"), bb = find("nested/bb.plot"), native = find("group.gplot");
+    require(og.algorithm == PlotAlgorithm::pos1 && og.header_validated && og.compression_family == "uncompressed" &&
+        bb.container == PlotContainer::chiapos_v2 && bb.compression_family == "bladebit" && bb.compression_level == 5 &&
+        native.algorithm == PlotAlgorithm::pos2 && native.members == 4 && find("unknown.drplot").status == "protected", "format observations were conflated");
+    auto text = farm_inventory_text(observed); auto restored = parse_farm_inventory(text);
+    require(farm_inventory_text(restored) == text && text.find(std::string(64, '9')) == std::string::npos &&
+        text.find("9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a") == std::string::npos, "inventory lost determinism or exposed local memo secret");
+    {
+        auto legacy_catalog = observed; legacy_catalog.version = 1;
+        for (auto& root : legacy_catalog.roots) root.durable = {};
+        for (auto& plot : legacy_catalog.plots) plot.identity.durable = {};
+        auto const legacy_text = farm_inventory_text(legacy_catalog);
+        require(legacy_text.find("durable_identity") == legacy_text.npos && farm_inventory_text(parse_farm_inventory(legacy_text)) == legacy_text,
+            "strict legacy inventory bytes changed without native evidence");
+        auto const legacy_source = legacy_catalog.plots[size_t(&find("og.plot") - observed.plots.data())];
+        (void)recheck_inventory_source(legacy_catalog.roots[0], legacy_source);
+        if (file_io::has_durable_identity(observed.roots[0].durable) && file_io::has_durable_identity(og.identity.durable))
+        {
+            require(observed.version == 2 && restored.roots[0].durable == observed.roots[0].durable &&
+                restored.plots[size_t(&find("og.plot") - observed.plots.data())].identity.durable == og.identity.durable,
+                "prospective inventory evidence lost its explicit schema or roundtrip");
+            auto historical_root = observed.roots[0]; historical_root.device ^= UINT64_C(0x80000000);
+            auto historical = og; historical.identity.stamp.device = historical_root.device;
+            InventorySourcePin recovered(historical_root, historical);
+            require(matches_inventory_identity(historical.identity, recovered.identity(historical.relative_path, {})),
+                "verified native root and generation handle could not compare a simulated changed device");
+            auto strict_root = historical_root; strict_root.durable = {};
+            auto strict_source = historical; strict_source.identity.durable = {};
+            rejects([&] { InventorySourcePin pin(strict_root, strict_source); }, "legacy root retroactively recovered a changed native device");
+            rejects([&] { InventorySourcePin pin(historical_root, strict_source); }, "legacy source retroactively recovered a changed native device");
+            auto wrong = historical; wrong.identity.durable.object.back() = wrong.identity.durable.object.back() == '0' ? '1' : '0';
+            rejects([&] { InventorySourcePin pin(historical_root, wrong); }, "different object handle gained remount source authority");
+            wrong = historical; ++wrong.identity.allocated_bytes;
+            rejects([&] { InventorySourcePin pin(historical_root, wrong); }, "native handle bypassed exact source allocation");
+            wrong = historical; ++wrong.identity.stamp.mtime_ns;
+            rejects([&] { InventorySourcePin pin(historical_root, wrong); }, "native handle bypassed exact source timestamp");
+            auto missing = og.identity; missing.durable = {};
+            require(!matches_inventory_identity(og.identity, missing), "current missing evidence satisfied a prospective owner");
+            auto invalid = observed; invalid.version = 1;
+            rejects([&] { (void)farm_inventory_text(invalid); }, "legacy inventory schema accepted new native authority");
+        }
+    }
+    Resource storage; storage.id = "fixture-storage"; storage.host = observed.host; storage.kind = ResourceKind::storage;
+    observed.resource_template = make_profile_template({storage}, {{"known-header", 3}, {"protected-unknown", 1}}, observed.captured_at, observed.producer_build);
+    text = farm_inventory_text(observed); restored = parse_farm_inventory(text);
+    require(restored.resource_template && farm_inventory_text(restored) == text &&
+        !restored.resource_template->resources[0].capacity_known && restored.resource_template->workloads[0].cost == CostKind::unknown,
+        "inventory template became a resource/cost guarantee or failed roundtrip");
+    require(text.find("resource_preparation") == std::string::npos, "optional preparation changed older inventory serialization");
+    auto setup = observed;
+    for (auto& plot : setup.plots) plot.workload_id = plot.header_validated ? "known-header" : "protected-unknown";
+    FarmResourceBindings bindings; bindings.target_hosts = {{"harvester", "target-host"}, {"farmer", "target-host"},
+        {"full_node", "target-host"}, {"solver", "target-host"}};
+    bindings.workload_hosts["known-header"] = {"reader-host"};
+    setup.resource_template = make_inventory_resource_template(setup, {{"known-header", 3}, {"protected-unknown", 1}}, bindings);
+    auto const& scaffold = *setup.resource_template;
+    resource_detail::Graph physical(scaffold);
+    require(physical.names.contains("cpu:reader-host") && physical.names.contains("memory:target-host") &&
+        scaffold.native.output_resources.empty() && !scaffold.native.source_resources.empty() && !scaffold.native.bounded,
+        "preparation lost established topology or invented a bounded output selection");
+    for (auto const& workload : scaffold.workloads)
+    {
+        require(!workload.bounded && workload.cost == CostKind::unknown, "preparation invented foreign service bounds");
+        for (auto const& use : workload.uses)
+            require(use.resource != "cpu:target-host" && use.resource != "memory:target-host" &&
+                (workload.id != "protected-unknown" || physical.resources[physical.find(use.resource)].kind == ResourceKind::storage),
+                "preparation added unrelated service edges or assumed an opaque decoder host");
+    }
+    std::ostringstream policy_before; write_profile_json(policy_before, scaffold); auto const before_preparation = farm_inventory_memory(setup);
+    setup.resource_preparation = prepare_farm_inventory_resources(setup, bindings, true);
+    std::ostringstream policy_after; write_profile_json(policy_after, *setup.resource_template);
+    require(policy_before.str() == policy_after.str() && !setup.resource_preparation->missing.empty() &&
+        farm_inventory_memory(setup) > before_preparation, "preparation changed saved declarations or escaped the inventory memory ledger");
+    auto const setup_text = farm_inventory_text(setup); auto setup_restored = parse_farm_inventory(setup_text);
+    require(setup_restored.resource_preparation && farm_inventory_text(setup_restored) == setup_text,
+        "preparation provenance and missing declarations failed inventory roundtrip");
+    require(std::any_of(setup.resource_preparation->facts.begin(), setup.resource_preparation->facts.end(), [](auto const& fact)
+        { return fact.path == "local.available_memory_bytes" && fact.basis == "observed" && fact.scope.find("Not an offered budget") != std::string::npos; }),
+        "OS observations were presented as declared capacity");
+    auto drift = bindings; drift.target_hosts["solver"] = "new-solver-host";
+    auto changed = prepare_farm_inventory_resources(setup, drift, true);
+    require(std::any_of(changed.missing.begin(), changed.missing.end(), [](auto const& need)
+        { return need.path == "farm_resources.native.service_hosts.solver"; }), "changed physical service binding was not actionable");
+    auto invalid_report = setup; invalid_report.resource_preparation->facts[0].basis = "verified-capacity";
+    rejects([&] { (void)farm_inventory_text(invalid_report); }, "unsupported provenance became a resource grant");
+    (void)recheck_inventory_source(observed.roots[0], og);
+    InventoryLimits tiny; tiny.max_files = 1; rejects([&] { (void)scan_farm_inventory(roots, tiny); }, "entry bound was ignored");
+    auto empty_tree = directory / "empty-tree"; fs::create_directories(empty_tree / "one" / "two" / "three");
+    std::array<fs::path, 1> empty_roots{empty_tree}; tiny.max_files = 2;
+    rejects([&] { (void)scan_farm_inventory(empty_roots, tiny); }, "already visited empty directories escaped the total entry bound");
+    fs::create_directories(directory / "other-empty-tree" / "child");
+    std::array<fs::path, 2> split_roots{empty_tree / "one" / "two", directory / "other-empty-tree"}; tiny.max_files = 1;
+    rejects([&] { (void)scan_farm_inventory(split_roots, tiny); }, "total entry bound restarted at each root");
+    fs::remove_all(empty_tree); fs::remove_all(directory / "other-empty-tree");
+    tiny = {}; tiny.cancelled = [] { return true; }; rejects([&] { (void)scan_farm_inventory(roots, tiny); }, "cancellation was ignored");
+    rejects([&] { (void)inventory_detail::catalog_deadline({}, 100001); }, "catalog allowance ignored the entry bound");
+    auto malicious = observed; malicious.plots[0].relative_path = "../outside";
+    rejects([&] { (void)farm_inventory_text(malicious); }, "parent path escaped inventory root");
+    malicious = observed; malicious.plots[1].alias_of = 0;
+    rejects([&] { (void)farm_inventory_text(malicious); }, "forged alias hid another native file");
+    std::array<fs::path, 2> overlap{directory, directory / "nested"}; auto overlapped = scan_farm_inventory(overlap);
+    require(std::count_if(overlapped.plots.begin(), overlapped.plots.end(), [](auto const& p) { return p.status == "protected" && p.reason == "duplicate native file identity"; }) == 2,
+        "overlapping roots counted the same native file as reclaimable twice");
+    (void)farm_inventory_text(overlapped);
+    write(directory / "og.plot", {0}); rejects([&] { (void)recheck_inventory_source(observed.roots[0], og); }, "changed source accepted");
+#ifndef _WIN32
+    fs::create_directory_symlink(directory, directory / "loop"); fs::create_symlink(directory / "group.gplot", directory / "linked.plot");
+    auto links = scan_farm_inventory(roots);
+    require(links.plots.size() == 6 && std::count_if(links.plots.begin(), links.plots.end(), [](auto const& p) { return p.status == "protected"; }) >= 3,
+        "links were followed or concealed");
+    auto current = observe_inventory_file(observed.roots[0], "group.gplot"); InventorySourcePin pin(observed.roots[0], current);
+    fs::create_directory(directory / ".claim"); fs::rename(directory / "group.gplot", directory / ".claim" / "one");
+    require(pin.matches_claim(".claim/one"), "rename changed a pinned source's content identity");
+    InventorySourcePin recovered(observed.roots[0], current, {}, ".claim/one");
+    require(recovered.matches_claim(".claim/one"), "crash after claim could not reopen the exact source");
+    write(directory / ".claim" / "one", {1}); require(!pin.matches_claim(".claim/one"), "claimed source mutation was ignored");
+    fs::create_hard_link(directory / "nested" / "bb.plot", directory / "alias.plot");
+    links = scan_farm_inventory(roots);
+    require(std::count_if(links.plots.begin(), links.plots.end(), [](auto const& p) { return p.identity.links > 1 && p.status == "protected"; }) == 2,
+        "hardlinks were independently reclaimable");
+#endif
+}
+int fake_adapter(int argc, char** argv)
+{
+    std::string mode = argc > 2 ? fs::path(argv[2]).filename().string() : "";
+    if (mode == "timeout") { std::this_thread::sleep_for(std::chrono::seconds(5)); return 0; }
+    if (mode == "flood") { for (unsigned i = 0; i < 65536; ++i) std::cout << "private-memo-must-never-be-logged\n"; return 1; }
+    if (mode == "failed") { std::cout << "private-memo-must-never-be-logged"; return 1; }
+    if (argc == 4 && std::string_view(argv[3]) == "version") { std::cout << "fixture-native-1\n"; return 0; }
+    std::string endpoint = argv[argc - 1];
+    auto const root = fs::path(argv[2]); std::string const service = argv[4];
+    auto flag = [&](char const* name) { return fs::exists(root / name); };
+    if (endpoint == "get_version")
+    {
+        if (flag("version-delay")) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        if (service == "farmer" && flag("farmer-unavailable")) return 1;
+        std::string version = "fixture-native-1"; std::ifstream in(fs::path(argv[2]) / "version"); if (in) in >> version;
+        if ((service == "farmer" && flag("farmer-version")) || (service == "solver" && flag("solver-version")) ||
+            (service == "harvester" && flag("harvester-version")) || (service == "full_node" && flag("full-node-version"))) version = "fixture-native-2";
+        std::cout << "{\"success\":true,\"version\":\"" << version << "\"}";
+    }
+    else if (endpoint == "get_network_info") std::cout << "{\"success\":true,\"network_name\":\"simulator0\",\"genesis_challenge\":\"" << std::string(64, service == "solver" && flag("solver-network") ? 'b' : 'a') << "\"}";
+    else if (endpoint == "get_connections")
+    {
+        struct Peer { unsigned type, local, server, port; char id; }; std::vector<Peer> peers;
+        unsigned const harvester_port = flag("harvester-advertised") ? 8448u : 0u;
+        if (service == "harvester" && !flag("farmer-disconnected")) peers = {{3, harvester_port, 8447, 8447, '1'}};
+        if (service == "farmer")
+        {
+            if (!flag("farmer-disconnected")) peers.push_back({2, flag("farmer-zero-port") ? 0u : 8447u,
+                flag("harvester-port-mismatch") ? 8449u : harvester_port, 61934, '3'});
+            peers.push_back({1, 8447, flag("node-mismatch") ? 8445u : 8444u, 8444, '4'});
+            if (!flag("solver-disconnected")) peers.push_back({8, 8447, 8666, 8666, '5'});
+        }
+        if (service == "full_node") peers = {{3, 8444, 8447, 61935, '2'}};
+        if (service == "solver" && !flag("solver-disconnected")) peers = {{3, 8666, flag("solver-mismatch") ? 8449u : 8447u, 61936, '2'}};
+        std::cout << "{\"success\":true,\"connections\":[";
+        for (size_t i = 0; i < peers.size(); ++i)
+        { auto const p = peers[i]; if (i) std::cout << ','; std::cout << "{\"type\":" << p.type << ",\"local_port\":" << p.local << ",\"peer_server_port\":" << p.server
+            << ",\"peer_port\":" << p.port << ",\"peer_host\":\"" << (flag("remote-peers") ? (service != "farmer" ? "10.0.0.2" : p.type == 2 ? "10.0.0.1" : p.type == 1 ? "10.0.0.3" : "10.0.0.4") : "127.0.0.1")
+            << "\",\"node_id\":\"" << std::string(64, p.id)
+            << "\",\"creation_time\":" << (flag("connection-churn") ? "2.25" : "1.25") << ",\"last_message_time\":0}"; }
+        std::cout << "]}";
+    }
+    else if (endpoint == "get_state") std::cout << "{\"success\":true,\"started\":" << (flag("solver-stopped") ? "false" : "true") << '}';
+    else if (endpoint == "get_pool_state")
+    {
+        std::string const pool(64, flag("pool-mismatch") ? '8' : '4');
+        std::cout << "{\"success\":true,\"pool_state\":[{\"p2_singleton_puzzle_hash\":\"" << pool << "\",\"pool_config\":{\"p2_singleton_puzzle_hash\":\"" << pool
+            << "\",\"pool_url\":\"" << ((flag("pool-external") || flag("pool-uninitialized")) ? "https://pool.example" : "")
+            << "\",\"launcher_id\":\"" << std::string(64, '1') << "\",\"owner_public_key\":\"" << std::string(96, '6')
+            << "\",\"target_puzzle_hash\":\"" << std::string(64, '2') << "\",\"version\":" << (flag("pool-version-invalid") ? 3 : flag("pool-v2") ? 2 : 1)
+            << "},\"current_difficulty\":" << (flag("pool-uninitialized") ? "null" : "17") << ",\"authentication_token_timeout\":5}]}";
+    }
+    else if (endpoint == "get_harvesters" || endpoint == "get_harvesters_summary")
+    {
+        if (endpoint == "get_harvesters" && flag("summary-only")) return 1;
+        std::ifstream in(root / (flag("farmer-override") ? "farmer-plots.json" : "plots.json"));
+        std::string raw = in ? std::string(std::istreambuf_iterator<char>(in), {}) : "{\"plots\":[]}";
+        auto parsed = profile_detail::JsonReader(raw, 16 * 1024 * 1024).read(); auto const count = inventory_detail::required_field(parsed, "plots").items.size();
+        auto const start = raw.find('['), end = raw.rfind(']'); require(start != raw.npos && end != raw.npos, "bad fake farmer registry");
+        std::cout << "{\"success\":true,\"harvesters\":[{\"connection\":{\"node_id\":\"" << std::string(64, flag("farmer-mismatch") ? '6' : '3')
+            << "\",\"host\":\"" << (flag("remote-peers") ? "10.0.0.1" : "127.0.0.1") << "\",\"port\":61934},\"syncing\":" << (flag("farmer-syncing") ? "{}" : "null")
+            << ",\"last_sync_time\":" << (flag("farmer-zero-sync") ? "0" : flag("farmer-future-sync") ? "99999999999" : flag("sync-churn") ? "2.25" : "1.25") << ",\"plots\":";
+        if (endpoint == "get_harvesters_summary") std::cout << count; else std::cout << raw.substr(start, end - start + 1);
+        std::cout << '}';
+        if (flag("other-harvester"))
+        {
+            std::cout << ",{\"connection\":{\"node_id\":\"" << std::string(64, '9') << "\",\"host\":\"10.0.0.9\",\"port\":61939},\"syncing\":" << (flag("other-harvester-syncing") ? "{}" : "null") << ",\"last_sync_time\":"
+                << (flag("other-harvester-growth") ? "2.25" : "1.25") << ",\"plots\":";
+            if (endpoint == "get_harvesters_summary") std::cout << (flag("other-harvester-empty") ? 0 : flag("other-harvester-growth") ? 2 : 1);
+            else std::cout << (flag("other-harvester-empty") ? "[]" : "[{\"size\":130,\"group_size\":4}]");
+            std::cout << '}';
+        }
+        std::cout << "]}";
+    }
+    else if (endpoint == "get_constants") std::cout << "{\"success\":true,\"constants\":{\"GENESIS_CHALLENGE\":\"" << std::string(64, 'a') << "\",\"HARD_FORK2_HEIGHT\":100,\"MIN_PLOT_STRENGTH\":2,\"MAX_PLOT_STRENGTH\":17,\"PLOT_SIZE_V2\":28}}";
+    else if (endpoint == "get_plots")
+    {
+        if (auto const* delay = std::getenv("XCHPLOT2_INVENTORY_TEST_RPC_DELAY_MS"))
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::stoul(delay)));
+        auto counter = fs::path(argv[2]) / "registry-count"; unsigned value = 0; { std::ifstream in(counter); in >> value; }
+        { std::ofstream out(counter); out << value + 1; }
+        std::ifstream in(fs::path(argv[2]) / "plots.json");
+        if (in) std::cout << in.rdbuf(); else std::cout << "{\"success\":true,\"plots\":[]}";
+        if (flag("retirement-version-change")) { std::ofstream changed(root / "version"); changed << "fixture-native-2"; }
+        if (flag("retirement-config-change")) { std::ofstream changed(root / "config/config.yaml", std::ios::app); changed << "# changed during registry query\n"; }
+    }
+    else if (endpoint == "get_blockchain_state")
+    {
+        bool const inactive = fs::exists(fs::path(argv[2]) / "inactive");
+        std::cout << "{\"success\":true,\"blockchain_state\":{\"sync\":{\"synced\":" << (flag("unsynced") ? "false" : "true") << ",\"sync_mode\":false},\"peak\":{\"prev_transaction_block_height\":"
+            << (inactive ? 99 : 101) << ",\"timestamp\":" << std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()) << "}}}";
+    }
+    else return 2;
+    return 0;
+}
+void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProjection const& projection, InventoryRoot const& root,
+    ReplacementExpectation const& prototype, std::vector<uint8_t> const& bytes, std::string const& loaded_key)
+{
+    constexpr unsigned files = 12;
+    TargetServiceExpectation service{prototype.farmer_public_key, prototype.pool_public_key, prototype.pool_contract_puzzle_hash};
+    auto expectation = [&](unsigned index)
+    {
+        auto value = prototype; value.path = prototype.path.parent_path() / ("prefix-" + std::to_string(index) + ".plot2");
+        value.identity = observe_inventory_file(root, file_io::path_text(value.path.filename()), options.limits).identity; return value;
+    };
+    for (unsigned i = 0; i < files; ++i) write(prototype.path.parent_path() / ("prefix-" + std::to_string(i) + ".plot2"), bytes);
+    auto registry = [&](bool wrong = false, bool duplicate = false, bool wrong_meta = false)
+    {
+        std::ofstream out(options.root / "plots.json"); out << "{\"success\":true,\"plots\":[";
+        for (unsigned i = 0; i < files + unsigned(duplicate); ++i)
+        {
+            auto expected = expectation(i % files); if (i) out << ','; out << "{\"filename\":"; profile_detail::quote(out, file_io::path_text(expected.path));
+            out << ",\"size\":130,\"plot_id\":\"" << expected.group_id << "\",\"file_size\":" << expected.identity.stamp.bytes << ",\"time_modified\":" << expected.identity.stamp.mtime
+                << ",\"pool_contract_puzzle_hash\":\"" << expected.pool_contract_puzzle_hash << "\",\"plot_public_key\":\"" << (wrong && i == files - 1 ? std::string(96, '7') : loaded_key)
+                << "\",\"meta_group\":" << unsigned(expected.meta_group + uint8_t(wrong_meta && i == files - 1)) << ",\"group_size\":" << expected.members << '}';
+        }
+        out << "]}";
+    };
+    auto count = [&] { unsigned value = 0; std::ifstream in(options.root / "registry-count"); in >> value; return value; };
+    auto publication = [&](ReplacementExpectation const& expected, unsigned index)
+    { return ReplacementPublication{expected.path, expected.identity, std::string(64, 'b'), index}; };
+    registry();
+    FarmInventory complete_scope; complete_scope.roots.push_back(root);
+    rejects([&] { TargetReadinessSnapshot outside(options, projection, prototype.k, prototype.strength, service, &complete_scope); },
+        "target reader accepted loaded files absent from the complete catalog");
+    auto published = [&](std::string_view path, std::string_view id)
+    {
+        if (id != prototype.group_id) return false;
+        for (unsigned i = 0; i < files; ++i)
+            if (path == file_io::path_text(expectation(i).path)) return true;
+        return false;
+    };
+    auto future = [&](std::string_view path, std::string_view id)
+    { return path != file_io::path_text(expectation(files - 1).path) && published(path, id); };
+    rejects([&] { TargetReadinessSnapshot unpublished(options, projection, prototype.k, prototype.strength, service, &complete_scope, future); },
+        "target registry accepted an unpublished future replacement name");
+    auto before = count();
+    {
+        TargetReadinessSnapshot snapshot(options, projection, prototype.k, prototype.strength, service, &complete_scope, published);
+        for (unsigned i = 0; i < files; ++i)
+        { auto expected = expectation(i); require(snapshot.check(expected, publication(expected, i)).ready, "prefix snapshot rejected an exact sealed publication"); }
+        snapshot.finish();
+    }
+    require(count() == before + 1, "prefix target readiness repeated get_plots per completed file");
+    registry(true);
+    {
+        TargetReadinessSnapshot mismatch(options, projection, prototype.k, prototype.strength, service); auto expected = expectation(files - 1);
+        require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot accepted a mismatched loaded public key");
+        rejects([&] { mismatch.finish(); }, "failed prefix check retained a healthy snapshot");
+    }
+    registry(false, false, true);
+    {
+        TargetReadinessSnapshot mismatch(options, projection, prototype.k, prototype.strength, service); auto expected = expectation(files - 1);
+        require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot ignored an explicitly reported wrong meta group");
+    }
+    registry(false, true);
+    rejects([&] { TargetReadinessSnapshot duplicate(options, projection, prototype.k, prototype.strength, service); }, "duplicate target registry paths accepted");
+    registry();
+    auto bounded = options; bounded.limits.max_files = files - 1;
+    rejects([&] { TargetReadinessSnapshot too_many(bounded, projection, prototype.k, prototype.strength, service); }, "target snapshot ignored its parsed index count bound");
+    {
+        TargetReadinessSnapshot changed(options, projection, prototype.k, prototype.strength, service); auto expected = expectation(0);
+        require(changed.check(expected, publication(expected, 0)).ready, "prefix configuration fixture did not start ready");
+#ifndef _WIN32
+        { std::ofstream config(options.root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 3\n"; }
+        rejects([&] { changed.finish(); }, "prefix audit ignored a configuration change after its RPC snapshot");
+        { std::ofstream config(options.root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 2\n"; }
+#else
+        // The existing native Windows pin denies both writes and replacement.
+        std::ofstream config(options.root / "config" / "config.yaml"); require(!config, "snapshot config pin allowed a concurrent write"); changed.finish();
+#endif
+    }
+    {
+        auto short_options = options; short_options.limits.timeout_ms = 3000;
+        TargetReadinessSnapshot expired(short_options, projection, prototype.k, prototype.strength, service);
+        // The constructor has completed all RPC work. Waiting its full grant
+        // from here deterministically exceeds the original shared deadline.
+        std::this_thread::sleep_for(std::chrono::milliseconds(short_options.limits.timeout_ms + 1));
+        auto expected = expectation(0);
+        require(!expired.check(expected, publication(expected, 0)).ready, "prefix audit silently reset its deadline for the next file");
+        rejects([&] { expired.finish(); }, "expired target snapshot remained usable");
+    }
+    { std::ofstream absent(options.root / "plots.json"); absent << "{\"success\":true,\"plots\":[]}"; }
+    TargetReadinessSnapshot next_boundary(options, projection, prototype.k, prototype.strength, service); auto expected = expectation(0);
+    require(!next_boundary.check(expected, publication(expected, 0)).ready, "next retirement boundary reused a cached loaded registry");
+}
+#ifdef __linux__
+void source_metadata_snapshot(fs::path const& directory, HarvesterAdapterOptions options, std::string const& loaded_key)
+{
+    auto root = directory / "metadata-native-files"; fs::create_directory(root);
+    auto bytes = legacy(false); auto const id = adapter_detail::legacy_id_from_loaded_key(loaded_key, std::string(64, '4'));
+    auto public_id = group_tools::hex(id); std::copy(public_id.begin(), public_id.end(), bytes.begin() + 19); bytes[54] = 'x';
+    write(root / "first.plot", bytes); write(root / "second.plot", bytes);
+    std::array<fs::path, 1> roots{root}; auto catalog = scan_farm_inventory(roots);
+    auto registry = [&](bool missing = false)
+    {
+        std::ofstream out(options.root / "plots.json"); out << "{\"success\":true,\"plots\":[";
+        for (size_t i = 0; i < catalog.plots.size() - size_t(missing); ++i)
+        {
+            auto const& plot = catalog.plots[i]; if (i) out << ','; out << "{\"filename\":";
+            profile_detail::quote(out, file_io::path_text(root / plot.relative_path));
+            out << ",\"size\":32,\"plot_id\":\"" << id << "\",\"file_size\":" << plot.identity.stamp.bytes << ",\"time_modified\":" << plot.identity.stamp.mtime
+                << ",\"pool_contract_puzzle_hash\":\"" << std::string(64, '4') << "\",\"plot_public_key\":\"" << loaded_key << "\",\"compression_level\":33}";
+        }
+        out << "]}";
+    };
+    registry();
+    observe_harvester_inventory(catalog, options);
+    require(std::all_of(catalog.plots.begin(), catalog.plots.end(), [](auto const& p) { return p.native_identified && p.status == "native-observed"; }),
+        "reader metadata retirement required an unavailable compressed-plot GPU checker");
+    RegistryScopeIndex scope(catalog, options.limits);
+    observe_registry_scope(options, catalog, {}, &scope);
+    auto copied_catalog = catalog;
+    rejects([&] { observe_registry_scope(options, copied_catalog, {}, &scope); }, "registry index silently used another catalog's borrowed paths");
+    auto tight = options.limits; tight.memory_bytes = RegistryScopeIndex::memory_bound(catalog) - 1;
+    rejects([&] { RegistryScopeIndex index(catalog, tight); }, "retained registry index escaped its memory grant");
+    std::array<uint64_t, 2> indices{0, 1};
+    auto count = [&] { unsigned value = 0; std::ifstream in(options.root / "registry-count"); in >> value; return value; };
+    auto const before = count();
+    {
+        SourceReadinessSnapshot snapshot(options, catalog, indices, {}, false, &scope);
+        for (auto const& plot : catalog.plots) (void)snapshot.check(catalog.roots[plot.root], plot);
+        snapshot.finish();
+    }
+    require(count() == before + 2, "source snapshot rescanned the complete registry per source instead of bounded capture/final fences");
+    {
+        std::ofstream changed(options.root / "version"); changed << "fixture-native-2"; changed.close();
+        rejects([&] { observe_registry_scope(options, catalog, {}, &scope); }, "fresh protected-action scope ignored a source-only version change");
+        rejects([&] { SourceReadinessSnapshot snapshot(options, catalog, indices, {}, false, &scope); },
+            "post-construction metadata refresh silently rebound a changed reader version");
+        fs::remove(options.root / "version");
+    }
+    {
+        auto path = options.root / "config" / "config.yaml"; std::ifstream in(path); std::string original(std::istreambuf_iterator<char>(in), {});
+        { std::ofstream changed(path); changed << original << "# changed source-only config\n"; }
+        rejects([&] { observe_registry_scope(options, catalog, {}, &scope); }, "fresh protected-action scope ignored source-only configuration change");
+        rejects([&] { SourceReadinessSnapshot snapshot(options, catalog, indices, {}, false, &scope); },
+            "post-construction metadata refresh silently rebound a changed reader configuration");
+        { std::ofstream restored(path); restored << original; }
+    }
+    {
+        SourceReadinessSnapshot snapshot(options, catalog, indices); registry(true);
+        rejects([&] { snapshot.finish(); }, "source loaded-population loss survived an unchanged reader version"); registry();
+    }
+    {
+        SourceReadinessSnapshot snapshot(options, catalog, indices);
+        auto registry_file = options.root / "plots.json"; std::ifstream in(registry_file); std::string raw(std::istreambuf_iterator<char>(in), {});
+        auto row = raw.substr(raw.find('{', raw.find('[')), raw.find('}', raw.find('[')) - raw.find('{', raw.find('[')) + 1);
+        auto const path = file_io::path_text(root / "first.plot"); auto where = row.find(path);
+        require(where != row.npos, "source arrival fixture cannot locate its original row"); row.replace(where, path.size(), file_io::path_text(root / "arrival.plot"));
+        { std::ofstream changed(registry_file); changed << raw.substr(0, raw.rfind(']')) << ',' << row << "]}"; }
+        rejects([&] { observe_registry_scope(options, catalog, {}, &scope); }, "protected-action route guard ignored a new source arrival");
+        rejects([&] { snapshot.finish(); }, "new source arrival survived the coherent route scope fence"); registry();
+    }
+    registry(true);
+    rejects([&] { SourceReadinessSnapshot snapshot(options, catalog, indices); (void)snapshot.check(catalog.roots[0], catalog.plots[1]); },
+        "missing source reader acknowledgement retained native identification");
+    registry();
+    {
+        SourceReadinessSnapshot snapshot(options, catalog, indices);
+        { std::ofstream changed(options.root / "version"); changed << "fixture-native-2"; }
+        rejects([&] { snapshot.finish(); }, "source snapshot lost its version fence");
+        fs::remove(options.root / "version");
+    }
+    auto drchia = options; drchia.kind = HarvesterAdapterKind::drchia;
+    auto dr_catalog = scan_farm_inventory(roots); observe_harvester_inventory(dr_catalog, drchia);
+    require(dr_catalog.plots[0].native_identified && dr_catalog.plots[0].reader == "drchia" && dr_catalog.plots[0].reader_version == "cli:fixture-native-1" &&
+        dr_catalog.plots[0].container == PlotContainer::unknown, "compatible DrChia public metadata was either rejected or given a guessed grammar");
+    { std::ofstream empty(options.root / "plots.json"); empty << "{\"success\":true,\"plots\":[]}"; }
+    rejects([&] { SourceReadinessSnapshot initial(options, catalog, indices); (void)initial.check(catalog.roots[0], catalog.plots[0]); },
+        "initial source phase accepted files never acknowledged by its reader");
+    {
+        SourceReadinessSnapshot resumed(options, catalog, indices, {}, true);
+        for (auto const& plot : catalog.plots) (void)resumed.check(catalog.roots[plot.root], plot);
+        resumed.finish();
+    }
+    auto unreviewed = catalog; unreviewed.plots[0].native_identified = false;
+    rejects([&] { SourceReadinessSnapshot resumed(options, unreviewed, indices, {}, true); (void)resumed.check(catalog.roots[0], unreviewed.plots[0]); },
+        "unloaded recovery invented previously unobserved reader metadata");
+    write(root / "known.plot", legacy(false));
+    auto known = observe_inventory_file(catalog.roots[0], "known.plot");
+    FarmInventory known_catalog; known_catalog.version = catalog.version; known_catalog.roots = catalog.roots; known_catalog.plots = {known};
+    std::array<uint64_t, 1> known_index{0};
+    auto legacy_known_catalog = known_catalog;
+    observe_harvester_inventory(known_catalog, options);
+    require(!known_catalog.plots[0].native_identified && known_catalog.plots[0].reader == "gigahorse" &&
+        !known_catalog.plots[0].reader_identity.empty() && known_catalog.plots[0].plot_public_key.empty(),
+        "absent ordinary header lost route context or acquired invented loaded-file metadata");
+    {
+        SourceReadinessSnapshot snapshot(options, known_catalog, known_index);
+        auto header_only = snapshot.check(known_catalog.roots[0], known);
+        require(header_only.header_validated && !header_only.native_identified, "unloaded ordinary public-header identity required invented reader acknowledgement");
+        snapshot.finish();
+    }
+    write(root / "known.plot", {1});
+    rejects([&] { SourceReadinessSnapshot snapshot(options, known_catalog, known_index); (void)snapshot.check(known_catalog.roots[0], known); },
+        "unloaded known-header source mutation survived the native object fence");
+    fs::remove(root / "known.plot");
+    require(observe_sources_retired(options, known_catalog, known_index).no_loaded_record &&
+        observe_sources_retired(options, legacy_known_catalog, known_index).no_loaded_record,
+        "retired unloaded ordinary header could not release old arrivals under a fresh complete route registry");
+    {
+        std::ofstream loaded(options.root / "plots.json"); loaded << "{\"success\":true,\"plots\":[{\"filename\":";
+        profile_detail::quote(loaded, file_io::path_text(root / "known.plot")); loaded << ",\"plot_id\":\"" << known.plot_id << "\"}]}";
+    }
+    require(!observe_sources_retired(options, known_catalog, known_index).no_loaded_record,
+        "still-registered ordinary source released old arrivals");
+    { std::ofstream empty(options.root / "plots.json"); empty << "{\"success\":true,\"plots\":[]}"; }
+    auto stale_opaque = catalog; observe_harvester_inventory(stale_opaque, options);
+    require(std::none_of(stale_opaque.plots.begin(), stale_opaque.plots.end(), [](auto const& plot) { return plot.native_identified; }) &&
+        std::all_of(stale_opaque.plots.begin(), stale_opaque.plots.end(), [](auto const& plot) { return plot.status == "protected"; }),
+        "refresh retained stale opaque reader identification while its registry was empty");
+    auto malformed = catalog; malformed.plots[0].plot_id = std::string(64, '9');
+    rejects([&] { SourceReadinessSnapshot resumed(options, malformed, indices, {}, true); (void)resumed.check(catalog.roots[0], malformed.plots[0]); },
+        "unloaded recovery accepted malformed public plot-key/route identity metadata");
+    write(root / catalog.plots[0].relative_path, {1});
+    rejects([&] { SourceReadinessSnapshot resumed(options, catalog, indices, {}, true); (void)resumed.check(catalog.roots[0], catalog.plots[0]); },
+        "unloaded recovery ignored mutation of the exact reviewed native object");
+}
+
+#endif
+void adapters(fs::path const& directory)
+{
+    auto self = calibration_process::executable(); auto root = directory / "native"; fs::create_directories(root / "config");
+    write(directory / "native-source.plot", legacy(false));
+    { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 2\n"; }
+    HarvesterAdapterOptions options; options.executable = self; options.root = root;
+    {
+        auto bounded = options; bounded.limits.timeout_ms = 1000;
+        auto const config_before = stream_state::stamp(root / "config" / "config.yaml");
+        { std::ofstream flag(root / "version-delay"); flag << '1'; }
+        {
+            adapter_detail::Session individual(bounded);
+            require(adapter_detail::version(individual.rpc(AdapterOperation::harvester_version)) == "fixture-native-1",
+                "individual delayed RPC did not fit the adapter grant");
+        }
+        unsigned completed = 0; bool deadline = false;
+        try
+        {
+            adapter_detail::Session aggregate(bounded);
+            for (unsigned i = 0; i < 64; ++i)
+            {
+                require(adapter_detail::version(aggregate.rpc(AdapterOperation::harvester_version)) == "fixture-native-1",
+                    "delayed RPC returned an unexpected version");
+                ++completed;
+            }
+        }
+        catch (std::exception const& error) { deadline = std::string_view(error.what()).find("deadline") != std::string_view::npos; }
+        fs::remove(root / "version-delay");
+        require(completed >= 2 && deadline, "successful RPCs each received a fresh budget instead of sharing the adapter phase deadline");
+        require(stream_state::stamp(root / "config" / "config.yaml") == config_before,
+            "expired aggregate adapter phase changed its configuration");
+    }
+    auto projection = observe_network_projection(options);
+    require(projection.available && projection.network == "simulator0" && projection.genesis_challenge == std::string(64, 'a') && projection.plot_size == 28,
+        "actual typed RPC projection was not observed");
+    require(observe_target_network(options, projection, 28, 2).ready, "active target-only network gate incorrectly required a replacement publication");
+    ReplacementExpectation expected; expected.path = directory / "published.plot2"; expected.network = "simulator0"; expected.genesis_challenge = std::string(64, 'a');
+    expected.reader_version = projection.reader_version; expected.reader_identity = projection.reader_identity;
+    expected.network_version = projection.version;
+    expected.farmer_version = projection.farmer_version; expected.solver_version = projection.solver_version;
+    expected.k = 28; expected.strength = 2; expected.members = 4; expected.farmer_public_key = std::string(96, '6'); expected.pool_contract_puzzle_hash = std::string(64, '4');
+    std::string const loaded_key(96, '5'); expected.group_id = adapter_detail::group_id_from_loaded_key(loaded_key, expected.pool_contract_puzzle_hash, expected.strength);
+    PlotGroupFile::Header header{}; header.magic = PlotGroupFile::MAGIC; header.version = PlotGroupFile::FORMAT_VERSION; header.k = expected.k;
+    header.strength = expected.strength; header.group_size = expected.members; header.group_id = PlotGroupId(expected.group_id); header.memo_length = 112; header.chunk_index_offset = 200;
+    std::vector<uint8_t> bytes(256); std::memcpy(bytes.data(), &header, sizeof(header));
+    std::fill(bytes.begin() + sizeof(header), bytes.begin() + sizeof(header) + 32, uint8_t(0x44));
+    std::fill(bytes.begin() + sizeof(header) + 32, bytes.begin() + sizeof(header) + 80, uint8_t(0x66));
+    std::fill(bytes.begin() + sizeof(header) + 80, bytes.begin() + sizeof(header) + 112, uint8_t(0x99)); write(expected.path, bytes);
+    std::array<fs::path, 1> roots{directory}; auto observed = scan_farm_inventory(roots);
+    auto found = std::find_if(observed.plots.begin(), observed.plots.end(), [](auto const& p) { return p.relative_path == "published.plot2"; });
+    require(found != observed.plots.end(), "replacement fixture not inventoried"); expected.identity = found->identity;
+    auto loaded = [&](std::string const& key)
+    {
+        std::ofstream out(root / "plots.json"); out << "{\"success\":true,\"plots\":[{\"filename\":"; profile_detail::quote(out, file_io::path_text(expected.path));
+        out << ",\"size\":130,\"plot_id\":\"" << expected.group_id << "\",\"file_size\":" << expected.identity.stamp.bytes << ",\"time_modified\":" << expected.identity.stamp.mtime
+            << ",\"pool_contract_puzzle_hash\":\"" << expected.pool_contract_puzzle_hash << "\",\"plot_public_key\":\"" << key << "\",\"group_size\":" << expected.members << "}]}";
+    };
+    TargetServiceExpectation service{expected.farmer_public_key, expected.pool_public_key, expected.pool_contract_puzzle_hash};
+    require(observe_target_prerequisites(options, projection, 28, 2, service).ready,
+        "empty target registry incorrectly required a fabricated new-plot/key acknowledgement");
+    { std::ofstream flag(root / "summary-only"); flag << '1'; }
+    observe_farming_health(options, projection, 28, 2, service);
+    {
+        FarmingHealthMonitor monitor(options, projection, 28, 2, service);
+        auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!monitor.reason().empty() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(monitor.reason().empty(), "live health monitor did not recover after a fresh healthy observation");
+        { std::ofstream flag(root / "farmer-unavailable"); flag << '1'; }
+        auto changed = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (monitor.reason().empty() && std::chrono::steady_clock::now() < changed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(monitor.reason() == "unavailable-farming-health", "live health monitor retained a healthy observation after service loss");
+        fs::remove(root / "farmer-unavailable");
+        changed = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (!monitor.reason().empty() && std::chrono::steady_clock::now() < changed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(monitor.reason().empty(), "live health monitor did not recover after service return");
+        monitor.observe_latency(6000000, 10000000);
+        require(monitor.reason() == "degraded-farming-response", "slow farming observation did not pause the automatic policy");
+    }
+    fs::remove(root / "summary-only");
+    { std::ofstream flag(root / "harvester-advertised"); flag << '1'; }
+    require(observe_target_prerequisites(options, projection, 28, 2, service).ready,
+        "matching advertised harvester ports were refused");
+    fs::remove(root / "harvester-advertised");
+    for (char const* failure : {"farmer-unavailable", "farmer-disconnected", "farmer-mismatch", "node-mismatch", "farmer-syncing",
+        "farmer-zero-sync", "farmer-future-sync", "solver-stopped", "solver-disconnected", "solver-mismatch", "solver-network",
+        "pool-uninitialized", "pool-version-invalid", "pool-mismatch", "farmer-version", "solver-version", "farmer-zero-port", "harvester-port-mismatch"})
+    {
+        { std::ofstream flag(root / failure); flag << '1'; }
+        require(!observe_target_prerequisites(options, projection, 28, 2, service).ready, "missing genuine target service prerequisite was accepted");
+        rejects([&] { observe_farming_health(options, projection, 28, 2, service); },
+            "automatic health check accepted an unavailable or changed farming service");
+        fs::remove(root / failure);
+    }
+    auto og = service; og.pool_public_key = std::string(96, '4'); og.pool_contract_puzzle_hash.clear();
+    require(observe_target_prerequisites(options, projection, 28, 2, og).ready, "OG public route was unnecessarily refused");
+    { std::ofstream external(root / "pool-external"); external << '1'; }
+    auto pooled = observe_target_prerequisites(options, projection, 28, 2, service);
+    require(pooled.ready && pooled.pool.external && pooled.pool.difficulty == 17 && pooled.pool.protocol_version == 1,
+        "ordinary initialized pool startup required a partial or invented authentication evidence");
+    { std::ofstream modern(root / "pool-v2"); modern << '1'; }
+    pooled = observe_target_prerequisites(options, projection, 28, 2, service);
+    require(pooled.ready && pooled.pool.protocol_version == 2, "RewardPuzzle v2 route was refused");
+    fs::remove(root / "pool-v2"); fs::remove(root / "pool-external");
+    { std::ofstream other(root / "other-harvester"); other << '1'; }
+    auto other_receivers = observe_target_prerequisites(options, projection, 28, 2, service);
+    require(other_receivers.ready && other_receivers.other_harvesters.size() == 1 && other_receivers.other_harvesters[0].files == 1 && other_receivers.other_harvesters[0].members == 4,
+        "other receiver population was hidden or conflated with the selected exact file scope");
+    {
+        TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
+        { std::ofstream growth(root / "other-harvester-growth"); growth << '1'; }
+        rejects([&] { snapshot.finish(); }, "new other-harvester workload escaped the live phase lease");
+        fs::remove(root / "other-harvester-growth");
+    }
+    { std::ofstream empty(root / "other-harvester-empty"); empty << '1'; }
+    { std::ofstream syncing(root / "other-harvester-syncing"); syncing << '1'; }
+    require(!observe_target_prerequisites(options, projection, 28, 2, service).ready,
+        "empty partial sync was mistaken for a known empty other-harvester workload");
+    fs::remove(root / "other-harvester-syncing");
+    {
+        TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
+        snapshot.finish();
+        { std::ofstream syncing(root / "other-harvester-syncing"); syncing << '1'; }
+        rejects([&] { snapshot.finish(); }, "empty other receiver began synchronization without invalidating readiness");
+        fs::remove(root / "other-harvester-syncing");
+    }
+    fs::remove(root / "other-harvester-empty"); fs::remove(root / "other-harvester");
+    auto remote = options; remote.host = "fixture-harvester";
+    for (auto const& [role, host, node, farmer] : {std::tuple{"harvester", "10.0.0.1", '3', '1'},
+        std::tuple{"farmer", "10.0.0.2", '1', '1'}, std::tuple{"full_node", "10.0.0.3", '4', '2'}, std::tuple{"solver", "10.0.0.4", '5', '2'}})
+    {
+        FarmServiceBinding binding; binding.root = directory / (std::string("remote-") + role); binding.rpc_host = host;
+        binding.host = std::string("fixture-") + role; binding.node_id = std::string(64, node); binding.farmer_node_id = std::string(64, farmer);
+        fs::create_directories(binding.root / "config");
+        { std::ofstream config(binding.root / "config" / "config.yaml"); config << "self_hostname: " << host << "\nharvester:\n  num_threads: 2\n"; }
+        { std::ofstream flags(binding.root / "remote-peers"); flags << '1'; }
+        if (std::string_view(role) == "harvester") { remote.root = binding.root; remote.rpc_host = binding.rpc_host; }
+        remote.services.emplace(role, std::move(binding));
+    }
+    auto remote_projection = observe_network_projection(remote);
+    require(remote_projection.available && remote_projection.reader_identity != projection.reader_identity &&
+        observe_target_prerequisites(remote, remote_projection, 28, 2, service).ready,
+        "explicit authenticated remote contexts and reciprocal TLS node IDs were refused");
+    auto misbound = remote; misbound.services.at("solver").node_id = std::string(64, '8');
+    auto misbound_projection = observe_network_projection(misbound);
+    require(!observe_target_prerequisites(misbound, misbound_projection, 28, 2, service).ready,
+        "remote solver service was matched by host/port instead of its explicit TLS identity");
+    require(target_service_hosts(remote).at("solver") == "fixture-solver", "remote service lost its physical resource host binding");
+    auto unreviewed = projection; unreviewed.farmer_version.clear();
+    require(!observe_target_prerequisites(options, unreviewed, 28, 2, service).ready, "unreviewed service version silently authorized execution");
+    { std::ofstream flag(root / "farmer-unavailable"); flag << '1'; }
+    auto forecast = observe_network_projection(options); fs::remove(root / "farmer-unavailable");
+    require(forecast.available && forecast.farmer_version.empty() && !forecast.service_status.empty(), "missing service removed network-only forecast capability");
+    loaded(loaded_key);
+    std::vector<ResourcePreparationFact> reader_configuration;
+    observe_harvester_inventory(observed, options, true, &reader_configuration);
+    require(reader_configuration.size() == 1 && reader_configuration[0].value == "2" && reader_configuration[0].basis == "observed" &&
+        reader_configuration[0].scope.find("Not an OS CPU cap") != std::string::npos,
+        "configured reader threads became a bounded physical CPU grant");
+    auto enriched = std::find_if(observed.plots.begin(), observed.plots.end(), [](auto const& p) { return p.relative_path == "published.plot2"; });
+    require(enriched != observed.plots.end() && enriched->reader == "chia" && enriched->reader_version == "fixture-native-1", "installed reader inventory provenance was lost");
+    require(!observe_replacement_readiness(options, expected).ready, "public metadata substituted for private first-publication evidence");
+    ReplacementPublication publication{expected.path, expected.identity, std::string(64, 'b'), 0};
+    require(observe_replacement_readiness(options, expected, publication).ready, "actual native API fields could not attest a sealed first publication");
+    for (char const* failure : {"connection-churn", "sync-churn", "farmer-syncing", "solver-stopped", "pool-external", "farmer-version", "solver-version", "harvester-version", "full-node-version", "inactive", "unsynced"})
+    {
+        TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
+        require(snapshot.check(expected, publication).ready, "service drift fixture did not begin with exact sync");
+        { std::ofstream flag(root / failure); flag << '1'; }
+        rejects([&] { snapshot.finish(); }, "service connection/sync/pool/version drift survived snapshot finish"); fs::remove(root / failure);
+    }
+    {
+        TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
+        require(snapshot.check(expected, publication).ready, "replacement path fence fixture did not begin ready");
+        snapshot.finish();
+        auto hidden = expected.path; hidden += ".hidden"; fs::rename(expected.path, hidden);
+        rejects([&] { snapshot.finish(); }, "local replacement deletion escaped unchanged cached RPC metadata");
+        fs::rename(hidden, expected.path);
+        expected.identity = observe_inventory_file(observed.roots[0], "published.plot2").identity; publication.identity = expected.identity; loaded(loaded_key);
+    }
+    {
+        auto short_options = options; short_options.limits.timeout_ms = 1000;
+        TargetReadinessSnapshot snapshot(short_options, projection, expected.k, expected.strength, service);
+        require(snapshot.check(expected, publication).ready, "expiry fixture did not begin ready");
+        snapshot.finish(); std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        rejects([&] { snapshot.finish(); }, "expired readiness phase lease authorized another retirement action");
+    }
+    auto farmer_override = [&](bool empty, bool group)
+    {
+        std::ifstream in(root / "plots.json"); std::string raw((std::istreambuf_iterator<char>(in)), {});
+        if (empty) raw = "{\"plots\":[]}";
+        else if (!group)
+        { auto const field = ",\"group_size\":" + std::to_string(expected.members); auto at = raw.find(field); require(at != raw.npos, "missing group fixture field"); raw.erase(at, field.size()); }
+        { std::ofstream out(root / "farmer-plots.json"); out << raw; }
+        { std::ofstream flag(root / "farmer-override"); flag << '1'; }
+    };
+    farmer_override(true, true);
+    auto pending = observe_replacement_readiness(options, expected, publication);
+    require(!pending.ready && pending.retryable, "missing farmer synchronization was accepted or classified as a permanent failure");
+    farmer_override(false, false);
+    require(!observe_replacement_readiness(options, expected, publication).ready, "farmer without multi-member metadata attested an entire group");
+    fs::remove(root / "farmer-override");
+    auto const multiple = expected; auto single_bytes = bytes; auto single_header = header; single_header.group_size = 1;
+    std::memcpy(single_bytes.data(), &single_header, sizeof(single_header)); expected.path = directory / "single-member.plot2"; expected.members = 1;
+    write(expected.path, single_bytes); expected.identity = observe_inventory_file(observed.roots[0], "single-member.plot2").identity;
+    loaded(loaded_key); farmer_override(false, false);
+    require(observe_replacement_readiness(options, expected, ReplacementPublication{expected.path, expected.identity, std::string(64, 'b'), 0}).ready,
+        "single-member farmer compatibility incorrectly required new group metadata");
+    fs::remove(root / "farmer-override"); expected = multiple; loaded(loaded_key);
+    target_prefix_snapshot(options, projection, observed.roots[0], expected, bytes, loaded_key); loaded(loaded_key);
+    loaded(std::string(96, '7')); auto mismatch = observe_replacement_readiness(options, expected, publication);
+    require(!mismatch.ready && !mismatch.retryable, "wrong loaded public key route was accepted or classified as a temporary outage"); loaded(loaded_key);
+    { std::ofstream inactive(root / "inactive"); inactive << '1'; }
+    require(!observe_replacement_readiness(options, expected, publication).ready, "preactivation last transaction height accepted"); fs::remove(root / "inactive");
+    { std::ofstream inactive(root / "inactive"); inactive << '1'; }
+    require(!observe_target_network(options, projection, 28, 2).ready, "target-only predelete gate accepted inactive consensus"); fs::remove(root / "inactive");
+    require(!observe_source_retired(options, observed.roots[0], *enriched).no_loaded_record, "loaded source prematurely released arrivals");
+    { std::ofstream absent(root / "plots.json"); absent << "{\"success\":true,\"plots\":[]}"; }
+    require(observe_source_retired(options, observed.roots[0], *enriched).no_loaded_record, "fresh native source absence was not observed");
+    unsigned count = 0, after = 0; { std::ifstream in(root / "registry-count"); in >> count; }
+    std::vector<uint64_t> indices{uint64_t(enriched - observed.plots.begin())};
+    require(observe_sources_retired(options, observed, indices).no_loaded_record, "batch source absence was unavailable");
+    { std::ifstream in(root / "registry-count"); in >> after; }
+    require(after == count + 1, "batch source absence repeated per-file registry queries");
+    {
+        std::ofstream outside(root / "plots.json"); outside << "{\"success\":true,\"plots\":[{\"filename\":";
+        profile_detail::quote(outside, file_io::path_text(directory / "omitted-root" / "legacy.plot"));
+        outside << ",\"plot_id\":\"" << std::string(64, '7') << "\"}]}";
+    }
+    rejects([&] { observe_harvester_inventory(observed, options); }, "inventory silently omitted a loaded outside-root plot");
+    rejects([&] { observe_registry_scope(options, observed); }, "runtime scope silently omitted a loaded outside-root plot");
+    require(!observe_sources_retired(options, observed, indices).no_loaded_record,
+        "uncovered outside registry scope released selected cohort arrivals");
+    loaded(loaded_key);
+    auto nonplot_catalog = observed; auto& classified = nonplot_catalog.plots[size_t(enriched - observed.plots.begin())];
+    classified.header_validated = false; classified.status = "non-plot"; classified.reason = "explicit reviewed classification";
+    rejects([&] { observe_registry_scope(options, nonplot_catalog); }, "loaded path retained a zero-workload non-plot classification");
+    { std::ofstream absent(root / "plots.json"); absent << "{\"success\":true,\"plots\":[]}"; }
+#ifdef __linux__
+    auto proprietary = std::find_if(observed.plots.begin(), observed.plots.end(), [](auto const& p) { return p.relative_path == "unknown.drplot"; });
+    require(proprietary != observed.plots.end(), "missing native failure fixture");
+    options.kind = HarvesterAdapterKind::gigahorse;
+    auto proprietary_bytes = legacy(false); auto native_id = adapter_detail::legacy_id_from_loaded_key(loaded_key, std::string(64, '4'));
+    auto native_id_bytes = group_tools::hex(native_id); std::copy(native_id_bytes.begin(), native_id_bytes.end(), proprietary_bytes.begin() + 19);
+    proprietary_bytes[54] = 'x'; // A genuinely unknown header grammar to our parser.
+    write(directory / "native-opaque.plot", proprietary_bytes);
+    auto native_plot = observe_inventory_file(observed.roots[0], "native-opaque.plot");
+    require(!native_plot.header_validated && native_plot.status == "protected", "unknown native container was guessed");
+    auto native_registry = [&]
+    {
+        std::ofstream out(root / "plots.json"); out << "{\"success\":true,\"plots\":[{\"filename\":"; profile_detail::quote(out, file_io::path_text(directory / "native-opaque.plot"));
+        out << ",\"size\":32,\"plot_id\":\"" << native_id << "\",\"file_size\":" << native_plot.identity.stamp.bytes << ",\"time_modified\":" << native_plot.identity.stamp.mtime
+            << ",\"pool_contract_puzzle_hash\":\"" << std::string(64, '4') << "\",\"plot_public_key\":\"" << loaded_key << "\",\"compression_level\":7}]}";
+    };
+    native_registry(); FarmInventory native_catalog; native_catalog.version = observed.version; native_catalog.roots = observed.roots; native_catalog.plots = {native_plot}; native_catalog.complete = true;
+    observe_harvester_inventory(native_catalog, options); native_plot = native_catalog.plots[0];
+    require(native_plot.native_identified && native_plot.members == 1 && native_plot.status == "native-observed" && native_plot.farmer_public_key.empty() && native_plot.container == PlotContainer::unknown,
+        "native observation invented undisclosed proprietary metadata");
+    std::array<uint64_t, 1> native_indices{0};
+    {
+        auto original = native_catalog; original.network = observe_network_projection(options); original.captured_at = "origin-snapshot";
+        auto header_only = original.plots[0]; header_only.reader_identity.clear(); header_only.header_validated = true;
+        header_only.host = profile_detail::host_name();
+        adapter_detail::require_source_resource_binding(options, header_only);
+        auto moved = options; moved.host = "different-source-host";
+        rejects([&] { adapter_detail::require_source_resource_binding(moved, header_only); },
+            "header-only source lost its known physical host binding when no reader tuple was present");
+        header_only.solver = "original-solver";
+        rejects([&] { adapter_detail::require_source_resource_binding(options, header_only); },
+            "header-only source lost its known solver binding when no reader tuple was present");
+        auto provisional = original;
+        { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 3\n"; }
+        auto active_readers = refresh_replot_reader_observations(provisional, {}, options, {});
+        require(active_readers.size() == 1 && !active_readers[0].source.empty() && !active_readers[0].captured_at.empty() &&
+            provisional.captured_at == original.captured_at && provisional.plots[0].reader_identity != original.plots[0].reader_identity &&
+            provisional.plots[0].identity == original.plots[0].identity && provisional.plots[0].status == original.plots[0].status &&
+            provisional.plots[0].native_identified == original.plots[0].native_identified,
+            "active reader refresh changed original object/classification or lost fresh snapshot provenance");
+        auto const reviewed_text = farm_inventory_text(provisional);
+        validate_replot_reader_observations(provisional, {}, options, {});
+        require(farm_inventory_text(provisional) == reviewed_text, "successor reader validation changed saved provenance or classification");
+        auto protected_catalog = provisional; protected_catalog.plots[0].status = "protected";
+        protected_catalog.plots[0].reason = "retained opaque cohort outside the current retirement batch";
+        auto const protected_text = farm_inventory_text(protected_catalog);
+        for (bool wrong_key : {false, true})
+        {
+            native_registry();
+            std::ifstream input(root / "plots.json"); auto text = profile_detail::read_text(input, 65536);
+            auto const field = wrong_key ? loaded_key : std::string("\"compression_level\":7");
+            auto const replacement = wrong_key ? std::string(96, '7') : std::string("\"compression_level\":8");
+            auto at = text.find(field); require(at != text.npos, "missing opaque metadata comparison fixture"); text.replace(at, field.size(), replacement);
+            { std::ofstream output(root / "plots.json"); output << text; }
+            observe_registry_scope(options, protected_catalog);
+            rejects([&] { validate_replot_reader_observations(protected_catalog, {}, options, {}); },
+                "same-ID/path protected opaque metadata bypassed preactivation successor validation");
+            require(farm_inventory_text(protected_catalog) == protected_text, "failed successor validation changed opaque metadata or protection");
+        }
+        native_registry();
+        { std::ofstream absent(root / "plots.json"); absent << "{\"success\":true,\"plots\":[]}"; }
+        rejects([&] { (void)refresh_replot_reader_observations(provisional, {}, options, {}); },
+            "unloaded active opaque source acquired unchecked current identification");
+        { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 4\n"; }
+        auto const origin_reader = provisional.plots[0].reader_identity;
+        auto current_readers = refresh_replot_reader_observations(provisional, {}, options, native_indices);
+        require(provisional.plots[0].reader_identity == origin_reader && current_readers[0].identity != origin_reader,
+            "nonactive source origin provenance was replaced by current route metadata");
+        RevalidationReaderAllowance allowance(provisional, current_readers, native_indices);
+        auto refreshed_options = options; refreshed_options.revalidation = &allowance;
+        auto const nonactive_text = farm_inventory_text(provisional);
+        validate_replot_reader_observations(provisional, {}, refreshed_options, native_indices);
+        require(farm_inventory_text(provisional) == nonactive_text, "validation replaced a durable nonactive source's historical identification");
+        {
+            SourceReadinessSnapshot snapshot(refreshed_options, provisional, native_indices, {}, true);
+            auto retained = snapshot.check(provisional.roots[0], provisional.plots[0]); snapshot.finish();
+            require(retained.reader_identity == origin_reader && retained.identity == provisional.plots[0].identity,
+                "durable unloaded source was presented as newly identified by a changed reader");
+        }
+        require(observe_sources_retired(refreshed_options, provisional, native_indices).no_loaded_record,
+            "native-audited nonactive route could not use its separately refreshed current reader");
+        RevalidationReaderAllowance active_only(provisional, current_readers, {});
+        refreshed_options.revalidation = &active_only;
+        rejects([&] { observe_registry_scope(refreshed_options, provisional); },
+            "public current-reader mapping bypassed an active source's original identification");
+        auto changed_scope = provisional; changed_scope.network.genesis_challenge = std::string(64, 'b');
+        rejects([&] { (void)refresh_replot_reader_observations(changed_scope, {}, options, native_indices); },
+            "reader refresh changed immutable network genesis");
+        { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 2\n"; }
+        native_registry();
+    }
+    {
+        SourceReadinessSnapshot snapshot(options, native_catalog, native_indices);
+        (void)snapshot.check(native_catalog.roots[0], native_plot); snapshot.finish();
+    }
+    auto stale_catalog = native_catalog; stale_catalog.plots[0].reader_version = "older-reader";
+    rejects([&] { SourceReadinessSnapshot snapshot(options, stale_catalog, native_indices);
+        (void)snapshot.check(stale_catalog.roots[0], stale_catalog.plots[0]); snapshot.finish(); },
+        "changed reader version silently refreshed reviewed costs");
+    stale_catalog = native_catalog; stale_catalog.plots[0].checker_identity = std::string(64, '0');
+    {
+        SourceReadinessSnapshot snapshot(options, stale_catalog, native_indices);
+        (void)snapshot.check(stale_catalog.roots[0], stale_catalog.plots[0]); snapshot.finish();
+    } // Historical optional diagnostics are not retirement authority.
+    { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 3\n"; }
+    rejects([&] { SourceReadinessSnapshot snapshot(options, native_catalog, native_indices);
+        (void)snapshot.check(native_catalog.roots[0], native_plot); snapshot.finish(); },
+        "changed reader configuration silently refreshed reviewed costs");
+    { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 2\n"; }
+    InventorySourcePin pin(native_catalog.roots[0], native_plot, options.limits);
+    fs::rename(directory / "native-opaque.plot", directory / ".claim" / "native");
+    { std::ofstream absent(root / "plots.json"); absent << "{\"success\":true,\"plots\":[]}"; }
+    require(pin.matches_claim(".claim/native", options.limits), "native claim rename lost the exact held object");
+    {
+        InventorySourcePin recovered(native_catalog.roots[0], native_plot, options.limits, ".claim/native");
+        require(recovered.matches_claim(".claim/native", options.limits),
+            "claimed recovery incorrectly required original-path loaded registry state");
+    }
+    fs::rename(directory / ".claim" / "native", directory / ".claim" / "native-original");
+    write(directory / ".claim" / "native", proprietary_bytes);
+    require(!pin.matches_claim(".claim/native", options.limits), "replacement claim object matched the held native identity");
+    rejects([&] { InventorySourcePin recovered(native_catalog.roots[0], native_plot, options.limits, ".claim/native"); },
+        "substituted claim object accepted for recovered native identity");
+    fs::remove(directory / ".claim" / "native");
+    fs::rename(directory / ".claim" / "native-original", directory / ".claim" / "native");
+    write(directory / ".claim" / "native", {1});
+    require(!pin.matches_claim(".claim/native", options.limits), "claimed native object mutation was ignored");
+    rejects([&] { InventorySourcePin recovered(native_catalog.roots[0], native_plot, options.limits, ".claim/native"); },
+        "changed native object accepted for claimed recovery");
+    source_metadata_snapshot(directory, options, loaded_key);
+#endif
+    AdapterCommand command; command.executable = self; command.root = directory / "flood";
+    calibration_process::Limits limits{64 * 1024 * 1024, 2000, 4096, {}};
+    rejects([&] { (void)run_farm_adapter(command, limits); }, "native output bound ignored");
+    command.root = directory / "timeout"; limits.timeout_ms = 50;
+    rejects([&] { (void)run_farm_adapter(command, limits); }, "native adapter deadline ignored");
+    command.root = root; limits.timeout_ms = 2000; limits.cancelled = [] { return true; };
+    rejects([&] { (void)run_farm_adapter(command, limits); }, "native adapter cancellation ignored");
+    { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: farm.example.com\nharvester:\n  num_threads: 2\n"; }
+    require(!observe_network_projection(options).available, "nonloopback native adapter accepted");
+}
+void retirement_configuration(fs::path const& directory)
+{
+    std::string const discovered = "harvester:\n  plot_directories:\n  - relative/plots\n  - relative/plots\n";
+    require(adapter_detail::RetirementConfigReader(discovered, 1024 * 1024).read(false).directories ==
+        std::vector<std::string>{"relative/plots", "relative/plots"},
+        "configuration discovery rejected paths before normalization and deduplication");
+    rejects([&] { (void)adapter_detail::RetirementConfigReader(discovered, 1024 * 1024).read(); },
+        "relaxed discovery changed strict retirement configuration authority");
+    auto root = directory / "removal-config", old = directory / "removal-old", target = directory / "removal-target";
+    fs::create_directories(root / "config"); fs::create_directory(old); fs::create_directory(target); write(old / "one.plot", legacy(false));
+    HarvesterAdapterOptions options; options.root = root; options.executable = calibration_process::executable(); options.host = "fixture-host";
+    auto configuration = [&](bool source, bool replacement, bool addition = false)
+    {
+        std::ostringstream out;
+        out << "# conventional native configuration\nself_hostname: &self_hostname \"localhost\"\nother: &shared\n  label: 'true'\n  enabled: true\n  ratio: 1.5\nharvester:\n  num_threads: 1\n  plot_directories:\n";
+        for (auto const& [include, path] : {std::pair{source, old}, {replacement, target}, {addition, directory / "unreviewed"}})
+            if (include) { out << "  - "; profile_detail::quote(out, file_io::path_text(path)); out << '\n'; }
+        if (!source && !replacement && !addition) out << "    []\n";
+        out << "  farmer_peers:\n  - host: *self_hostname\n    port: 8447\ncopy: *shared\n"; return out.str();
+    };
+    auto save = [&](std::string const& text) { std::ofstream out(root / "config" / "config.yaml"); out << text; };
+    auto original = configuration(true, true); save(original);
+    std::array<fs::path, 1> roots{old}; auto catalog = scan_farm_inventory(roots); observe_harvester_inventory(catalog, options);
+    catalog.network = observe_network_projection(options, &catalog);
+    require(catalog.retirement_readers.size() == 1, "conventional config did not record optional retirement context");
+    auto encoded = farm_inventory_text(catalog);
+    require(farm_inventory_text(parse_farm_inventory(encoded)) == encoded, "optional retirement context failed deterministic catalog roundtrip");
+    auto legacy_catalog = catalog; legacy_catalog.retirement_readers.clear();
+    auto legacy_encoded = farm_inventory_text(legacy_catalog);
+    require(legacy_encoded.find("retirement_readers") == legacy_encoded.npos && farm_inventory_text(parse_farm_inventory(legacy_encoded)) == legacy_encoded,
+        "strict legacy catalogs acquired new serialized policy bytes");
+    auto unexpected = encoded; auto at = unexpected.find("\"retirement_identity\":"); unexpected.insert(at, "\"unreviewed\":true,");
+    rejects([&] { (void)parse_farm_inventory(unexpected); }, "unknown retirement authority field was silently accepted");
+    RetirementConfigurationAllowance allowance(catalog, options.limits); allowance.authorize(options, catalog.roots[0]); allowance.retain(options, file_io::path_text(target));
+    auto permitted = options; permitted.retirement = &allowance;
+    auto matches = [&](HarvesterAdapterOptions const& value)
+    { adapter_detail::Session session(value); return session.matches_reader_identity(catalog.plots[0].reader_identity); };
+    save(original + "# no-op rewrite\n");
+    require(!matches(permitted), "canonical formatting alone became general config compatibility");
+    save(configuration(false, true));
+    require(!matches(options) && matches(permitted), "authorized source-directory removal either bypassed strict policy or remained unusable");
+    require(observe_target_network(permitted, catalog.network, 28, 2).ready, "same-config source removal blocked target network provenance");
+    validate_replot_reader_observations(catalog, {}, permitted, {});
+    require(farm_inventory_text(catalog) == encoded, "read-only successor validation rewrote legitimate removal-only reader provenance");
+    rejects([&] { validate_replot_reader_observations(catalog, {}, options, {}); },
+        "successor validation silently accepted source-directory removal without private authorization");
+    auto trailing = options; trailing.root /= "";
+    RetirementConfigurationAllowance trailing_allowance(catalog, options.limits);
+    trailing_allowance.authorize(trailing, catalog.roots[0]); trailing_allowance.retain(trailing, file_io::path_text(target)); trailing.retirement = &trailing_allowance;
+    require(matches(trailing) && observe_target_network(trailing, catalog.network, 28, 2).ready,
+        "trailing reader-root separator blocked authorized source removal or shared target provenance");
+    RetirementConfigurationAllowance trailing_retained(catalog, options.limits);
+    trailing_retained.authorize(trailing, catalog.roots[0]); trailing_retained.retain(trailing, file_io::path_text(old / "replacement")); trailing.retirement = &trailing_retained;
+    require(!matches(trailing), "trailing reader-root separator bypassed retained target ancestry");
+    std::array<uint64_t, 1> indices{0};
+    { SourceReadinessSnapshot snapshot(permitted, catalog, indices); (void)snapshot.check(catalog.roots[0], catalog.plots[0]); snapshot.finish(); }
+    {
+        auto fresh = scan_farm_inventory(roots); observe_harvester_inventory(fresh, permitted);
+        require(fresh.plots[0].reader_identity != catalog.plots[0].reader_identity, "fresh inventory reported the compatibility alias as actual raw provenance");
+    }
+    RetirementConfigurationAllowance strict(legacy_catalog, options.limits); strict.authorize(options, legacy_catalog.roots[0]);
+    auto old_policy = options; old_policy.retirement = &strict;
+    require(!matches(old_policy), "legacy inventory silently gained removal authority");
+    save(configuration(false, true, true)); require(!matches(permitted), "source unload admitted a new plot directory");
+    save(configuration(true, false)); require(!matches(permitted), "source unload removed a retained replacement directory");
+    auto changed = configuration(false, true); at = changed.find("ratio: 1.5"); changed.replace(at, std::string("ratio: 1.5").size(), "ratio: 2.5"); save(changed);
+    require(!matches(permitted), "non-directory service configuration drift survived retirement compatibility");
+    save(configuration(false, true));
+    auto changed_host = permitted; changed_host.host = "other-physical-host";
+    require(!matches(changed_host), "retirement compatibility omitted the physical host binding");
+    auto changed_service = permitted;
+    FarmServiceBinding service; service.root = root; service.rpc_host = "localhost"; service.host = options.host;
+    changed_service.services.emplace("farmer", service);
+    require(!matches(changed_service), "retirement compatibility omitted service-role bindings");
+    { adapter_detail::Session session(changed_service); require(session.retirement_context().configurations.size() == 1, "shared service config roots were duplicated"); }
+    auto copy = directory / "different-reader-executable"; fs::copy_file(options.executable, copy);
+    auto changed_executable = permitted; changed_executable.executable = copy;
+    require(!matches(changed_executable), "retirement compatibility omitted the exact executable path/implementation"); fs::remove(copy);
+    RetirementConfigurationAllowance nested(catalog, options.limits); nested.authorize(options, catalog.roots[0]); nested.retain(options, file_io::path_text(old / "replacement"));
+    auto ancestor = options; ancestor.retirement = &nested;
+    require(!matches(ancestor), "removing an ancestor directory disabled retained replacement discovery");
+#ifdef _WIN32
+    FarmInventory mixed_case; mixed_case.roots.push_back(catalog.roots[0]); mixed_case.roots[0].path = "D:\\farm";
+    RetirementConfigurationAllowance native_case(mixed_case, options.limits); native_case.authorize(options, mixed_case.roots[0]);
+    native_case.retain(options, "d:\\FARM\\replacement");
+    require(!native_case.permits(stream_state::digest(file_io::path_text(options.root)), "D:\\farm"), "Windows case spelling concealed retained target ancestry");
+#else
+    RetirementConfigurationAllowance native_case(catalog, options.limits); native_case.authorize(options, catalog.roots[0]);
+    native_case.retain(options, file_io::path_text(directory / "REMOVAL-OLD" / "replacement"));
+    require(native_case.permits(stream_state::digest(file_io::path_text(options.root)), file_io::path_text(old)), "native target ancestry lost Linux case sensitivity");
+#endif
+    auto fingerprint = [&](std::string const& text) { return adapter_detail::retirement_config(text, options.limits.memory_bytes / 4).identity; };
+    auto reordered = std::string("copy:\n  ratio: 1.50\n  enabled: True\n  label: \"true\"\nharvester:\n  farmer_peers:\n  - host: localhost\n    port: 8447\n  num_threads: 1\n  plot_directories:\n  - ") + [&] { std::ostringstream out; profile_detail::quote(out, file_io::path_text(target)); return out.str(); }() +
+        "\nother:\n  enabled: true\n  label: true\n  ratio: 1.5\nself_hostname: localhost\n";
+    auto string_label = reordered; at = string_label.find("label: true"); string_label.replace(at, 11, "label: 'true'");
+    require(fingerprint(original) == fingerprint(string_label) && fingerprint(original) != fingerprint(reordered), "canonical YAML changed a scalar type or failed alias/map ordering");
+    for (auto suffix : {"bad: true\nbad: false\n", "bad: {x: 1}\n", "bad: &cycle\n  self: *cycle\n", "bad: !!str hello\n", "true: 1\n1: 2\n", "bad: 0123\n", "bad: -\n", "bad: :\n", "bad: -.inf\n"})
+        require(fingerprint(original + suffix).empty(), "ambiguous, duplicate, cyclic or unsupported YAML gained retirement authority");
+    auto set = original + "keys: !!set\n  public: null\n  second: null\n";
+    auto reordered_set = original + "keys: !!set\n  second:\n  'public': ~\n";
+    require(!fingerprint(set).empty() && fingerprint(set) == fingerprint(reordered_set), "native bounded string-key YAML set lost its exact semantics");
+    require(!fingerprint(original + "keys: !!set {}\n").empty(), "empty standard YAML set lost optional retirement compatibility");
+    require(fingerprint(original + "keys: !!set\n  public: true\n").empty(), "YAML set with non-null values gained retirement authority");
+    for (auto const& [raw, escaped] : {std::pair{"\xc2\x85", "\\u0085"}, {"\xe2\x80\xa8", "\\u2028"}, {"\xe2\x80\xa9", "\\u2029"}})
+    {
+        require(fingerprint(original + "unicode: \"" + raw + "\"\n").empty(), "raw YAML line separators were mistaken for literal JSON string content");
+        require(fingerprint(original + "# comment" + raw + "non_directory: changed\n").empty(), "Unicode line break hid a native configuration key behind a comment");
+        require(!fingerprint(original + "unicode: \"" + escaped + "\"\n").empty(), "literal escaped Unicode text was mistaken for a raw YAML line break");
+    }
+    require(fingerprint(original + "# comment\rnon_directory: changed\n").empty(), "bare carriage return hid a native configuration key behind a comment");
+    std::string crlf; for (char c : original) { if (c == '\n') crlf += '\r'; crlf += c; }
+    require(fingerprint(crlf) == fingerprint(original), "ordinary native CRLF configuration lost optional compatibility");
+    for (auto anchor : {"", " &entry"})
+    {
+        auto flat = fingerprint(original + "x:\n  -" + anchor + "\n  - a\n");
+        auto nested_list = fingerprint(original + "x:\n  -" + anchor + "\n    - a\n");
+        require(!flat.empty() && !nested_list.empty() && flat != nested_list,
+            "empty list member consumed an equal-indent sibling as a nested list");
+    }
+    std::string aliases = original + "alias0: &a0 value\n";
+    for (unsigned i = 1; i < 80; ++i) aliases += "alias" + std::to_string(i) + ": &a" + std::to_string(i) + "\n  - *a" + std::to_string(i - 1) + '\n';
+    require(fingerprint(aliases).empty(), "alias DAG escaped the semantic depth bound");
+    require(adapter_detail::retirement_config(original, 1).identity.empty(), "optional configuration parser escaped its memory bound");
+}
+void routes(fs::path const& directory)
+{
+    auto self = calibration_process::executable();
+    std::ostringstream out;
+    auto quote = [&](fs::path const& path) { profile_detail::quote(out, file_io::path_text(path)); };
+    out << "{\"farm_adapters\":{\"schema\":1,\"target_route\":\"new-chia\",\"routes\":[{\"id\":\"old-gh\",\"kind\":\"gigahorse\",\"root\":";
+    quote(directory / "gh-config"); out << ",\"executable\":"; quote(self); out << ",\"source_roots\":["; quote(directory);
+    out << "]},{\"id\":\"new-chia\",\"kind\":\"chia\",\"root\":"; quote(directory / "chia-config"); out << ",\"executable\":"; quote(self); out << ",\"source_roots\":[]}]}}";
+    std::istringstream input(out.str()); auto table = read_farm_adapters(input);
+    InventoryRoot root; root.path = file_io::path_text(directory); InventoryPlot plot; plot.harvester = "old-gh";
+    require(resolve_source(table, root, plot).kind == HarvesterAdapterKind::gigahorse && resolve_target(table, "new-chia").kind == HarvesterAdapterKind::chia,
+        "mixed old/new native readers were conflated");
+    {
+        auto local = table;
+        FarmServiceBinding service; service.root = local.routes[0].options.root; service.rpc_host = "127.0.0.1";
+        service.host = local.routes[0].options.host; service.node_id = std::string(64, 'a'); service.farmer_node_id = std::string(64, 'b');
+        local.routes[0].options.services.emplace("harvester", service);
+        std::ostringstream exported; exported << "{\"farm_adapters\":"; write_farm_adapters_json(exported, local); exported << '}';
+        std::istringstream saved(exported.str()); auto reused = read_farm_adapters(saved);
+        auto const selected = resolve_source(reused, root, plot);
+        require(reused.target_route == local.target_route && selected.executable == self && selected.root == service.root &&
+            selected.rpc_host == service.rpc_host && selected.services.at("harvester").node_id == service.node_id &&
+            selected.services.at("harvester").farmer_node_id == service.farmer_node_id,
+            "private reusable adapter export changed its exact local executable, root, route or authenticated service binding");
+    }
+    auto swapped = table; swapped.target_route = "old-gh";
+    rejects([&] { (void)resolve_target(swapped, "new-chia"); }, "swapped target route escaped review binding");
+    swapped = table; swapped.routes[0].source_roots.clear(); swapped.routes[1].source_roots.push_back(root.path);
+    rejects([&] { (void)resolve_source(swapped, root, plot); }, "swapped source route escaped review binding");
+    swapped.routes[0].source_roots.push_back(root.path);
+    rejects([&] { (void)resolve_source(swapped, root, plot); }, "ambiguous source route accepted");
+    root.path += "/missing"; rejects([&] { (void)resolve_source(table, root, plot); }, "missing source route inferred from a parent prefix");
+}
+void retired_workload_batches(fs::path const& directory)
+{
+    fs::create_directories(directory);
+    auto make_options = [&](char const* route)
+    {
+        HarvesterAdapterOptions options; options.root = directory / route; options.harvester = route;
+        options.executable = calibration_process::executable(); fs::create_directories(options.root / "config");
+        std::ofstream config(options.root / "config/config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 1\n";
+        return options;
+    };
+    auto first = make_options("first"), second = make_options("second");
+    FarmInventory catalog; InventoryRoot root; root.path = file_io::path_text(directory / "sources"); catalog.roots = {root};
+    for (unsigned index = 0; index < 3; ++index)
+    {
+        InventoryPlot plot; plot.relative_path = "source-" + std::to_string(index) + ".plot";
+        plot.plot_id = std::string(63, 'a') + char('0' + index); plot.harvester = index == 2 ? second.harvester : first.harvester;
+        plot.workload_id = index == 1 ? "independent" : "shared";
+        plot.header_validated = true; plot.algorithm = PlotAlgorithm::pos1; plot.container = PlotContainer::chiapos_v1;
+        catalog.plots.push_back(plot);
+    }
+    auto registry = [&](HarvesterAdapterOptions const& options, std::optional<size_t> loaded = {}, bool duplicate = false)
+    {
+        std::ofstream out(options.root / "plots.json"); out << "{\"success\":true,\"plots\":[";
+        if (loaded) for (unsigned record = 0; record < (duplicate ? 2u : 1u); ++record)
+        {
+            if (record) out << ',';
+            auto const& plot = catalog.plots.at(*loaded); out << "{\"filename\":";
+            profile_detail::quote(out, file_io::path_text(file_io::native_path(root.path) / plot.relative_path));
+            out << ",\"plot_id\":\"" << plot.plot_id << "\"}";
+        }
+        out << "]}";
+    };
+    std::array<uint64_t, 1> a{0}, b{1}, c{2};
+    std::array<std::span<uint64_t const>, 2> batches{a, b};
+    std::array<std::span<uint64_t const>, 1> other{c};
+    RegistryScopeIndex scope(catalog);
+    registry(first, 0); registry(second);
+    auto observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    auto other_observed = observe_source_batches_retired(second, catalog, other, {}, &scope);
+    require(!observed.no_loaded_records[0] && observed.no_loaded_records[1] && other_observed.no_loaded_records[0],
+        "route snapshot conflated loaded and absent workloads or independent routes");
+    unsigned count = 0; { std::ifstream in(first.root / "registry-count"); in >> count; }
+    require(count == 1 && observed.observed != std::chrono::steady_clock::time_point{} && !observed.captured_at.empty(),
+        "independent workload results did not share one fresh route registry");
+    registry(first, 0, true);
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "duplicate registry path records released an independent absent workload");
+    registry(first, 0);
+    catalog.plots[1].plot_id = catalog.plots[0].plot_id;
+    observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    require(!observed.no_loaded_records[0] && !observed.no_loaded_records[1],
+        "a loaded duplicate plot ID released a different workload at another path");
+    registry(first); observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    require(observed.no_loaded_records[0] && observed.no_loaded_records[1],
+        "a later protected phase reused a stale loaded snapshot");
+    catalog.plots[1].plot_id.back() = '1';
+    { std::ofstream outside(first.root / "plots.json"); outside << "{\"success\":true,\"plots\":[{\"filename\":\"/unreviewed/source.plot\",\"plot_id\":\"" << std::string(64, 'b') << "\"}]}"; }
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "unexpected loaded arrivals were converted into a safe absent-workload result");
+    registry(first);
+    { std::ofstream changed(first.root / "retirement-version-change"); changed << '1'; }
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "reader version changed during a grouped absence observation");
+    fs::remove(first.root / "retirement-version-change"); fs::remove(first.root / "version");
+    { std::ofstream changed(first.root / "retirement-config-change"); changed << '1'; }
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "reader configuration changed during a grouped absence observation");
+    fs::remove(first.root / "retirement-config-change");
+    {
+        auto bounded = first; bounded.limits.memory_bytes = 64 * 1024 * 1024;
+        FarmInventory large = catalog; large.plots.clear(); large.plots.reserve(3000);
+        std::vector<uint64_t> indices;
+        for (uint64_t index = 0; index < 3000; ++index)
+        {
+            auto plot = catalog.plots[0]; plot.relative_path = "large-" + std::to_string(index) + ".plot";
+            large.plots.push_back(std::move(plot)); indices.push_back(index);
+        }
+        auto all = std::span<uint64_t const>(indices);
+        std::array<std::span<uint64_t const>, 2> groups{all.first(1500), all.subspan(1500)};
+        require(all.size() > bounded.limits.memory_bytes / 32768 && groups[0].size() <= bounded.limits.memory_bytes / 32768,
+            "large-route fixture did not exceed the original per-batch aggregate bound");
+        { std::ofstream counter(first.root / "registry-count"); counter << 0; }
+        auto snapshot = observe_source_batches_retired(bounded, large, groups);
+        { std::ifstream counter(first.root / "registry-count"); counter >> count; }
+        require(count == 1 && snapshot.no_loaded_records[0] && snapshot.no_loaded_records[1],
+            "one fresh route snapshot refused independently admissible workload batches at its aggregate source count");
+        std::array<std::span<uint64_t const>, 2> oversized{all, all.first(1)};
+        snapshot = observe_source_batches_retired(bounded, large, oversized);
+        require(!snapshot.lookup_bounded[0] && !snapshot.no_loaded_records[0] && snapshot.lookup_bounded[1] && snapshot.no_loaded_records[1],
+            "one oversized workload blocked a bounded independent workload or released its unknown old arrivals");
+    }
+    auto tight = first; tight.limits.max_files = 1;
+    rejects([&] { (void)observe_source_batches_retired(tight, catalog, batches, {}, &scope); },
+        "grouped source lookup exceeded its aggregate count bound");
+    auto cancelled = first; cancelled.limits.cancelled = [] { return true; };
+    rejects([&] { (void)observe_source_batches_retired(cancelled, catalog, batches, {}, &scope); },
+        "grouped source lookup ignored cancellation");
+    auto expired = first; expired.limits.timeout_ms = 1;
+    { std::ofstream delayed(first.root / "version-delay"); delayed << '1'; }
+    rejects([&] { (void)observe_source_batches_retired(expired, catalog, batches, {}, &scope); },
+        "grouped source lookup ignored its bounded phase deadline");
+}
+void large_catalog(fs::path const& directory)
+{
+    std::array<fs::path, 1> roots{directory}; auto catalog = scan_farm_inventory(roots);
+    auto prototype = catalog.plots.front(); prototype.alias_of.reset(); prototype.native_identified = false; prototype.identity.links = 1;
+    catalog.plots.clear(); catalog.resource_template.reset(); catalog.plots.reserve(7000);
+    for (uint64_t i = 0; i < 7000; ++i)
+    {
+        auto plot = prototype; plot.relative_path = "large-" + std::to_string(i) + ".plot"; plot.identity.stamp.inode = i + 1;
+        catalog.plots.push_back(std::move(plot));
+    }
+    InventoryLimits limits; limits.memory_bytes = 1024 * 1024 * 1024; limits.max_output_bytes = 64 * 1024 * 1024;
+    auto text = farm_inventory_text(catalog, limits);
+    bool structure = false;
+    try { (void)profile_detail::JsonReader(text, limits.memory_bytes / 2).read(); }
+    catch (std::runtime_error const& error) { structure = std::string_view(error.what()).find("structure limit") != std::string_view::npos; }
+    require(structure, "large-catalog fixture did not exceed the unchanged default node bound");
+    require(parse_farm_inventory(text, limits).plots.size() == catalog.plots.size(), "valid large catalog failed its explicit bounded roundtrip");
+    auto tight = limits; tight.memory_bytes = 128 * 1024 * 1024; tight.max_output_bytes = 16 * 1024 * 1024;
+    rejects([&] { (void)parse_farm_inventory(text, tight); }, "large catalog escaped a tighter parser memory budget");
+    tight = limits; tight.max_output_bytes = text.size() - 1;
+    rejects([&] { (void)parse_farm_inventory(text, tight); }, "large catalog escaped its byte bound");
+}
+void farming_log(fs::path const& directory)
+{
+    using namespace std::chrono;
+    fs::create_directories(directory / "config"); fs::create_directory(directory / "logs");
+    auto const config = directory / "config/config.yaml", log = directory / "logs/harvester.log";
+    std::string const settings = "logging: &logging\n  log_stdout: False\n  log_filename: logs/harvester.log\nharvester:\n  num_threads: 4\n  plot_directories: []\n  logging: *logging\n";
+    { std::ofstream out(config); out << settings; }
+    auto const wall = system_clock::now(); auto const begin = FarmingLogSampler::Clock::now();
+    auto record = [&](std::string_view elapsed, system_clock::time_point when = system_clock::now())
+    {
+        auto const epoch = system_clock::to_time_t(when); auto time = *std::localtime(&epoch); std::ostringstream out;
+        out << std::put_time(&time, "%Y-%m-%dT%H:%M:%S") << ".000 2.5.5 harvester chia.harvester.harvester: INFO     "
+            << "3 plots were eligible for farming challenge Found 0 proofs. Time: " << elapsed << " s. Total 500 plots\n";
+        return out.str();
+    };
+    auto write = [&](std::string const& text, bool append = true)
+    { std::ofstream out(log, append ? std::ios::app : std::ios::trunc); out << text; require(bool(out), "farming log fixture write failed"); };
+    write(record("9.00000", wall));
+    HarvesterAdapterOptions options; options.root = directory; options.host = profile_detail::host_name();
+    FarmingLogSampler sampler(options);
+    require(!sampler.sample(begin, wall), "historical farming log was accepted as a current observation");
+    write(record("0.25000", wall));
+    require(sampler.sample(begin + seconds(1), wall) == 250000000, "fresh completed farming lookup time was not observed");
+    require(!sampler.sample(begin + seconds(2), wall), "one farming completion was counted repeatedly");
+    auto partial = record("2.00000", wall); write(partial.substr(0, partial.size() - 1));
+    require(!sampler.sample(begin + seconds(3), wall), "partial farming log record was accepted");
+    write("\n"); require(sampler.sample(begin + seconds(4), wall) == 2000000000, "split farming record was lost");
+    write(record("8.00000", wall - minutes(2))); write(record("8.00000", wall + minutes(2)));
+    write(record("nan", wall)); write(record("-1", wall));
+    require(!sampler.sample(begin + seconds(5), wall), "stale, future or invalid log duration became farming feedback");
+    fs::rename(log, log.string() + ".1"); write(record("7.00000", wall));
+    require(!sampler.sample(begin + seconds(6), wall), "log rotation replayed an existing record");
+    write(record("0.50000", wall)); require(sampler.sample(begin + seconds(7), wall) == 500000000, "rotated log did not recover on a fresh append");
+    write("truncated\n", false); require(!sampler.sample(begin + seconds(8), wall), "truncation reused an old partial record");
+    write(record("0.75000", wall)); require(sampler.sample(begin + seconds(9), wall) == 750000000, "truncated log could not resume observations");
+    write(std::string(100000, 'x') + '\n' + record("1.00000", wall));
+    require(sampler.sample(begin + seconds(10), wall) == 1000000000, "bounded tail could not recover after unrelated log traffic");
+    auto remote = options; remote.host = "unreviewed-remote-host"; FarmingLogSampler remote_sampler(remote);
+    require(!remote_sampler.sample(begin, wall), "local CLI log became a remote farming observation");
+    auto retired = settings; auto const dirs = retired.find("plot_directories: []");
+    retired.replace(dirs, std::string("plot_directories: []").size(), "plot_directories:\n    - /remaining-plots");
+    { std::ofstream out(config); out << retired; }
+    write(record("1.25000", wall)); require(sampler.sample(begin + seconds(11), wall) == 1250000000,
+        "ordinary plot-directory retirement permanently disabled unchanged farming telemetry");
+    { std::ofstream out(config); out << settings << "changed: true\n"; }
+    write(record("1.50000", wall)); require(!sampler.sample(begin + seconds(12), wall), "changed reader logging configuration supplied old-context feedback");
+    fs::remove_all(directory);
+}
+int main(int argc, char** argv)
+{
+    if (argc > 1 && std::string_view(argv[1]) == "--root-path") return fake_adapter(argc, argv);
+    auto root = fs::temp_directory_path() / ("xchplot2-inventory-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    try { fs::create_directory(root); durable_native_identity(root / "durable-native"); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); retired_workload_batches(root / "retired-batches"); farming_log(root / "farming-log"); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
+    catch (std::exception const& error) { fs::remove_all(root); std::cerr << error.what() << '\n'; return 1; }
+}

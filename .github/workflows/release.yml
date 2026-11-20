@@ -5,16 +5,24 @@ on:
     paths:
       - .github/workflows/release.yml
       - CMakeLists.txt
+      - LICENSE
+      - NOTICE
       - cmake/**
       - ci/release/**
       - keygen-rs/**
-      - src/**
+      - src/host/**
+      - src/gpu/**
       - tools/**
-      - contrib/**
+      - contrib/pos2-*.patch
+      - contrib/cccl-*.patch
+      - contrib/adaptivecpp-windows-*.patch
       - scripts/build-release.sh
       - scripts/build-release.ps1
       - scripts/test/recovery.py
       - scripts/test/release.py
+      - scripts/test/group-cli.py
+      - scripts/test/compute-cli.py
+      - scripts/test/group-pool-test.py
   push:
     tags: ['v*', '!v*-cuda-only']
   workflow_dispatch:
@@ -33,14 +41,70 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.architecture || 'all' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  changes:
+    name: Select release checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      linux: ${{ steps.filter.outputs.linux }}
+      windows: ${{ steps.filter.outputs.windows }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          predicate-quantifier: some-with-excludes
+          filters: |
+            shared:
+              - '.github/workflows/release.yml'
+              - '{CMakeLists.txt,LICENSE,NOTICE}'
+              - 'cmake/**'
+              - 'keygen-rs/{Cargo.toml,Cargo.lock,about.toml,src/**,include/**}'
+              - 'src/{host,gpu}/**'
+              - 'tools/**'
+              - '!tools/xchplot2/*.{rc,manifest}'
+              - '!tools/xchplot2/compute_service_windows.cpp'
+              - '!tools/xchplot2/compute_service.cpp'
+              - 'contrib/pos2-*.patch'
+              - 'contrib/cccl-arch-list.patch'
+              - 'ci/release/adaptivecpp-*.patch'
+              - 'ci/release/{adaptivecpp-third-party.txt,llvm-third-party.txt,licenses.hbs,check-cuda-ptx.py}'
+              - 'scripts/test/{recovery,release,group-cli,compute-cli,group-pool-test}.py'
+            linux:
+              - 'ci/release/{Containerfile,README.txt}'
+              - 'scripts/build-release.sh'
+              - 'tools/xchplot2/compute_service.cpp'
+            windows:
+              - 'ci/release/*.ps1'
+              - 'ci/release/{README.windows.txt,amd-runtime.txt,microsoft-runtime.txt}'
+              - 'scripts/build-release.ps1'
+              - 'tools/xchplot2/*.{rc,manifest}'
+              - 'tools/xchplot2/compute_service_windows.cpp'
+              - 'contrib/adaptivecpp-windows-*.patch'
+              - 'contrib/cccl-windows-ptx.patch'
+
   linux-sycl:
-    if: inputs.platform != 'windows'
+    needs: changes
+    if: >-
+      inputs.platform != 'windows' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.linux == 'true')
     strategy:
       fail-fast: false
       matrix:
         arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
       - name: Build release image
@@ -48,6 +112,7 @@ jobs:
           docker build --build-arg BASE_IMAGE=${{ matrix.arch == 'aarch64' && 'ubuntu:26.04' || 'nvidia/cuda:12.9.1-devel-ubuntu24.04' }} \
             -t xchplot2-release -f ci/release/Containerfile ci/release
       - name: Build and package
+        id: package
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
@@ -64,6 +129,7 @@ jobs:
               --sycl-probe build/release-linux/tools/sanity/hellosycl
           '
       - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         with:
           name: linux-${{ matrix.arch }}-sycl
           path: |
@@ -72,7 +138,11 @@ jobs:
           if-no-files-found: error
 
   windows-sycl:
-    if: inputs.platform != 'linux'
+    needs: changes
+    if: >-
+      inputs.platform != 'linux' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.windows == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -121,7 +191,7 @@ jobs:
         id: toolchain
         with:
           path: build/windows-toolchain/install
-          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}
+          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
       - name: Configure Visual Studio
         run: |
           $ErrorActionPreference = 'Stop'
@@ -166,6 +236,7 @@ jobs:
           rustup default 1.98.1
           cargo install --locked --features cli cargo-about --version 0.9.2
       - name: Build and package
+        id: package
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           ACPP_PREFIX: ${{ github.workspace }}/build/windows-toolchain/install
@@ -198,6 +269,7 @@ jobs:
               Rename-Item build/windows-toolchain/install-hidden install
           }
       - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         with:
           name: windows-${{ matrix.arch }}-sycl
           path: |
@@ -206,9 +278,10 @@ jobs:
           if-no-files-found: error
 
   draft:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [linux-sycl, windows-sycl]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     concurrency:
       group: binary-release
       cancel-in-progress: false

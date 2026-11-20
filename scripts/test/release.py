@@ -47,6 +47,8 @@ def main():
                      "licenses/pos2-chip.txt", "licenses/fse.txt", "licenses/aes.txt",
                      "licenses/adaptivecpp.txt", "licenses/adaptivecpp-third-party.txt",
                      "licenses/adaptivecpp-cuda-llvm20.txt",
+                     "licenses/adaptivecpp-level-zero-events.txt",
+                     "licenses/adaptivecpp-level-zero-event-lifetime.txt",
                      "licenses/llvm.txt", "licenses/llvm-third-party.txt",
                      "licenses/rust-standard-library/COPYRIGHT-library.html"):
             assert (package / name).stat().st_size > 0, f"Missing or empty {name}"
@@ -235,6 +237,14 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
             assert (package / "licenses/adaptivecpp-windows.txt").stat().st_size > 0
         subprocess.run([sys.executable, pathlib.Path(__file__).with_name("recovery.py"), binary],
                        check=True, timeout=720)
+        assert (package / "licenses/mdns.txt").stat().st_size > 0
+        assert (package / ("licenses/openssl.txt" if os.name == "nt" else "licenses/libssl-dev.txt")).stat().st_size > 0
+        # This process runs ordinary, migration and automatic-compute suites.
+        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("group-cli.py"), binary,
+                        "--automatic-compute", "--scratch", work], check=True, timeout=1800)
+        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("compute-cli.py"), binary,
+                        "--scratch", work, *(["--service-manager"] if os.name == "nt" else [])],
+                       check=True, timeout=420)
         print("Release archive: extraction, CLI, CPU/SYCL plotting parity, and full proofs passed")
 
 

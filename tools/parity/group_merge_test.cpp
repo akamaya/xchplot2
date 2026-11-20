@@ -1,0 +1,8224 @@
+#include "host/GroupMerge.hpp"
+#include "host/GroupWriter.hpp"
+#include "host/GroupPolicy.hpp"
+#include "host/GroupFarmMigration.hpp"
+#include "host/GroupFarmRetirement.hpp"
+#include <iostream>
+#include <sstream>
+#include <sys/wait.h>
+
+// Upstream and group-common headers define non-inline helpers, so the
+// controller fixture shares this translation unit with the engine fixtures.
+#include "host/GroupPlotter.cpp"
+#include "group_farm_progress_test.hpp"
+#include "group_farm_control_test.hpp"
+#include "group_farm_membership_test.hpp"
+#include "../xchplot2/group_commands.hpp"
+
+using namespace group_grow;
+namespace fs = std::filesystem;
+
+// Inject an actual writer syscall failure while a contribution producer may
+// still borrow its next window. The executable alone wraps pwrite at link time.
+#ifdef GROW_TEST_WRAP_PWRITE
+std::atomic<bool> fail_write{false};
+std::atomic<uint64_t> fail_write_begin{0}, fail_write_end{0};
+std::atomic<bool> hold_background_write{false}, background_write_active{false};
+std::atomic<bool> background_write_timed_out{false};
+std::thread::id producer_thread;
+std::promise<void>* background_write_started = nullptr;
+std::shared_future<void> background_write_release;
+std::atomic<bool> hold_background_check{false}, background_check_after{false};
+std::string background_check_target;
+std::atomic<bool> replace_unlinked{false};
+std::string replacement_target;
+std::function<void(int, char const*, int, char const*)> retirement_rename_hook;
+std::atomic<bool> fail_retired_xattr{false};
+std::function<void(int, size_t, off_t)> construction_write_observer;
+std::function<void(int, size_t, off_t)> construction_read_observer;
+extern "C" ssize_t __real_pread(int, void*, size_t, off_t);
+extern "C" ssize_t __wrap_pread(int fd, void* bytes, size_t count, off_t offset)
+{
+    auto const result = __real_pread(fd, bytes, count, offset);
+    if (result >= 0 && construction_read_observer) construction_read_observer(fd, count, offset);
+    return result;
+}
+extern "C" int __real_fsetxattr(int, char const*, void const*, size_t, int);
+extern "C" int __wrap_fsetxattr(int fd, char const* name, void const* value, size_t bytes, int flags)
+{
+    if (fail_retired_xattr.load(std::memory_order_acquire)) { errno = ENOTSUP; return -1; }
+    return __real_fsetxattr(fd, name, value, bytes, flags);
+}
+extern "C" int __real_renameat2(int, char const*, int, char const*, unsigned);
+extern "C" int __wrap_renameat2(int from, char const* old_name, int to, char const* new_name, unsigned flags)
+{
+    if (retirement_rename_hook)
+    {
+        auto hook = std::move(retirement_rename_hook); retirement_rename_hook = {};
+        hook(from, old_name, to, new_name);
+    }
+    return __real_renameat2(from, old_name, to, new_name, flags);
+}
+extern "C" int __real_unlink(char const*);
+extern "C" int __wrap_unlink(char const* path)
+{
+    int const result = __real_unlink(path);
+    if (!result && replace_unlinked.load(std::memory_order_acquire) && replacement_target == path &&
+        replace_unlinked.exchange(false, std::memory_order_acq_rel))
+    {
+        int const fd = ::open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0)
+        {
+            constexpr char bytes[] = "replacement";
+            (void)::write(fd, bytes, sizeof(bytes) - 1); ::close(fd);
+        }
+    }
+    return result;
+}
+extern "C" ssize_t __real_pwrite(int, void const*, size_t, off_t);
+extern "C" ssize_t __wrap_pwrite(int fd, void const* bytes, size_t count, off_t offset)
+{
+    if (std::this_thread::get_id() != producer_thread && hold_background_write.exchange(false, std::memory_order_acq_rel))
+    {
+        background_write_active.store(true, std::memory_order_release);
+        background_write_started->set_value();
+        if (background_write_release.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+            background_write_timed_out.store(true, std::memory_order_release);
+        background_write_active.store(false, std::memory_order_release);
+    }
+    if (fail_write.load(std::memory_order_acquire) && uint64_t(offset) >= fail_write_begin.load(std::memory_order_relaxed) &&
+        uint64_t(offset) < fail_write_end.load(std::memory_order_relaxed) && fail_write.exchange(false, std::memory_order_acq_rel))
+    { errno = EIO; return -1; }
+    auto const result = __real_pwrite(fd, bytes, count, offset);
+    if (result >= 0 && construction_write_observer) construction_write_observer(fd, count, offset);
+    return result;
+}
+extern "C" int __real_lstat(char const*, struct stat*);
+extern "C" int __wrap_lstat(char const* path, struct stat* info)
+{
+    bool const captured = background_check_after.load(std::memory_order_acquire) &&
+        std::this_thread::get_id() != producer_thread && path == background_check_target;
+    int const result = captured ? __real_lstat(path, info) : 0;
+    if ((!captured || !result) && std::this_thread::get_id() != producer_thread && path == background_check_target &&
+        hold_background_check.exchange(false, std::memory_order_acq_rel))
+    {
+        background_write_active.store(true, std::memory_order_release);
+        background_write_started->set_value();
+        if (background_write_release.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+            background_write_timed_out.store(true, std::memory_order_release);
+        background_write_active.store(false, std::memory_order_release);
+    }
+    return captured ? result : __real_lstat(path, info);
+}
+#endif
+
+void test_producer_options()
+{
+    using namespace grow_controller_test;
+    auto parse = [](std::initializer_list<char const*> options)
+    {
+        std::vector<char*> command;
+        for (auto option : options) command.push_back(const_cast<char*>(option));
+        return pos2gpu::parse_group_options(int(command.size()), command.data());
+    };
+    auto const defaults = parse({"grow", "group.gplot"});
+    require(defaults.generation_overlap && defaults.generation_overlap_auto &&
+        defaults.batch == defaults.max_members, "producer defaults do not allow admitted automatic work");
+    require(!defaults.max_ram_set && !defaults.max_ram_limit && defaults.max_ram >= 16 * mib &&
+        defaults.max_ram <= profile_detail::physical_memory(), "automatic RAM budget exceeds the host limit");
+    for (auto const* cap : {"67108864", "34359738368"})
+    {
+        auto const limited = parse({"grow", "group.gplot", "--max-ram", cap});
+        require(limited.max_ram_set && limited.max_ram == std::stoull(cap) &&
+            limited.max_ram_limit == limited.max_ram, "explicit RAM cap was replaced by automatic memory detection");
+    }
+    auto const automatic = parse({"grow", "group.gplot", "--generation-overlap", "auto"});
+    require(automatic.generation_overlap && automatic.generation_overlap_auto,
+        "explicit automatic overlap differs from the default");
+    auto const enabled = parse({"grow", "group.gplot", "--generation-overlap", "on", "--batch-members", "7"});
+    require(enabled.generation_overlap && !enabled.generation_overlap_auto && enabled.batch == 7,
+        "explicit producer overrides were not retained");
+    auto const disabled = parse({"grow", "group.gplot", "--generation-overlap", "on", "--generation-overlap", "off"});
+    require(!disabled.generation_overlap && !disabled.generation_overlap_auto,
+        "explicit overlap off did not override an earlier request");
+    bool rejected = false;
+    try { (void)parse({"grow", "group.gplot", "--generation-overlap", "invalid"}); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "unknown producer overlap policy was accepted");
+
+    Arguments args;
+    args.member_storage = "raw"; args.max_ram = 5 * mib;
+    Backend backend; backend.generation_overlap = true;
+    require(backend.admit_gpu_generation(args, mib, 5 * mib, 4 * mib) && !backend.generation_overlap,
+        "automatic raw admission rejected a fitting borrowed GPU output");
+    require(backend.admit_gpu_generation(args, 0, 5 * mib, 4 * mib) && !backend.generation_overlap,
+        "backend reuse re-enabled overlap while borrowed output may be live");
+    backend.generation_overlap = true; args.generation_overlap_auto = false;
+    require(!backend.admit_gpu_generation(args, mib, 5 * mib, 4 * mib) && backend.generation_overlap,
+        "explicit overlap silently changed to borrowed output");
+    backend.generation_overlap = false;
+    require(backend.admit_gpu_generation(args, mib, 5 * mib, 4 * mib),
+        "explicit serial output failed exact borrowed admission");
+    backend.generation_overlap = true; args.generation_overlap_auto = true;
+    require(!backend.admit_gpu_generation(args, mib, 5 * mib, 4 * mib + 1),
+        "borrowed fallback exceeded the RAM budget");
+    backend.generation_overlap = true; args.member_storage = "compact";
+    require(!backend.admit_gpu_generation(args, mib, 5 * mib, 4 * mib) && backend.generation_overlap,
+        "compact generation incorrectly used a raw borrowed-output allowance");
+    backend.generation_overlap = true; args.member_storage = "raw";
+    require(backend.admit_gpu_generation(args, 0, 5 * mib, 4 * mib) && backend.generation_overlap,
+        "exact owning output admission unnecessarily disabled overlap");
+    require(backend.admit_gpu_generation(args, 0, 5 * mib, 4 * mib, 2 * mib, 2 * mib) && !backend.generation_overlap,
+        "live headroom did not admit a fitting raw borrowed fallback");
+    backend.generation_overlap = true;
+    require(backend.admit_gpu_generation(args, 0, 5 * mib, 4 * mib, 3 * mib, 2 * mib) && backend.generation_overlap,
+        "exact live owning headroom unnecessarily disabled overlap");
+    require(!backend.admit_gpu_generation(args, 0, 5 * mib, 4 * mib, 2 * mib - 1, 2 * mib),
+        "live borrowed fallback exceeded available headroom");
+    backend.generation_overlap = true; args.generation_overlap_auto = false;
+    require(!backend.admit_gpu_generation(args, 0, 5 * mib, 4 * mib, 2 * mib, 2 * mib) && backend.generation_overlap,
+        "live headroom silently disabled explicit overlap");
+    args.max_ram = 8 * mib; args.generation_overlap_auto = true; backend.generation_overlap = true;
+    require(backend.admit_gpu_generation(args, 0, 8 * mib, 6 * mib) && backend.generation_overlap,
+        "ordinary workspace did not admit the initial owning representation");
+    require(backend.admit_gpu_generation(args, 2 * mib, 8 * mib, 6 * mib) && !backend.generation_overlap,
+        "increased engine or retained-member workspace did not re-admit borrowed output");
+    backend.generation_overlap = true; args.generation_overlap_auto = false;
+    require(!backend.admit_gpu_generation(args, 2 * mib, 8 * mib, 6 * mib) && backend.generation_overlap,
+        "increased workspace silently disabled explicit overlap");
+    args.generation_overlap_auto = true;
+    require(!backend.admit_gpu_generation(args, 0, 8 * mib, 6 * mib, uint64_t(0)),
+        "exhausted live RAM was treated as unknown headroom");
+    backend.generation_overlap = true;
+    require(backend.admit_gpu_generation(args, 0, 8 * mib, 6 * mib, uint64_t(0), 6 * mib) && !backend.generation_overlap,
+        "exhausted live RAM prevented reuse of an already resident borrowed output");
+}
+
+void test_destination_temporary()
+{
+    using namespace grow_controller_test;
+    auto parse = [](std::initializer_list<char const*> options)
+    {
+        std::vector<char*> command;
+        for (auto option : options) command.push_back(const_cast<char*>(option));
+        return pos2gpu::parse_group_options(int(command.size()), command.data());
+    };
+    auto const defaults = parse({"grow", "group.gplot"});
+    require(defaults.destination_temp == "on" && !defaults.destination_temp_set,
+        "destination scratch was not enabled by default without explicit temporary directories");
+    auto const separate = parse({"grow", "group.gplot", "--temp-dir", "scratch"});
+    require(separate.destination_temp == "off" && !separate.destination_temp_set,
+        "explicit temporary storage also enabled destination scratch by default");
+    for (auto const& options : {std::initializer_list<char const*>{"grow", "group.gplot", "--temp-dir", "scratch", "--destination-temp", "on"},
+        {"grow", "group.gplot", "--destination-temp", "on", "--temp-dir", "scratch"}})
+    {
+        auto const selected = parse(options);
+        require(selected.destination_temp == "on" && selected.destination_temp_set && selected.temporary.size() == 1,
+            "explicit destination scratch depended on temporary-directory argument order");
+    }
+    auto const capped = parse({"grow", "group.gplot", "--construction", "external", "--temp-capacity-bytes", "1048576"});
+    require(capped.destination_temp == "on" && capped.temporary_capacity == mib,
+        "default destination scratch did not support external construction or a temporary cap");
+    auto const ssd = parse({"grow", "group.gplot", "--destination-temp", "ssd"});
+    auto const hdd = parse({"grow", "group.gplot", "--destination-temp", "hdd"});
+    auto const on = parse({"grow", "group.gplot", "--destination-temp", "on",
+        "--construction", "external", "--temp-capacity-bytes", "1048576"});
+    auto const off = parse({"grow", "group.gplot", "--destination-temp", "on", "--destination-temp", "off"});
+    require(ssd.destination_temp == "ssd" && hdd.destination_temp == "hdd" && on.destination_temp == "on" &&
+        on.temporary_capacity == mib && off.destination_temp == "off", "destination temporary options changed");
+    bool rejected = false;
+    try { (void)parse({"grow", "group.gplot", "--destination-temp", "auto"}); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "unknown destination temporary policy was accepted");
+    rejected = false;
+    try { (void)parse({"grow", "group.gplot", "--destination-temp", "all"}); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "obsolete destination temporary policy spelling was accepted");
+    rejected = false;
+    try { (void)parse({"grow", "group.gplot", "--destination-temp", "off", "--temp-capacity-bytes", "1048576"}); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "temporary cap without enabled storage was accepted");
+
+    std::vector<fs::path> roots;
+    StorageDevice const fast{"fast-fs", {"nvme"}, true}, slow{"slow-fs", {"hdd"}, false, true},
+        unknown{"unknown-fs", {}, false, false}, mixed{"mixed-fs", {"nvme", "hdd"}, false, false};
+    add_destination_temporary(roots, defaults.destination_temp, "fast", fast);
+    add_destination_temporary(roots, defaults.destination_temp, "slow", slow);
+    require(roots == std::vector<fs::path>{"fast", "slow"}, "default policy omitted destination scratch");
+    roots.clear();
+    roots.emplace_back("explicit");
+    for (auto const& [path, device] : std::array<std::pair<fs::path, StorageDevice>, 4>{
+            std::pair{fs::path("fast"), fast}, {fs::path("slow"), slow}, {fs::path("unknown"), unknown},
+            {fs::path("mixed"), mixed}})
+        add_destination_temporary(roots, ssd.destination_temp, path, device);
+    require(roots == std::vector<fs::path>{"explicit", "fast"},
+        "SSD policy removed explicit storage or included rotating/unknown storage");
+    std::vector<fs::path> rotating_roots;
+    for (auto const& [path, device] : std::array<std::pair<fs::path, StorageDevice>, 4>{
+            std::pair{fs::path("fast"), fast}, {fs::path("slow"), slow}, {fs::path("unknown"), unknown},
+            {fs::path("mixed"), mixed}})
+        add_destination_temporary(rotating_roots, hdd.destination_temp, path, device);
+    require(rotating_roots == std::vector<fs::path>{"slow"},
+        "HDD policy included nonrotating, mixed or unclassified storage");
+    add_destination_temporary(roots, on.destination_temp, "slow", slow);
+    add_destination_temporary(roots, on.destination_temp, "unknown", unknown);
+    add_destination_temporary(roots, on.destination_temp, "fast", fast);
+    add_destination_temporary(roots, off.destination_temp, "disabled", fast);
+    require(roots == std::vector<fs::path>{"explicit", "fast", "slow", "unknown"},
+        "on/off destination policy changed stable root selection or retained duplicates");
+}
+
+void metadata_options()
+{
+    auto parse = [](std::string_view action, std::initializer_list<char const*> options)
+    {
+        std::vector<char*> command;
+        for (auto option : options) command.push_back(const_cast<char*>(option));
+        return pos2gpu::parse_group_options(int(command.size()), command.data(), action);
+    };
+    auto const positional = parse("plan", {"plan", "--metadata-only", "saved.plan", "--json"});
+    auto const preview = parse("plan", {"plan", "--metadata-only", "--from-plan", "saved.plan"});
+    auto const private_job = parse("plan", {"plan", "--metadata-only", "--manifest", "private.plan"});
+    require(positional.metadata_only && positional.plan_only && positional.directory_farm && positional.json &&
+        positional.from_plan == preview.from_plan && !private_job.manifest.empty() &&
+        !positional.automatic_compute && !private_job.farming_profile,
+        "metadata inspection did not retain its read-only source scope");
+    auto const joint = parse("plan", {"plan", "--assess-jobs", "first.plan", "second.plan", "--json"});
+    require(joint.assess_jobs && joint.plan_only && joint.assessment_plans.size() == 2 &&
+        joint.target.empty() && joint.destinations.empty() && !joint.automatic_compute && !joint.farming_profile,
+        "joint assessment did not retain its read-only source scope");
+    auto reject = [&](std::string_view action, std::initializer_list<char const*> options)
+    {
+        bool rejected = false;
+        try { (void)parse(action, options); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, "metadata inspection accepted a live action or override");
+    };
+    reject("fill", {"fill", "--metadata-only", "saved.plan"});
+    reject("grow", {"grow", "--metadata-only", "saved.gplot"});
+    reject("plan", {"plan", "--metadata-only"});
+    reject("plan", {"plan", "--metadata-only", "saved.plan", "another.plan"});
+    reject("plan", {"plan", "--metadata-only", "--manifest", "private.plan", "saved.plan"});
+    reject("plan", {"plan", "--metadata-only", "saved.plan", "--save-plan", "replacement.plan"});
+    reject("plan", {"plan", "--metadata-only", "saved.plan", "--harvester", "local"});
+    reject("plan", {"plan", "--metadata-only", "saved.plan", "--paths-from", "unread-list"});
+    reject("plan", {"plan", "--metadata-only", "saved.plan", "--farming-cores", "1"});
+    reject("fill", {"fill", "--assess-jobs", "saved.plan"});
+    reject("plan", {"plan", "--assess-jobs"});
+    reject("plan", {"plan", "--assess-jobs", "saved.plan", "--metadata-only"});
+    reject("plan", {"plan", "--assess-jobs", "saved.plan", "--save-plan", "replacement.plan"});
+    reject("plan", {"plan", "--assess-jobs", "saved.plan", "--harvester", "local"});
+    reject("plan", {"plan", "--assess-jobs", "saved.plan", "--calibrate"});
+    reject("fill", {"fill", "unread.plot2", "--replot-proof-solves", "1"});
+    reject("plan", {"plan", "--calibrate", "unread.plot2", "--replot-proof-solves", "1"});
+    reject("plan", {"plan", "--calibrate", "--calibration-worker", "unread.plot2", "--replot-structure-worker", "--replot-proof-solves", "1", "--json"});
+#ifndef XCHPLOT2_GROUP_COMMANDS
+    reject("plan", {"plan", "--calibrate", "not-read.gplot", "--json"});
+    reject("plan", {"plan", "--calibrate", "--calibration-worker", "not-read.gplot", "--json"});
+#endif
+}
+
+void temporary_admission(std::filesystem::path const& root, group_grow::Identity const& initial)
+{
+    using namespace grow_controller_test;
+    auto directory = group_grow::ScratchRoot::inspect(root);
+    directory.available_bytes = 128 * mib;
+    group_grow::ScratchPool pool(std::vector{directory}, 0);
+    require(pool.try_reserve_output(0, directory, directory.available_bytes), "joint output reservation failed");
+    pool.seal_recovery();
+    Arguments args; args.max_ram = 256 * mib; args.workers = 2; args.window = 65536;
+    auto config = configuration(args, directory.available_bytes, mib);
+    auto const grant = temporary_grant(pool, 0, root, identity_from(initial), 64, 1, config, false);
+    require(grant && config.capacity_bytes < directory.available_bytes,
+        "shared filesystem could not jointly admit final output and temporary contributions");
+    uint64_t scratch = 0; for (auto const& part : grant->scratch) scratch += part.capacity_bytes;
+    require(config.capacity_bytes + scratch <= directory.available_bytes,
+        "joint output and scratch admission exceeded the shared filesystem");
+    pool.release_scratch_after_cleanup(0);
+    require(pool.try_reserve_output(0, root, directory.available_bytes),
+        "ordinary handoff could not restore the original capacity after scratch cleanup");
+    pool.cancel(0);
+}
+
+void replot_external_projection(fs::path const& directory, group_grow::Identity const& initial)
+{
+    using namespace grow_controller_test;
+    Arguments args; args.max_ram = 256 * mib; args.workers = 2; args.batch = 4;
+    args.construction = "external"; args.window = 65536; args.headroom = 0;
+    auto const requested = identity_from(initial); auto target = group_grow::ScratchRoot::inspect(directory);
+    target.available_bytes = 2 * 1024 * mib;
+    auto const capacity = sum(canonical_bound(requested, 4), args.max_ram);
+    require(replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {target}, target, 0),
+        "ordinary scratch policy could not admit a projected external migration");
+    auto const fresh_root = directory / "fresh-private-external-projection"; fs::create_directory(fresh_root);
+    ReplotReview destinations;
+    for (auto const& path : {directory, fresh_root})
+    { FarmingDirectory output; output.directory = file_io::path_text(path); destinations.farm.directories.push_back(output); }
+    auto shared = args; shared.destination_temp = "on";
+    require(replot_temporary(shared, destinations) == std::vector<fs::path>{directory, fresh_root},
+        "migration scratch omitted a permitted destination other than the active output");
+    shared.destination_temp = "off"; shared.temporary = {fresh_root};
+    require(replot_temporary(shared, destinations) == shared.temporary,
+        "migration scratch ignored explicit roots or enabled unpermitted destinations");
+    auto fresh = group_grow::ScratchRoot::inspect(fresh_root); fresh.available_bytes = target.available_bytes;
+    auto const stage = migration_stage_path(fresh_root, std::string(64, 'a'), 0, false);
+    require(replot_external_capacity(args, requested, 4, capacity, stage, {fresh}, fresh, 0, true) &&
+        fs::is_empty(fresh_root), "fresh external projection required or created a private construction namespace");
+    bool strict = false;
+    try { (void)replot_external_capacity(args, requested, 4, capacity, stage, {fresh}, fresh, 0); }
+    catch (std::runtime_error const&) { strict = true; }
+    require(strict && fs::is_empty(fresh_root), "runtime external inspection ignored a missing construction parent");
+    {
+        FarmingMetadataDirectory metadata(fresh_root); metadata.create(); metadata.require_fresh();
+        require(replot_external_capacity(args, requested, 4, capacity, stage, {fresh}, fresh, 0, true) &&
+            fs::is_empty(metadata.path) && !fs::exists(stage.parent_path()),
+            "external projection populated an empty metadata ancestor");
+    }
+    auto empty = target; empty.available_bytes = 0;
+    require(!replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {empty}, empty, 0),
+        "external migration admitted scratch/output without actual or reviewed prospective space");
+    auto missing_output = target; missing_output.available_bytes = 0;
+    require(!replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {target}, missing_output, 0),
+        "scratch alias multiplied projected filesystem space");
+    auto changed = target; ++changed.directory_inode;
+    bool refused = false;
+    try { (void)replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {changed}, changed, 0); }
+    catch (std::runtime_error const&) { refused = true; }
+    require(refused, "projected scratch admission accepted a changed native directory");
+    auto capped = args; capped.temporary_capacity = 1;
+    require(!replot_external_capacity(capped, requested, 4, capacity, directory / "projection.gplot", {target}, target, 0),
+        "projected external migration ignored the ordinary scratch cap");
+}
+void replot_preview_models(fs::path const& directory, group_grow::Identity const& initial)
+{
+    using namespace grow_controller_test;
+    Arguments args; args.max_ram = 512 * mib; args.workers = 2; args.window = 65536;
+    auto live = std::make_shared<CodecScheduler>(unsigned(args.workers));
+    auto preview = std::make_shared<CodecScheduler>(unsigned(args.workers), CodecScheduler::Execution::preview);
+    auto const executing = configuration(args, 128 * mib, mib, live, replot_preview_encoder(args, live));
+    auto const modeled = configuration(args, 128 * mib, mib, preview, replot_preview_encoder(args, preview));
+    ExternalConfig scratch; scratch.scratch.push_back({directory.string(), 128 * mib}); scratch.segment_bytes = mib;
+    for (uint8_t k : {18, 28}) for (uint16_t batch : {1, 4})
+    {
+        require(Engine::memory_bytes(k, executing, batch) == Engine::memory_bytes(k, modeled, batch) &&
+            MergeEngine::memory_bytes(k, executing, batch) == MergeEngine::memory_bytes(k, modeled, batch) &&
+            StagingEngine::memory_bytes(k, executing, batch) == StagingEngine::memory_bytes(k, modeled, batch) &&
+            ExternalEngine::memory_bytes(k, executing, scratch, batch) == ExternalEngine::memory_bytes(k, modeled, scratch, batch),
+            "read-only migration scheduler changed an engine memory model");
+        for (auto phase : {ExternalEngine::MemoryPhase::staging, ExternalEngine::MemoryPhase::packing, ExternalEngine::MemoryPhase::publication})
+            require(ExternalEngine::phase_memory_bytes(k, executing, scratch, phase, batch) ==
+                ExternalEngine::phase_memory_bytes(k, modeled, scratch, phase, batch), "read-only migration scheduler changed recovery phase memory");
+    }
+    auto const requested = identity_from(initial);
+    for (auto const* engine : {"incremental", "merged", "staged", "external"})
+    {
+        args.construction = engine;
+        require(prefetch_memory(args, requested, executing, 1, true, scratch) == prefetch_memory(args, requested, modeled, 1, true, scratch),
+            "read-only migration preview changed drive-specific prefetch admission");
+    }
+}
+void replot_diagnostics()
+{
+    using namespace grow_controller_test; using namespace farm;
+    Admission paused; paused.assessment.reasons = {"capacity-exceeded:cpu"};
+    Margin margin; margin.resource = "cpu"; margin.capacity = 2; margin.occupied_units = 3; paused.assessment.margins = {margin};
+    auto const reason = replot_pause_reason(paused);
+    require(reason.find("capacity-exceeded:cpu") != reason.npos && reason.find("declared capacity=2") != reason.npos &&
+        reason.find("occupied=3") != reason.npos, "resource pause lost its existing cause or declared margin");
+    paused.assessment.reasons = {std::string(4096, '\n')};
+    require(replot_pause_reason(paused).size() < 1024 && replot_pause_reason(paused).find('\n') == std::string::npos,
+        "resource diagnostics escaped their bounded single-line form");
+    require(replot_diagnostic_label(std::string(95, 'x') + "\xc3\xa9-tail") == json_string(std::string(95, 'x') + "..."),
+        "bounded diagnostic label split a Unicode character");
+    require(replot_unload_reason("RPC failure with private-memo-must-never-be-logged").find("private-memo") == std::string::npos &&
+        replot_unload_reason("config changed: private-memo-must-never-be-logged").find("private-memo") == std::string::npos,
+        "source-unload diagnostics exposed arbitrary adapter exception text");
+    paused.assessment.reasons.clear();
+    require(replot_pause_reason(paused).find("recovery") != std::string::npos, "recovery hysteresis pause has no diagnostic cause");
+}
+
+// Exercise actual controller lifecycle with synthetic known drive identities;
+// production topology discovery has no test override.
+void test_construction_history(std::filesystem::path const& root, group_grow::Members members,
+    group_grow::Identity const& initial, group_grow::Config config)
+{
+    using namespace grow_controller_test;
+    Arguments args;
+    args.backend = "cpu"; args.member_storage = "raw";
+    args.max_ram = 536870912; args.batch = 1; args.workers = 2;
+    args.window = config.window_bytes = mib;
+    args.checkpoint_bytes = config.checkpoint_bytes = 16 * mib;
+    config.capacity_bytes = 256 * mib; config.memory_limit_bytes = args.max_ram - mib;
+    group_grow::ConstructionHistories histories(4);
+    group_grow::ConstructionContext context{{"history-test-drive"}, initial.header.k, initial.header.strength, initial.header.meta_group,
+        initial.memo.size(), args.max_ram, args.window, args.checkpoint_bytes, config.codec_bytes,
+        config.workers, false, config.io_overlap, config.release_cache};
+    auto source = histories.find(context);
+    Backend backend;
+    auto const requested = identity_from(initial);
+    auto select = [&](Construction& engine, Arguments const& options, uint64_t retained = 0)
+    {
+        uint64_t const reserved = engine.memory_bytes(1, false), fixed = sum(reserved, mib);
+        Producer producer{requested, nullptr, backend, options, options.max_ram, fixed, fixed};
+        return automatic_selection(engine, producer, 64, 1, reserved, retained, 0, true);
+    };
+    Construction first((root / "history-first").string(), config, false, initial, "auto");
+    first.attach_history(source); first.confirm_identity();
+    require(!select(first, args) && !first.can_select(), "first group bypassed conservative initial construction");
+    require(first.append(members.subspan(0, 1)).accepted, "first history append did not fit");
+    first.select_merged();
+    for (size_t i = 1; i < members.size(); ++i)
+        require(first.append(members.subspan(i, 1)).accepted, "history contribution did not fit");
+    auto const published = first.finish();
+    auto const completed = source->snapshot();
+    require(completed.count && completed.contributions.count && completed.packing.count &&
+        completed.layout.count && completed.shapes.count,
+        "completed construction omitted append, packing, layout or canonical evidence");
+
+    // Retain the real completed work/call counts and canonical shape above.
+    // Like construction_selection(), make the policy decision independent of
+    // scheduler, filesystem-cache and sanitizer timing: unit byte/codec rates,
+    // no sync delay. The subsequent handoffs and publication still perform I/O.
+    {
+        std::lock_guard lock(source->mutex);
+        auto timing = [](group_grow::ConstructionSamples& samples)
+        {
+            for (size_t i = 0; i < samples.count; ++i)
+            {
+                auto& sample = samples.samples[i];
+                sample.read_ns = sample.read_bytes; sample.write_ns = sample.written_bytes;
+                sample.sync_ns = sample.decode_ns = 0;
+                sample.codec_ns = uint64_t(std::ceil(sample.codec_bytes / std::max(1u, sample.workers)));
+                sample.elapsed_ns = sample.read_ns + sample.write_ns + sample.codec_ns;
+            }
+        };
+        timing(source->history); timing(source->history.contributions);
+        timing(source->history.packing); timing(source->history.layout);
+    }
+
+    Construction next((root / "history-next").string(), config, false, initial, "auto");
+    next.attach_history(source); next.confirm_identity();
+    auto const selected = select(next, args);
+    require(selected && selected->merged && next.can_select(),
+        "a later compatible group could not select merged construction before its first append");
+    auto explicit_args = args; explicit_args.window_set = explicit_args.checkpoint_set = true;
+    if (auto constrained = select(next, explicit_args))
+        require(constrained->config.window_bytes == config.window_bytes &&
+            constrained->config.checkpoint_bytes == config.checkpoint_bytes,
+            "inherited observations overrode explicit I/O constraints");
+
+    // Slow flushes justify longer HDD transactions without reserving more
+    // RAM or changing another writer's retained grant. Unknown media and
+    // explicit checkpoint requests keep their existing bounds.
+    {
+        auto hdd_args = args; auto hdd_config = config;
+        hdd_args.window = hdd_config.window_bytes = 16 * mib;
+        hdd_args.checkpoint_bytes = hdd_config.checkpoint_bytes = 256 * mib;
+        hdd_config.capacity_bytes = 96 * 1024 * mib;
+        Construction hdd((root / "history-hdd-tuning").string(), hdd_config, false, initial, "incremental");
+        hdd.confirm_identity(); hdd.known_storage = true; hdd.nonrotating = false;
+        group_grow::ConstructionSample sample;
+        sample.read_bytes = sample.written_bytes = 512 * mib;
+        sample.read_ns = sample.write_ns = sample.codec_ns = 1000000000;
+        sample.syncs = 100; sample.sync_ns = 900000000000;
+        sample.elapsed_ns = sample.sync_ns + sample.read_ns + sample.write_ns + sample.codec_ns;
+        sample.codec_bytes = 1024 * mib; sample.workers = config.workers;
+        sample.member_bytes = 1024 * mib; sample.chunk_bytes = 512 * 1024;
+        hdd.history.add(sample); hdd.history.shapes.add(sample);
+        uint64_t const reserved = hdd.memory_bytes(1, false);
+        auto const tuned = select(hdd, hdd_args, reserved);
+        require(tuned && !tuned->merged && tuned->config.checkpoint_bytes > hdd_args.checkpoint_bytes &&
+            tuned->config.checkpoint_bytes <= 1024 * mib && tuned->engine_bytes == reserved &&
+            tuned->config.window_bytes == hdd_config.window_bytes,
+            "HDD checkpoint tuning lost its window or another writer's memory grant");
+        hdd_args.checkpoint_set = true;
+        auto const fixed = select(hdd, hdd_args, reserved);
+        require(fixed && fixed->config.checkpoint_bytes == hdd_args.checkpoint_bytes,
+            "HDD tuning changed an explicit checkpoint interval");
+        hdd_args.checkpoint_set = false; hdd.known_storage = false;
+        auto const unknown = select(hdd, hdd_args, reserved);
+        require(unknown && unknown->config.checkpoint_bytes <= hdd_args.checkpoint_bytes,
+            "unknown storage inherited an HDD checkpoint interval");
+    }
+    next.retune(selected->config); next.select_merged();
+    require(next.append(members).accepted, "empty merged handoff lost exact append admission");
+    auto const inherited = next.finish();
+    require(inherited.final_bytes == published.final_bytes && inherited.members == published.members,
+        "inherited construction changed the published group");
+    auto contents = [](fs::path const& path)
+    { auto in = input(path.string()); return std::vector<uint8_t>{std::istreambuf_iterator<char>(in), {}}; };
+    require(contents(root / "history-first") == contents(root / "history-next"),
+        "inherited construction changed ordinary v2 bytes");
+
+    auto const limited_path = root / "history-capacity";
+    {
+        Construction bounded(limited_path.string(), config, false, initial);
+        bounded.attach_history(source); bounded.confirm_identity();
+        require(bounded.append(members).accepted, "capacity history fixture did not fit");
+        bounded.finish();
+    }
+    auto tight = config; tight.capacity_bytes = fs::file_size(limited_path);
+    {
+        Construction bounded(limited_path.string(), tight, true, initial);
+        bounded.attach_history(source); bounded.confirm_identity();
+        auto const before = source->snapshot();
+        auto const refused = bounded.append(members.subspan(0, 1));
+        auto const after = source->snapshot();
+        require(!refused.accepted && after.count == before.count &&
+            after.contributions.count == before.contributions.count &&
+            bounded.finish().members == members.size() && contents(limited_path) == contents(root / "history-first"),
+            "capacity rejection trained a successful batch or changed the completed prefix");
+    }
+
+    auto narrow = config; narrow.capacity_bytes = 4 * mib;
+    {
+        auto const path = root / "history-retired-capacity";
+        fs::copy_file(limited_path, path);
+        uint64_t const metadata = 4096;
+        bool rejected = false;
+        try
+        {
+            Construction bounded(path.string(), tight, true, initial, "incremental", {}, metadata);
+            bounded.confirm_identity();
+        }
+        catch (std::runtime_error const&) { rejected = true; }
+        require(rejected && contents(path) == contents(limited_path),
+            "retired metadata bypassed capacity admission or changed a rejected output");
+        auto admitted = tight; admitted.capacity_bytes += metadata;
+        Construction bounded(path.string(), admitted, true, initial, "incremental", {}, metadata);
+        bounded.confirm_identity();
+        auto const finished = bounded.finish();
+        require(finished.peak_file_bytes == admitted.capacity_bytes && finished.workspace_bytes == metadata,
+            "retired metadata disappeared from idle construction accounting");
+        bounded.resize_capacity(config.capacity_bytes + metadata);
+        auto const appended = bounded.append(members.subspan(0, 1));
+        require(appended.accepted && appended.result.workspace_bytes >= metadata &&
+            appended.result.peak_file_bytes <= config.capacity_bytes + metadata &&
+            bounded.config.capacity_bytes == config.capacity_bytes,
+            "capacity expansion reused space occupied by retired metadata");
+    }
+    {
+        Construction fallback((root / "history-empty-fallback").string(), narrow, false, initial, "auto");
+        fallback.attach_history(source); fallback.confirm_identity(); fallback.select_merged();
+        auto const before = source->snapshot();
+        auto const accepted = fallback.append(members.subspan(0, 1));
+        auto const after = source->snapshot();
+        require(accepted.accepted && !fallback.is_staging() && fallback.automatic_fallbacks == 1 &&
+            after.contributions.count == before.contributions.count && fallback.finish().members == 1,
+            "empty inherited construction could not fall back to exact ordinary admission");
+    }
+
+    // Saved zero-byte owners keep their inode when closed. Both handoffs
+    // must accept that same inode without opening an unrelated replacement.
+    auto const retained_path = root / "history-retained-empty";
+    { std::ofstream file(retained_path); }
+    Construction retained(retained_path.string(), narrow, true, initial, "auto");
+    retained.attach_history(source); retained.confirm_identity(); retained.select_merged();
+    require(retained.append(members.subspan(0, 1)).accepted && !retained.is_staging() &&
+        retained.automatic_fallbacks == 1 && retained.finish().members == 1,
+        "retained empty construction could not hand off or fall back through its saved inode");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    // Inject the replacement exactly after the old owner's unlink, for both
+    // minimum-reserve and contribution-admission rejection of an empty merge.
+    for (uint64_t capacity : {2 * config.window_bytes, 4 * config.window_bytes})
+    {
+        auto const path = root / ("history-fallback-replacement-" + std::to_string(capacity));
+        auto cfg = config; cfg.capacity_bytes = capacity;
+        Construction replaced(path.string(), cfg, false, initial, "auto");
+        replaced.attach_history(source); replaced.confirm_identity(); replaced.select_merged();
+        replacement_target = path.string(); replace_unlinked.store(true);
+        bool rejected = false;
+        try { replaced.append(members.subspan(0, 1)); } catch (std::exception const&) { rejected = true; }
+        bool const injected = !replace_unlinked.exchange(false);
+        std::string const expected = "replacement";
+        require(rejected && injected && contents(path) == std::vector<uint8_t>(expected.begin(), expected.end()),
+            "empty merge fallback adopted or removed a replacement after close");
+    }
+#endif
+
+    // A replacement path survives closing the old empty inode, so the fresh
+    // merge open must fail exclusively without adopting or deleting that file.
+    auto const conflict = root / "history-conflict";
+    Construction replaced(conflict.string(), config, false, initial, "auto");
+    replaced.attach_history(source); replaced.confirm_identity();
+    fs::rename(conflict, root / "history-original-empty");
+    { std::ofstream file(conflict); file << "replacement"; }
+    auto const replacement = contents(conflict);
+    bool rejected = false;
+    try { replaced.select_merged(); } catch (std::exception const&) { rejected = true; }
+    require(rejected && contents(conflict) == replacement,
+        "empty construction handoff adopted or removed a replacement target");
+
+    // The normal same-drive writer serializes appends while an idle destination
+    // can inspect shared evidence. Histories therefore need their own lock.
+    context.drives = {"history-live-drive"}; auto live_source = histories.find(context);
+    Construction live_first((root / "history-live-first").string(), config, false, initial);
+    Construction live_next((root / "history-live-next").string(), config, false, initial);
+    live_first.attach_history(live_source); live_next.attach_history(live_source);
+    live_first.confirm_identity(); live_next.confirm_identity();
+    group_grow::OrderedWriter writer([] {});
+    auto writing = writer.submit([&] { require(live_first.append(members).accepted, "live history append did not fit"); });
+    while (writing.wait_for(std::chrono::seconds(0)) != std::future_status::ready) live_next.refresh_history();
+    writing.get();
+    auto following = writer.submit([&] { require(live_next.append(members).accepted, "second live history append did not fit"); });
+    following.get();
+    require(live_source->snapshot().count == 2, "same-drive destinations lost completed writer observations");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    context.drives = {"history-failed-drive"}; auto failed_source = histories.find(context);
+    auto const failed_path = root / "history-failed";
+    {
+        Construction failed(failed_path.string(), config, false, initial, "merged");
+        failed.attach_history(failed_source); failed.confirm_identity();
+        require(failed.append(members).accepted, "failed-finalization fixture did not fit");
+        auto const before = failed_source->snapshot();
+        fail_write_begin.store(0); fail_write_end.store(UINT64_MAX); fail_write.store(true);
+        bool failed_finish = false;
+        try { failed.finish(); } catch (std::exception const&) { failed_finish = true; }
+        fail_write.store(false);
+        auto const after = failed_source->snapshot();
+        require(failed_finish && !after.packing.count && !after.layout.count && !after.shapes.count &&
+            after.contributions.count == before.contributions.count,
+            "failed finalization trained successful construction evidence");
+    }
+    {
+        Construction resumed(failed_path.string(), config, true, initial, "incremental");
+        resumed.attach_history(failed_source); resumed.confirm_identity();
+        require(resumed.is_staging(), "requested construction overrode the saved recovery protocol");
+        auto const recovered = resumed.finish(); auto const after = failed_source->snapshot();
+        require(recovered.members == members.size() && !after.packing.count && !after.layout.count && !after.shapes.count &&
+            contents(failed_path) == contents(root / "history-first"),
+            "recovery trained incomplete phase timings or changed canonical output");
+    }
+#endif
+}
+
+Identity identity()
+{
+    Identity result;
+    result.header.magic = PlotGroupFile::MAGIC; result.header.version = PlotGroupFile::FORMAT_VERSION;
+    result.header.group_id = PlotGroupId(std::string(64, 'a')); result.header.k = 18; result.header.strength = 2;
+    result.memo = {0, 17, 255}; result.header.memo_length = uint8_t(result.memo.size());
+    result.header.chunk_index_offset = sizeof(Header) + result.memo.size(); return result;
+}
+Config configuration()
+{
+    Config result;
+    result.capacity_bytes = 64ull * 1024 * 1024; result.window_bytes = 32768;
+    result.checkpoint_bytes = 65536; result.codec_bytes = 8ull * 1024 * 1024;
+    result.workers = 2; result.io_overlap = false;
+    result.memory_limit_bytes = std::max(Engine::memory_bytes(18, result, 16), MergeEngine::memory_bytes(18, result, 16));
+    return result;
+}
+void native_cpu_budget()
+{
+    using namespace grow_controller_test;
+    Arguments args; args.backend = "cpu"; args.workers = 1;
+    Backend backend; backend.mode = "cpu";
+    backend.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+    auto const requested = identity_from(identity());
+    auto const original = worker_detail::cpu_threads();
+    std::atomic<bool> started{false}, observed{false}, escaped{false};
+    args.cancelled = [&]
+    {
+        if (worker_detail::cpu_limit)
+        {
+            observed.store(true);
+            if (worker_detail::cpu_threads() != 1) escaped.store(true);
+        }
+        return false;
+    };
+    std::future<Member> generated;
+    {
+        CodecScheduler::Lease occupied(backend.cpu_scheduler.get());
+        generated = std::async(std::launch::async, [&]
+        {
+            started.store(true);
+            return backend.generate(requested, 0, args, nullptr, nullptr);
+        });
+        while (!started.load()) std::this_thread::yield();
+        require(generated.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready && !observed.load(),
+            "native CPU generation escaped the shared plotting budget");
+    }
+    auto output = generated.get();
+    require(output.size() && observed.load() && !escaped.load() && worker_detail::cpu_threads() == original,
+        "native CPU generation lost its scoped allowance or leaked it into the caller");
+    args.cancelled = [] { return true; };
+    bool interrupted = false;
+    try { (void)backend.generate(requested, 0, args, nullptr, nullptr); }
+    catch (Interrupted const&) { interrupted = true; }
+    require(interrupted, "native CPU budget wait ignored cancellation");
+}
+std::vector<std::vector<uint64_t>> members(size_t count = 8, uint64_t symbols = 64)
+{
+    std::vector<std::vector<uint64_t>> result(count);
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(18), range = 1ull << (18 + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+    for (size_t member = 0; member < count; ++member)
+        for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+            for (uint64_t i = 0; i < symbols; ++i)
+            {
+                uint64_t const value = chunk * range + i * (range / symbols) + member + 7;
+                result[member].push_back(value); if (i == 3) result[member].push_back(value);
+            }
+    return result;
+}
+std::vector<uint8_t> contents(fs::path const& path)
+{ auto in = group_tools::input(path.string()); return {std::istreambuf_iterator<char>(in), {}}; }
+void direct(fs::path const& path, Members input, Config cfg)
+{
+    Engine output(path.string(), cfg, false, identity()); output.confirm_identity();
+    require(output.append(input).accepted, "direct merge test reference did not fit");
+}
+Result complete(fs::path const& path, Members input, bool resume, Config cfg, size_t batch = 1)
+{
+    if (resume && fs::file_size(path) >= sizeof(Header) && !MergeEngine::pending(path.string()))
+    {
+        auto in = group_tools::input(path.string()); auto header = group_tools::read<Header>(in);
+        if (header.version == 0xf1)
+        {
+            Engine output(path.string(), cfg, true); output.confirm_identity(); output.resume({});
+        }
+    }
+    MergeEngine output(path.string(), cfg, resume, identity()); output.confirm_identity();
+    if (!output.can_append()) return output.finish();
+    while (output.committed_member_count() < input.size())
+    {
+        size_t const first = output.committed_member_count(), count = std::min(batch, input.size() - first);
+        auto result = output.append(input.subspan(first, count));
+        require(result.accepted, "merged test contribution rejected: " + result.reason);
+    }
+    return output.finish();
+}
+void construction_cancellation(fs::path const& root, Members input, Config cfg)
+{
+#ifdef GROW_TEST_WRAP_PWRITE
+    using grow_controller_test::Construction;
+    cfg.capacity_bytes = 128 * 1024 * 1024; cfg.memory_limit_bytes = 512 * 1024 * 1024;
+    cfg.window_bytes = 32768; cfg.checkpoint_bytes = 65536; cfg.io_overlap = true;
+    auto const reference = root / "cancel-reference"; direct(reference, input, cfg);
+    auto const expected = contents(reference);
+    for (auto const* mode : {"incremental", "staged", "merged", "external"})
+        for (auto const* phase : {"fresh", "append", "summary", "pack", "compact", "layout"})
+        {
+            bool const ordinary = std::string_view(mode) == "incremental";
+            bool const layout = std::string_view(phase) == "layout";
+            bool const compaction = std::string_view(phase) == "compact";
+            bool const summary = std::string_view(phase) == "summary";
+            bool const packing = std::string_view(phase) == "pack" || layout || compaction;
+            if ((ordinary && packing) || (layout && std::string_view(mode) != "merged") ||
+                (compaction && std::string_view(mode) != "staged") ||
+                (summary && std::string_view(mode) != "external")) continue;
+            auto const path = root / (std::string("cancel-") + mode + '-' + phase);
+            auto const scratch = fs::absolute(root / (path.filename().string() + "-scratch")); fs::create_directory(scratch);
+            ExternalConfig external; external.scratch.push_back({scratch.string(), cfg.capacity_bytes}); external.segment_bytes = 65536;
+            std::atomic<bool> requested{false}; Construction* live = nullptr;
+            auto bounded = cfg;
+            bounded.cancelled = [&]
+            {
+                if (layout && live && live->merged && live->merged->stats().layout_moves) requested = true;
+                return requested.load();
+            };
+            bool stopped = false;
+            if (summary)
+            {
+                // Live staging retains its summary in RAM. Reopen the saved
+                // prefix to exercise cancellation during the authenticated read.
+                Construction prefix(path.string(), bounded, false, identity(), mode, external, 0, false);
+                prefix.confirm_identity();
+                require(prefix.append(input.subspan(0, 1)).accepted, "cancellation summary prefix did not fit");
+            }
+            {
+                Construction output(path.string(), bounded, summary, identity(), mode,
+                    std::string_view(mode) == "external" ? std::optional(external) : std::nullopt, 0, false);
+                output.confirm_identity(); live = &output;
+                bool const prefix = std::string_view(phase) == "append" || summary;
+                if (packing || (prefix && !summary))
+                    require(output.append(packing ? input : input.subspan(0, 1)).accepted, "cancellation prefix did not fit");
+                auto const before = output.stats().encode_chunks;
+                auto const target = grow_controller_test::Construction::snapshot(path.string());
+                construction_read_observer = [&](int fd, size_t bytes, off_t offset)
+                {
+                    if (!summary || !offset || bytes <= sizeof(Header)) return;
+                    std::array<char, PATH_MAX> name{};
+                    auto const count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), name.data(), name.size());
+                    if (count > 0 && std::string_view(name.data(), size_t(count)).starts_with(scratch.string() + '/') &&
+                        std::string_view(name.data(), size_t(count)).ends_with("/run-1-0")) requested = true;
+                };
+                construction_write_observer = [&, target](int fd, size_t bytes, off_t offset)
+                {
+                    if (layout || summary || bytes <= sizeof(Header)) return;
+                    if (compaction && offset) return;
+                    // Same-file writers and contribution staging run on this
+                    // calling thread. External packing may have its own target
+                    // consumer, so its hook only reads immutable identities.
+                    if ((!packing || std::string_view(mode) != "external") && output.stats().encode_chunks == before) return;
+                    struct stat current{}; require(!::fstat(fd, &current), "cannot inspect cancellation write");
+                    bool matches = current.st_dev == target.st_dev && current.st_ino == target.st_ino;
+                    if (!packing && std::string_view(mode) == "external")
+                    {
+                        std::array<char, PATH_MAX> name{};
+                        auto const count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), name.data(), name.size());
+                        matches = count > 0 && std::string_view(name.data(), size_t(count)).starts_with(scratch.string() + '/');
+                    }
+                    if (matches) requested = true;
+                };
+                try
+                {
+                    if (packing) (void)output.finish();
+                    else (void)output.append(prefix ? input.subspan(1) : input);
+                }
+                catch (ConstructionInterrupted const&) { stopped = true; }
+                require(stopped && requested && (layout || summary || output.stats().encode_chunks > before),
+                    std::string("construction ignored payload cancellation: ") + mode + '/' + phase);
+                construction_write_observer = {}; construction_read_observer = {}; live = nullptr;
+            }
+            requested = false;
+            Construction resumed(path.string(), cfg, true, identity(), mode,
+                std::string_view(mode) == "external" ? std::optional(external) : std::nullopt, 0, false);
+            resumed.confirm_identity();
+            if (!resumed.is_staging() && resumed.identity().pending)
+            {
+                auto const saved = resumed.identity();
+                (void)resumed.resume(input.subspan(saved.old_members, saved.target_members - saved.old_members));
+            }
+            while (resumed.can_append() && resumed.member_count() < input.size())
+                require(resumed.append(input.subspan(resumed.member_count())).accepted, "cancelled construction prefix could not resume");
+            auto const result = resumed.finish();
+            require(result.members == input.size() && result.final_bytes == expected.size() && contents(path) == expected,
+                std::string("cancelled construction changed canonical resumed bytes: ") + mode + '/' + phase);
+        }
+    auto const planning = root / "cancel-planning"; direct(planning, input.subspan(0, 1), cfg);
+    auto const original = contents(planning); bool requested = false;
+    auto bounded = cfg; bounded.cancelled = [&] { return requested; };
+    Engine engine(planning.string(), bounded, true); engine.confirm_identity(); requested = true;
+    bool stopped = false;
+    try { (void)engine.plan(input.subspan(1)); } catch (ConstructionInterrupted const&) { stopped = true; }
+    require(stopped && contents(planning) == original, "cancelled planning changed its source");
+
+    // Exercise the actual run_group final pack, with its original reviewed
+    // deadline expiring inside a successful target payload syscall.
+    using namespace grow_controller_test;
+    auto const controller_path = fs::absolute(root / "cancel-controller.gplot");
+    auto const controller_scratch = fs::absolute(root / "cancel-controller-scratch"); fs::create_directory(controller_scratch);
+    auto const controller_identity = identity_from(::identity());
+    Fixtures fixture{controller_identity, {}, 0};
+    for (uint16_t member = 0; member < input.size(); ++member)
+    {
+        PlotData data; auto const raw = input[member].raw(); data.t3_proof_fragments.assign(raw.begin(), raw.end());
+        auto const path = root / ("cancel-controller-member-" + std::to_string(member));
+        fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, controller_identity.params, member, controller_identity.memo));
+        fixture.paths.push_back(path);
+    }
+    Arguments args; args.backend = "cpu"; args.construction = "external"; args.command = "test";
+    args.max_ram = 512 * mib; args.window = args.checkpoint_bytes = 65536; args.workers = 2;
+    args.batch = args.max_members = input.size(); args.headroom = 0; args.temporary_capacity = 128 * mib;
+    args.temporary = {controller_scratch};
+    using Clock = std::chrono::steady_clock;
+    std::atomic<Clock::duration::rep> deadline{Clock::duration::max().count()};
+    args.cancelled = [&] { return Clock::now().time_since_epoch().count() >= deadline.load(); };
+    construction_write_observer = [&](int fd, size_t bytes, off_t offset)
+    {
+        if (!offset || bytes <= 1024) return;
+        std::array<char, PATH_MAX> name{};
+        auto const count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), name.data(), name.size());
+        if (count > 0 && std::string_view(name.data(), size_t(count)) == controller_path.string() + ".partial")
+            deadline = Clock::now().time_since_epoch().count();
+    };
+    std::unique_ptr<Backend> backend; stopped = false;
+    try { (void)run_group(args, controller_path, &fixture, controller_identity, uint16_t(input.size()), cfg.capacity_bytes, 0, backend); }
+    catch (ConstructionInterrupted const&) { stopped = true; }
+    construction_write_observer = {};
+    require(stopped, "run_group returned success after its construction deadline expired during payload packing");
+    require(!fs::exists(controller_path) && fs::is_regular_file(controller_path.string() + ".partial"),
+        "cancelled controller exposed an unfinished output");
+    args.resume = true; args.cancelled = {}; backend.reset();
+    auto const result = run_group(args, controller_path, &fixture, controller_identity, uint16_t(input.size()), cfg.capacity_bytes, 0, backend);
+    require(result.members == input.size() && contents(controller_path) == expected &&
+        !fs::exists(controller_path.string() + ".partial"),
+        "controller deadline recovery changed canonical output");
+#endif
+}
+
+void parity(fs::path const& root, Members input, Config cfg)
+{
+    auto reference = root / "reference.gplot"; direct(reference, input, cfg); auto expected = contents(reference);
+    for (size_t batch : {size_t(1), size_t(3), input.size()})
+    {
+        auto path = root / ("merged-" + std::to_string(batch));
+        auto result = complete(path, input, false, cfg, batch);
+        require(result.final_bytes == expected.size() && result.peak_file_bytes <= cfg.capacity_bytes && contents(path) == expected,
+                "balanced merge differs from canonical bytes");
+        auto const before = fs::last_write_time(path); complete(path, input, true, cfg);
+        require(fs::last_write_time(path) == before && contents(path) == expected, "completed merge resume changed output");
+        fs::remove(path);
+    }
+    auto extended = root / "extended.gplot"; direct(extended, input.subspan(0, 1), cfg);
+    complete(extended, input, true, cfg); require(contents(extended) == expected, "ordinary merge extension differs"); fs::remove(extended);
+    auto staged = root / "bounded.gplot";
+    {
+        MergeEngine output(staged.string(), cfg, false, identity()); output.confirm_identity();
+        for (size_t member = 0; member < input.size(); ++member)
+            require(output.append(input.subspan(member, 1)).accepted, "bounded merge did not fit");
+        auto result = output.finish(); auto const& stats = output.stats();
+        uint64_t const passes = (input.size() + cfg.merge_inputs - 3) / (cfg.merge_inputs - 1);
+        require(stats.merge_passes < passes && stats.reclaimed_bytes > result.final_bytes &&
+            stats.max_active_runs <= MergeEngine::packing_inputs(cfg) && stats.read_bytes && stats.written_bytes && stats.sync_ns,
+            "merge did not perform bounded, measured space recycling");
+        if (input.size() <= MergeEngine::packing_inputs(cfg))
+            require(!stats.merge_passes && stats.max_active_runs == input.size(), "final packing materialized an unnecessary run");
+        auto const& packing = stats.phases[size_t(WorkPhase::pack)];
+        auto const& layout = stats.phases[size_t(WorkPhase::layout)];
+        require(packing.read_bytes && packing.written_bytes && packing.read_calls && packing.write_calls && packing.syncs &&
+            layout.written_bytes && layout.write_calls && layout.syncs && !layout.codec_ns,
+            "completed finalization phases did not retain their own storage work");
+        if (cfg.io_overlap)
+            require(stats.contribution_workers > 1 && stats.packing_overlap_windows && stats.layout_batches < stats.layout_moves,
+                    "merge did not parallelize contributions, overlap packing and batch placement");
+        // Retained-run slack can exceed this small output's size with the
+        // larger overlap transaction. capacity_pressure() checks that case
+        // below the duplicate-output bound with forced compaction instead.
+        if (!cfg.io_overlap)
+            require(result.peak_file_bytes < result.final_bytes * 2, "merge retained a full duplicate output");
+    }
+    require(contents(staged) == expected, "recycling changed final output"); fs::remove(staged);
+}
+void retuning(fs::path const& root, Members input, Config cfg)
+{
+    auto path = root / "retuning.gplot"; direct(path, input.subspan(0, 1), cfg);
+    auto const before = contents(path);
+    Engine output(path.string(), cfg, true, identity()); output.confirm_identity();
+    output.retune(output.largest_chunk(), cfg.checkpoint_bytes);
+    bool rejected = false;
+    try { (void)output.append(input.subspan(1)); }
+    catch (WindowBudgetError const&) { rejected = true; }
+    require(rejected && contents(path) == before && !output.identity().pending,
+            "automatic window sizing failure changed the ordinary source");
+    output.retune(cfg.window_bytes, cfg.checkpoint_bytes);
+    require(output.append(input.subspan(1)).accepted && contents(path) == contents(root / "reference.gplot"),
+            "restoring the reserved window changed canonical bytes");
+}
+void ordinary_prefix(fs::path const& root, Config cfg)
+{
+    // A bounded reader set must compact the new suffix rather than repeatedly
+    // copying its larger ordinary prefix. Vary the last contribution sizes.
+    auto input = members(12); auto path = root / "large-prefix.gplot";
+    auto reference = root / "large-prefix-reference.gplot";
+    direct(reference, input, cfg); direct(path, Members(input).subspan(0, 8), cfg);
+    {
+        MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity();
+        for (size_t count : {size_t(1), size_t(2), size_t(1)})
+            require(output.append(Members(input).subspan(output.committed_member_count(), count)).accepted,
+                    "small ordinary-prefix contribution did not fit");
+        require(output.stats().max_active_runs <= MergeEngine::packing_inputs(cfg), "prefix compaction exceeded reader budget");
+    }
+    {
+        MergeState saved(path.string(), cfg, true, identity());
+        require(saved.state.runs[0].ordinary && saved.state.runs[0].count == 8,
+                "suffix compaction unnecessarily rewrote the ordinary prefix");
+    }
+    complete(path, input, true, cfg);
+    require(contents(path) == contents(reference), "partial/changing suffix batches changed canonical bytes");
+    fs::remove(path); fs::remove(reference);
+}
+void balanced_traffic(fs::path const& root, Config cfg)
+{
+    // The final reader budget is independent of two-way compaction. With
+    // sufficient reader windows, unequal batches need no intermediate copy.
+    auto retained = members(14);
+    for (bool overlap : {false, true})
+    {
+        auto wide = cfg; wide.window_bytes = 16 * 1024 * 1024; wide.merge_inputs = 2;
+        wide.capacity_bytes = 512 * 1024 * 1024;
+        wide.io_overlap = overlap;
+        wide.memory_limit_bytes = std::max(Engine::memory_bytes(18, wide, uint16_t(retained.size())),
+            MergeEngine::memory_bytes(18, wide, uint16_t(retained.size())));
+        auto const path = root / (overlap ? "retained-overlap" : "retained-serial");
+        auto const reference = root / "retained-reference"; direct(reference, retained, wide);
+        {
+            MergeEngine output(path.string(), wide, false, identity()); output.confirm_identity();
+            size_t first = 0;
+            for (size_t count : {1, 3, 2, 1, 1, 1, 1, 2, 1, 1})
+            {
+                require(output.append(Members(retained).subspan(first, count)).accepted,
+                    "retained contribution did not fit"); first += count;
+            }
+            auto const result = output.finish();
+            require(!output.stats().merge_passes && output.stats().max_active_runs == 10 &&
+                result.peak_file_bytes <= wide.capacity_bytes && contents(path) == contents(reference),
+                "wide two-way construction copied retained runs or changed canonical bytes");
+        }
+        fs::remove(path); fs::remove(reference);
+    }
+    // Borrow the same valid member payload for many contributions, keeping
+    // resident memory small while exposing repeated unbalanced suffix copies.
+    auto source = members(1, 96); std::vector<Member> input;
+    for (size_t member = 0; member < 128; ++member) input.push_back(Member::borrowed(source[0]));
+    auto reference = root / "traffic-reference.gplot";
+    cfg.capacity_bytes = 256 * 1024 * 1024; cfg.window_bytes = 65536;
+    cfg.memory_limit_bytes = std::max(Engine::memory_bytes(18, cfg, uint16_t(input.size())),
+        MergeEngine::memory_bytes(18, cfg, uint16_t(input.size())));
+    direct(reference, input, cfg);
+    for (unsigned fan : {2u, 4u})
+    {
+        cfg.merge_inputs = fan; auto path = root / ("traffic-" + std::to_string(fan)); uint64_t read_bytes = 0;
+        {
+            MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+            for (size_t member = 0; member < input.size(); ++member)
+                require(output.append(Members(input).subspan(member, 1)).accepted, "balanced traffic contribution did not fit");
+            read_bytes = output.stats().read_bytes;
+        }
+        {
+            MergeState saved(path.string(), cfg, true, identity());
+            uint64_t const tables = input.size() * PlotGroupFile::getChunkCountForK(18) * (sizeof(ChunkSummary) + sizeof(uint64_t));
+            unsigned const bits = std::bit_width(input.size() - 1);
+            unsigned const levels = fan == 4 ? (bits + 1) / 2 : bits;
+            require(saved.state.run_count <= MergeState::max_runs &&
+                read_bytes <= saved.state.live_bytes * levels + tables,
+                "deferred runs repeatedly rewrote an unbalanced suffix");
+        }
+        complete(path, input, true, cfg);
+        require(contents(path) == contents(reference), "balanced deferred traffic changed canonical bytes"); fs::remove(path);
+    }
+    fs::remove(reference);
+}
+void interruption(fs::path const& root, Members input, Config cfg, std::string const& point, bool extend = false)
+{
+    auto expected = contents(root / "reference.gplot");
+    auto path = root / "interrupted.gplot"; fs::remove(path);
+    if (extend) direct(path, input.subspan(0, 1), cfg);
+    auto const child = ::fork(); require(child >= 0, "cannot fork merge recovery test");
+    if (!child)
+    {
+        ::setenv("XCHPLOT2_GROW_FAILPOINT", point.c_str(), 1);
+        try { complete(path, input, extend, cfg); }
+        catch (std::exception const& error) { std::cerr << point << ": " << error.what() << '\n'; std::_Exit(1); }
+        std::_Exit(0);
+    }
+    int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+        "merge failpoint was not reached: " + point);
+    auto resumed = cfg;
+    // Changing concurrency or raising the transaction request must not
+    // invalidate the reserve committed by the interrupted writer.
+    if (point == "merge-pack-committed:2") { resumed.workers = 1; resumed.checkpoint_bytes *= 8; }
+    if (point == "merge-copy-committed:2") resumed.merge_inputs = cfg.merge_inputs == 4 ? 2 : 4;
+    if (point.starts_with("merge-run-committed") || point == "merge-pack-committed:2" || point == "merge-copy-committed:2")
+    {
+        auto const before = contents(path); require(!::chmod(path.c_str(), 0400), "cannot make merge checkpoint read-only");
+        ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+        auto const inspected = MergeEngine::inspect(path.string(), resumed, limits);
+        auto const repeated = MergeEngine::inspect(path.string(), resumed, limits);
+        require(inspected.checkpoint && inspected.authority_digest == repeated.authority_digest && inspected.target == repeated.target &&
+            inspected.recovery_memory_bytes && inspected.inspection_memory_bytes <= limits.memory_bytes && contents(path) == before,
+            "read-only merge inspection changed or did not bind the retained checkpoint");
+        auto denied = limits; denied.memory_bytes = 1; bool refused = false;
+        try { (void)MergeEngine::inspect(path.string(), resumed, denied); } catch (std::runtime_error const&) { refused = true; }
+        require(refused && contents(path) == before, "merge inspection ignored its distinct audit grant or changed its checkpoint");
+        require(!::chmod(path.c_str(), 0600), "cannot restore merge checkpoint permissions");
+    }
+    if (point == "merge-allocated" || point == "merge-bootstrap" || point == "merge-locator-partial")
+    {
+        auto const before = contents(path);
+        auto const inspected = MergeEngine::inspect(path.string(), resumed,
+            {64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)}, identity());
+        require(!inspected.checkpoint && contents(path) == before,
+            "read-only merge bootstrap/orphan recovery invented checkpoint authority or changed retained bytes");
+    }
+    if (point == "merge-contribution-partial" || point == "merge-contribution-flushed")
+    {
+        MergeEngine output(path.string(), resumed, true, identity());
+        require(output.committed_member_count() == (extend ? 1 : 0),
+                "provisional contribution survived without its batch checkpoint");
+    }
+    complete(path, input, true, resumed);
+    require(contents(path) == expected, "merge crash recovery differs: " + point); fs::remove(path);
+}
+void recovery(fs::path const& root, Members input, Config cfg)
+{
+    std::vector<std::string> points{
+        "merge-allocated", "merge-bootstrap", "merge-locator-partial", "merge-initialized-committed",
+        "merge-checkpoint-partial:2", "merge-run-flushed:2", "merge-run-committed:3",
+        "merge-finishing-committed", "merge-pack-start-committed", "merge-pack-flushed:2", "merge-pack-committed:2",
+        "merge-index-flushed", "merge-layout-ready-committed", "merge-layout-located",
+        "merge-layout-partial:3", "merge-layout-move-flushed:2", "merge-layout-move-committed:3",
+        "merge-layout-complete-committed", "merge-final-header-partial", "merge-finalizing",
+        "merge-retire-partial", "merge-retired", "merge-truncated", "merge-published"};
+    for (auto const& point : points) interruption(root, input, cfg, point);
+    for (auto const* point : {"merge-locator-partial", "merge-initialized-committed",
+                              "merge-pack-committed:2", "merge-index-flushed", "merge-layout-partial", "merge-retired"})
+        interruption(root, input, cfg, point, true);
+    // A final group within the reader bound needs no packet-copy pass. Force
+    // input pressure separately so both saved merge fan-ins still recover.
+    auto more = members(MergeEngine::packing_inputs(cfg) + cfg.merge_inputs);
+    auto const pressure = root / "pressure"; fs::create_directory(pressure);
+    direct(pressure / "reference.gplot", more, cfg);
+    for (auto const* point : {"merge-start-committed", "merge-copy-flushed:2", "merge-copy-committed:2", "merge-complete-committed"})
+        interruption(pressure, more, cfg, point);
+    interruption(pressure, more, cfg, "merge-copy-committed:2", true);
+    interruption(pressure, more, cfg, "merge-run-committed:" + std::to_string(more.size()));
+}
+void construction_inspection_recovery(fs::path const& root, Members input, Config cfg)
+{
+    auto const directory = root / "readonly-construction"; fs::create_directory(directory);
+    input = input.subspan(0, 2); auto const reference = directory / "reference.gplot"; direct(reference, input, cfg);
+    auto const expected = contents(reference);
+    for (bool prefix : {false, true}) for (std::string const point : {"bootstrap", "allocated", "checkpoint-partial", "marked", "finalizing", "retired"})
+    {
+        if (prefix && point == "bootstrap") continue;
+        auto const path = directory / (std::string(prefix ? "prefix-" : "fresh-") + point);
+        if (prefix) direct(path, input.subspan(0, 1), cfg);
+        auto const child = ::fork(); require(child >= 0, "cannot fork read-only ordinary recovery fixture");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", point.c_str(), 1);
+            Engine output(path.string(), cfg, prefix, identity()); output.confirm_identity();
+            require(output.append(input.subspan(prefix ? 1 : 0)).accepted, "ordinary inspection recovery append rejected"); std::_Exit(0);
+        }
+        int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+            "ordinary inspection recovery failpoint was not reached: " + point);
+        auto const before = contents(path); require(!::chmod(path.c_str(), 0400), "cannot make ordinary bootstrap read-only");
+        ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+        auto const inspected = Engine::inspect(path.string(), cfg, limits, identity());
+        auto const repeated = Engine::inspect(path.string(), cfg, limits, identity());
+        require(inspected.authority_digest == repeated.authority_digest && inspected.target == repeated.target && contents(path) == before,
+            "read-only ordinary bootstrap/orphan inspection changed retained bytes");
+        if (point == "bootstrap" || point == "allocated" || point == "checkpoint-partial" || point == "retired")
+            require(!inspected.checkpoint, "uncheckpointed ordinary recovery invented checkpoint authority");
+        require(!::chmod(path.c_str(), 0600), "cannot restore ordinary bootstrap permissions");
+        {
+            Engine output(path.string(), cfg, true, identity()); output.confirm_identity(); auto const saved = output.identity();
+            if (saved.pending) output.resume(saved.target_members > saved.old_members ?
+                input.subspan(saved.old_members, saved.target_members - saved.old_members) : Members{});
+            if (output.identity().header.group_size < input.size())
+                require(output.append(input.subspan(output.identity().header.group_size)).accepted, "ordinary bootstrap recovery rejected the remaining members");
+        }
+        require(contents(path) == expected, "read-only inspection changed original ordinary resume parity: " + point);
+    }
+    for (auto const* point : {"merge-allocated", "merge-bootstrap", "merge-locator-partial", "merge-run-committed:2", "merge-pack-committed:2"})
+        interruption(directory, input, cfg, point);
+}
+void replot_output_native_owners(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    auto const directory = root / "replot-output-owners"; fs::create_directory(directory);
+    auto const path = directory / "replacement.gplot"; input = input.subspan(0, 2); direct(path, input, cfg);
+    auto const bytes = contents(path); auto const original = stream_state::stamp(path);
+    ReplotReview review; auto& lane = review.farm.directories.emplace_back();
+    lane.directory = file_io::path_text(directory); lane.directory_identity = farming_directory_identity(directory);
+    lane.layout.files = 1; lane.layout.total_members = lane.layout.group_members = input.size(); lane.layout.fixed_members = true;
+    review.batches.push_back({0, 0, 0, 0, cfg.capacity_bytes, 0, 0, 0});
+    auto const fixed = identity_from(identity());
+    auto const owner = audit_replot_replacement(review, review.farm, fixed, 0, path, original, false, {}, true);
+    auto reject = [](auto operation, char const* message)
+    { bool refused = false; try { operation(); } catch (std::exception const&) { refused = true; } require(refused, message); };
+    require(check_replot_output_stamp(path, original, {}) == original, "legacy output rejected unchanged exact native metadata");
+    auto prior_device = original; prior_device.device ^= UINT64_C(0x40000000);
+    reject([&] { (void)check_replot_output_stamp(path, prior_device, {}); }, "legacy output inferred unrecorded remount authority");
+    if (file_io::has_durable_identity(owner))
+    {
+        require(check_replot_output_stamp(path, prior_device, owner) == original,
+            "prospective output owner rejected its exact current object after device renumbering");
+        (void)audit_replot_replacement(review, review.farm, fixed, 0, path, prior_device, false, owner);
+        auto substituted = owner; substituted.object.back() = substituted.object.back() == '0' ? '1' : '0';
+        reject([&] { (void)check_replot_output_stamp(path, original, substituted); }, "unchanged stat bypassed output generation evidence");
+        auto changed = prior_device; ++changed.bytes;
+        reject([&] { (void)check_replot_output_stamp(path, changed, owner); }, "output generation bypassed immutable length");
+        auto const renamed = directory / "published.gplot"; fs::rename(path, renamed);
+        (void)audit_replot_replacement(review, review.farm, fixed, 0, renamed, prior_device, true, owner);
+        require(check_replot_output_stamp(renamed, prior_device, owner, true) == stream_state::stamp(renamed) && contents(renamed) == bytes,
+            "publication lost prospective exact output ownership or changed sealed bytes");
+    }
+    else std::cout << "native output generation capture unavailable; strict legacy output checks passed\n";
+}
+void replot_bootstrap_inspection(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "replot-bootstrap"; fs::create_directory(directory); input = input.subspan(0, 2);
+    auto const reference = directory / "reference.gplot"; direct(reference, input, cfg); auto const bytes = contents(reference);
+    for (bool legacy : {true, false}) for (std::string const engine : {"incremental", "staged", "merged", "external"})
+        for (std::string const state : {"empty", "ordinary", "orphan"})
+        {
+            ReplotInputs inputs; auto& review = inputs.review; review.farm.job_id = stream_state::digest(engine + state);
+            review.farm.config.k = 18; review.farm.config.strength = 2;
+            auto& destination = review.farm.directories.emplace_back(); destination.directory = file_io::path_text(directory);
+            destination.directory_identity = farming_directory_identity(directory);
+            destination.layout.files = 1; destination.layout.total_members = 2; destination.layout.group_members = 2; destination.layout.fixed_members = true;
+            review.batches.resize(1); review.batches[0].final_bound_bytes = cfg.capacity_bytes;
+            inputs.resources.native.engine = engine; ReplotJournal journal; journal.farm = review.farm;
+            FarmingReplotDirectory metadata(directory, review.farm.job_id, true, legacy);
+            auto const path = migration_stage_path(directory, review.farm.job_id, 0, legacy);
+            if (state == "empty") { std::ofstream empty(path, std::ios::binary); }
+            else
+            {
+                direct(path, input.subspan(0, 1), cfg);
+                if (state == "orphan") { std::ofstream orphan(path, std::ios::binary | std::ios::app); orphan << "uncommitted tail"; }
+            }
+            auto const before = contents(path); Arguments args; args.max_ram = 2 * 1024 * mib; args.workers = cfg.workers;
+            args.window = cfg.window_bytes; args.checkpoint_bytes = cfg.checkpoint_bytes; args.io_overlap = false;
+            auto const inspected = inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, false, legacy);
+            auto const expected_engine = state != "orphan" && (engine == "staged" || engine == "merged") ? engine : "incremental";
+            require(!inspected.inspected.checkpoint && inspected.evidence.source_build.empty() && inspected.evidence.engine == expected_engine && contents(path) == before,
+                "migration bootstrap inspection changed original dispatch, invented build authority or modified bytes");
+            bool refused = false;
+            try { (void)inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, true, legacy); }
+            catch (std::runtime_error const&) { refused = true; }
+            require(refused && contents(path) == before, "checkpoint-free bootstrap authorized a reviewed successor or changed bytes");
+            {
+                Construction output(file_io::path_text(path), configuration(args, cfg.capacity_bytes, 0), true, identity(), engine, {}, 0, false);
+                output.confirm_identity(); if (output.identity().pending) output.resume({});
+                if (output.member_count() < input.size()) require(output.append(input.subspan(output.member_count())).accepted, "migration bootstrap rejected original recovery");
+                output.finish();
+            }
+            require(contents(path) == bytes, "read-only migration bootstrap inspection changed normal original recovery parity");
+        }
+}
+void capacity_pressure(fs::path const& root, Members input, Config cfg)
+{
+    cfg.capacity_bytes = 9 * 1024 * 1024;
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, 16);
+    auto const path = root / "pressure-capacity.gplot";
+    {
+        MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+        for (size_t member = 0; member < input.size(); ++member)
+            require(output.append(input.subspan(member, 1)).accepted, "capacity-pressure contribution did not fit");
+        require(output.stats().merge_passes && output.stats().max_active_runs <= MergeEngine::packing_inputs(cfg),
+                "capacity pressure did not compact the bounded run set");
+        auto const result = output.finish();
+        require(result.peak_file_bytes <= cfg.capacity_bytes && cfg.capacity_bytes < result.final_bytes * 2 &&
+            output.stats().reclaimed_bytes > result.final_bytes, "capacity compaction retained duplicate output space");
+    }
+    require(contents(path) == contents(root / "reference.gplot"), "capacity compaction changed canonical bytes");
+    fs::remove(path);
+    interruption(root, input, cfg, "merge-copy-committed:2");
+}
+
+std::pair<uint64_t, uint64_t> layout_fixture(fs::path const& path, Config cfg,
+    std::span<uint8_t const> expected, unsigned order, uint64_t block_bytes = 0, uint64_t reserve_bytes = 0)
+{
+    MergeState arena(path.string(), cfg, false, identity()); arena.confirm();
+    auto record = arena.layout(block_bytes ? block_bytes : MergeEngine::block_bytes(cfg));
+    arena.initialize(record, arena.required_bytes(record, grow_add(expected.size(), reserve_bytes)));
+    auto& state = arena.state;
+    std::memcpy(&state.target, expected.data(), sizeof(Header)); state.members = state.target.group_size;
+    state.finishing = true; state.final_bytes = expected.size(); state.phase = MergeState::Phase::layout;
+    state.layout_blocks = uint32_t(MergeState::align(expected.size(), state.block_bytes) / state.block_bytes);
+    uint32_t const count = state.layout_blocks, tail = state.block_limit - count;
+    require(tail >= 2 && count > tail + 3 && expected.size() % state.block_bytes,
+            "layout fixture needs spare blocks and a partial final block");
+    std::fill(arena.map.begin(), arena.map.end(), MergeState::free_block);
+    for (uint32_t i = 0; i < count; ++i) arena.map[i] = i;
+    uint64_t moves = count, bytes = expected.size();
+    if (order < 2)
+    {
+        for (uint32_t i = 0; i < count; ++i) arena.map[i] = i ? i - 1 : order ? count : count - 1;
+        if (!order) { ++moves; bytes += expected.size() % state.block_bytes; }
+    }
+    else if (order == 2)
+    {
+        // A placed prefix, a cycle, and open chains whose sources occupy
+        // every tail slot. The only initial vacancies are final positions.
+        state.layout_done = 2;
+        for (uint32_t i = 2; i < count - tail; ++i) arena.map[i] = i == 2 ? count - tail - 1 : i - 1;
+        for (uint32_t i = count - tail; i < count; ++i) arena.map[i] = count + i - (count - tail);
+        moves = count - 1; bytes -= state.block_bytes;
+    }
+    else if (order == 3)
+    {
+        for (uint32_t i = 0; i < tail; ++i) arena.map[i] = count + i;
+        moves = tail; bytes = uint64_t(tail) * state.block_bytes;
+    }
+    else if (order == 4)
+    {
+        // Independent long chains must advance together rather than syncing
+        // each dependent step of one chain before starting the next chain.
+        for (uint32_t i = 0; i < count; ++i) arena.map[i] = i + tail;
+    }
+    else
+    {
+        // Several cycles can share existing durable tail spares. Include
+        // logical block zero and leave the short final block in a cycle.
+        for (uint32_t i = 0; i + 1 < count; i += 2)
+        { arena.map[i] = i + 1; arena.map[i + 1] = i; }
+        if (count % 2)
+        {
+            arena.map[count - 3] = count - 2; arena.map[count - 2] = count - 1; arena.map[count - 1] = count - 3;
+        }
+        moves += count / 2;
+        bytes += uint64_t(count / 2 - 1) * state.block_bytes + expected.size() % state.block_bytes;
+    }
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        uint64_t const offset = uint64_t(i) * state.block_bytes;
+        auto block = expected.subspan(size_t(offset), size_t(std::min(state.block_bytes, expected.size() - offset)));
+        arena.write(uint64_t(arena.map[i]) * state.block_bytes, block);
+        if (!i)
+        {
+            Header marker = state.target; marker.version = MergeState::construction_version; marker.chunk_index_offset = state.anchor;
+            arena.value(uint64_t(arena.map[i]) * state.block_bytes, marker);
+        }
+    }
+    arena.relocate_checkpoint(); arena.validate(); return {moves, bytes};
+}
+void layout(fs::path const& root, Members input, Config cfg)
+{
+    auto reference = root / "layout-reference.gplot"; direct(reference, input.subspan(0, 1), cfg);
+    auto expected = contents(reference); fs::remove(reference);
+    auto path = root / "layout.gplot";
+    cfg.capacity_bytes = cfg.window_bytes * 64;
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, 16);
+    require(MergeEngine::block_bytes(cfg) < cfg.checkpoint_bytes,
+            "layout fixture must exercise the existing smaller-block policy");
+    for (unsigned order : {0u, 1u, 2u, 3u, 4u, 5u})
+    {
+        auto const [moves, bytes] = layout_fixture(path, cfg, expected, order);
+        {
+            MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity(); output.finish();
+            require(output.stats().layout_moves == moves && output.stats().layout_bytes == bytes,
+                    "layout did not follow displacement chains and cycles");
+            if (order == 3) require(output.stats().layout_batches < moves, "independent layout moves were not batched");
+            if (order >= 4) require(output.stats().layout_batches <= (moves + 1) / 2,
+                    "independent chains or cycles did not share durable checkpoints");
+        }
+        require(contents(path) == expected, "permuted layout changed canonical bytes"); fs::remove(path);
+        for (auto const* point : {"merge-layout-partial", "merge-layout-written", "merge-layout-partial:3",
+            "merge-layout-written:3", "merge-layout-move-flushed:2", "merge-checkpoint-partial:2",
+            "merge-layout-move-committed:2"})
+        {
+            if (order == 3) break;
+            layout_fixture(path, cfg, expected, order);
+            auto const child = ::fork(); require(child >= 0, "cannot fork layout recovery test");
+            if (!child)
+            {
+                ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
+                try { complete(path, input.subspan(0, 1), true, cfg); }
+                catch (std::exception const& error) { std::cerr << point << ": " << error.what() << '\n'; std::_Exit(1); }
+                std::_Exit(0);
+            }
+            int status = 0;
+            require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+                    "layout failpoint was not reached: " + std::string(point));
+            complete(path, input.subspan(0, 1), true, cfg);
+            require(contents(path) == expected, "permuted layout recovery differs: " + std::string(point)); fs::remove(path);
+        }
+    }
+}
+void checkpoint_geometry(fs::path const& root, Members input, Config cfg)
+{
+    auto reference = root / "checkpoint-reference.gplot"; direct(reference, input, cfg);
+    auto const expected = contents(reference); fs::remove(reference);
+    auto const path = root / "checkpoint.gplot";
+    uint64_t const reserve = 1024 * 1024;
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, uint16_t(input.size()));
+    for (uint64_t block : {uint64_t(65536), uint64_t(131072), uint64_t(262144)})
+    {
+        for (unsigned order : {1u, 4u})
+        {
+            uint64_t previous = 0;
+            for (uint64_t transaction : {uint64_t(262144), uint64_t(1048576)})
+            {
+                cfg.checkpoint_bytes = transaction;
+                auto const [moves, bytes] = layout_fixture(path, cfg, expected, order, block, reserve);
+                uint64_t batches = 0;
+                {
+                    MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity(); output.finish();
+                    require(output.stats().layout_moves == moves && output.stats().layout_bytes == bytes && bytes == expected.size(),
+                            "checkpoint geometry changed layout copy bytes");
+                    batches = output.stats().layout_batches;
+                    require(order != 1 || batches == moves, "dependent layout chain reused an uncommitted source");
+                }
+                require(contents(path) == expected, "checkpoint geometry changed canonical bytes"); fs::remove(path);
+                if (previous && order == 4) require(batches < previous, "larger transaction did not batch independent chains");
+                std::cout << "layout geometry block=" << block << " transaction=" << transaction << " dependent=" << (order == 1)
+                          << " bytes=" << bytes << " moves=" << moves << " batches=" << batches << '\n';
+                previous = batches;
+            }
+        }
+    }
+    // A saved layout may have a different block geometry from new builds.
+    // Raising the request must preserve both its blocks and replay reserve.
+    cfg.checkpoint_bytes = 262144;
+    auto const [moves, bytes] = layout_fixture(path, cfg, expected, 4, 65536, reserve);
+    uint64_t batches = 0;
+    {
+        MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity(); output.finish();
+        batches = output.stats().layout_batches;
+    }
+    require(contents(path) == expected, "saved checkpoint geometry changed canonical bytes"); fs::remove(path);
+    layout_fixture(path, cfg, expected, 4, 65536, reserve);
+    cfg.checkpoint_bytes = 1048576;
+    {
+        MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity(); output.finish();
+        require(output.stats().layout_batches == batches && output.stats().layout_moves == moves && output.stats().layout_bytes == bytes,
+                "larger resume request exceeded the saved transaction reserve");
+    }
+    require(contents(path) == expected, "larger resume request changed canonical bytes"); fs::remove(path);
+}
+void placement_costs()
+{
+    require(merge_placement_bytes(4096, 8192, 8200, 0) == 8 &&
+        merge_placement_bytes(4096, 8192, 8200, 9000) == 808 &&
+        merge_placement_bytes(4096, 8192, 8200, 12288) == 4096 &&
+        merge_placement_bytes(4096, 8192, 9300, 9000) == 1108,
+            "placement credited bytes beyond its known prefix or proven terminal bound");
+    Stats stats; stats.read_bytes = stats.written_bytes = 100;
+    stats.read_ns = stats.write_ns = 100; stats.syncs = 2; stats.sync_ns = 20;
+    require(prefer_merge_placement(stats, 100, 30, 1), "profitable placement checkpoint was rejected");
+    require(!prefer_merge_placement(stats, 100, 200, 1), "placement omitted its checkpoint slot write");
+    require(!prefer_merge_placement(stats, 10, 30, 1), "partial output received a full-block copy saving");
+    require(!prefer_merge_placement(stats, 100, 30, 180), "placement ignored measured map/hash checkpoint cost");
+    require(!prefer_merge_placement(stats, 100, 30, 171), "placement accepted less than its required saving");
+    require(!prefer_merge_placement(stats, 100, 30, 0), "placement accepted missing checkpoint observations");
+    stats.syncs = 0;
+    require(!prefer_merge_placement(stats, 100, 30, 1), "placement accepted missing sync observations");
+}
+void placement(fs::path const& root, Config cfg)
+{
+    auto path = root / "placement.gplot";
+    for (bool tail_available : {true, false})
+    {
+        MergeState arena(path.string(), cfg, false, identity()); arena.confirm();
+        auto record = arena.layout(cfg.window_bytes);
+        arena.initialize(record, arena.required_bytes(record, cfg.window_bytes * 16));
+        auto& state = arena.state;
+        state.live_bytes = state.block_bytes * 8;
+        uint32_t const begin = uint32_t(state.live_bytes / state.block_bytes);
+        if (!tail_available)
+            for (uint32_t i = begin; i < state.block_limit; ++i) arena.map[i] = MergeState::reserved_block;
+        MergeState::Run run;
+        MergeState::Writer output(arena, run, cfg.window_bytes, true);
+        std::vector<uint8_t> bytes(size_t(state.block_bytes * 3), 17); output.write(bytes); output.flush();
+        auto blocks = arena.blocks(run);
+        require(blocks.size() == 3 && blocks[2] == 2 &&
+            (tail_available ? blocks[0] >= begin : blocks[0] == begin - 1 && blocks[1] == begin - 2),
+                "canonical placement stole an imminent final position or failed its capacity fallback");
+        auto const saved = arena.map;
+        require(!arena.releasing(run, state.block_bytes - 1, blocks[0]) &&
+            arena.releasing(run, state.block_bytes, blocks[0]) &&
+            !arena.releasing(run, state.block_bytes, blocks[1]) && !arena.releasing(run, run.bytes, 0) &&
+            arena.map == saved && !run.consumed && !run.released,
+                "placement query freed a live or partial input block");
+        output.write(std::span(bytes).first(1)); output.flush();
+        auto const terminal = arena.blocks(run).back();
+        require(!arena.releasing(run, run.bytes - 1, terminal) && arena.releasing(run, run.bytes, terminal),
+                "placement query did not preserve the partial terminal input block");
+        arena.release(run, run.bytes);
+        require(!arena.releasing(run, run.bytes, terminal), "placement query revisited an already released terminal block");
+        fs::remove(path);
+    }
+}
+
+void packing_windows(fs::path const& root, Config cfg)
+{
+    auto dense = members(24, 96); auto reference = root / "packing-window-reference.gplot";
+    cfg.window_bytes = 32768; cfg.checkpoint_bytes = 65536;
+    cfg.memory_limit_bytes = 1024ull * 1024 * 1024;
+    direct(reference, dense, cfg); auto const expected = contents(reference);
+    Engine ordinary(reference.string(), cfg, true, identity());
+    require(ordinary.largest_chunk() > 4096, "packing window fixture must cross several saved blocks");
+    for (unsigned workers : {1u, 2u})
+    for (bool overlap : {false, true})
+    {
+        auto path = root / "packing-window.gplot"; auto initial = cfg;
+        initial.window_bytes = 4096; initial.checkpoint_bytes = 4096;
+        initial.workers = 1; initial.io_overlap = false;
+        {
+            MergeEngine output(path.string(), initial, false, identity()); output.confirm_identity();
+            require(output.append(Members(dense).subspan(0, 8)).accepted, "small-block packing input did not fit");
+        }
+        cfg.workers = workers; cfg.io_overlap = overlap;
+        complete(path, dense, true, cfg, 16);
+        require(contents(path) == expected, "changed packing windows or concurrency changed canonical bytes");
+        fs::remove(path);
+    }
+    fs::remove(reference);
+}
+
+void packing_reads(fs::path const& root, Config cfg)
+{
+    auto dense = members(8, 96); auto const reference = root / "packing-read-reference";
+    cfg.window_bytes = 32768; cfg.checkpoint_bytes = 65536;
+    cfg.memory_limit_bytes = 1024ull * 1024 * 1024;
+    direct(reference, dense, cfg); auto const expected = contents(reference);
+    for (bool overlap : {false, true})
+    {
+        auto const path = root / (overlap ? "packing-reads-overlap" : "packing-reads-serial");
+        cfg.workers = 2; cfg.io_overlap = overlap;
+        {
+            MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+            for (size_t i = 0; i < dense.size(); ++i)
+                require(output.append(Members(dense).subspan(i, 1)).accepted, "packing read contribution did not fit");
+        }
+        uint64_t source_bytes = 0;
+        {
+            MergeState saved(path.string(), cfg, true, identity());
+            require(saved.state.run_count < dense.size(), "packing read fixture did not combine contribution packets");
+            for (size_t i = 0; i < saved.state.run_count; ++i) source_bytes += saved.state.runs[i].bytes;
+        }
+        {
+            MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity(); output.finish();
+            // A size lookahead may fetch each packet header separately, but
+            // its subsequent payload read must not reload the preread window.
+            uint64_t const headers = PlotGroupFile::getChunkCountForK(18) * dense.size() * sizeof(MergeState::Packet);
+            require(output.stats().phases[size_t(WorkPhase::pack)].read_bytes <= source_bytes + headers &&
+                contents(path) == expected, "packing reread payload windows while sizing chunks or changed canonical bytes");
+        }
+        fs::remove(path);
+    }
+    fs::remove(reference);
+}
+
+void placement_recovery(fs::path const& root, Config cfg)
+{
+    auto dense = members(8, 96); auto reference = root / "placement-reference.gplot";
+    cfg.window_bytes = 32768; cfg.checkpoint_bytes = 262144;
+    cfg.memory_limit_bytes = 1024ull * 1024 * 1024;
+    direct(reference, dense, cfg); auto const expected = contents(reference);
+    for (unsigned workers : {1u, 2u})
+    for (auto const* point : {"merge-pack-placement-flushed", "merge-pack-placement-committed"})
+    {
+        auto path = root / "placement-recovery.gplot";
+        {
+            MergeState arena(path.string(), cfg, false, identity()); arena.confirm();
+            auto const record = arena.layout(4096);
+            arena.initialize(record, arena.required_bytes(record, 0)); arena.validate();
+        }
+        cfg.workers = workers; cfg.io_overlap = workers > 1;
+        {
+            MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity();
+            require(output.append(dense).accepted, "placement recovery input did not fit");
+        }
+        auto const child = ::fork(); require(child >= 0, "cannot fork placement recovery test");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
+            try
+            {
+                MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity();
+                // Synthetic slow-read evidence makes this policy branch
+                // deterministic; the underlying Stats object is mutable.
+                auto& stats = const_cast<Stats&>(output.stats());
+                stats.read_bytes = 1; stats.read_ns = 1000000000000000ull;
+                output.finish();
+            }
+            catch (std::exception const& error) { std::cerr << point << ": " << error.what() << '\n'; std::_Exit(1); }
+            std::_Exit(0);
+        }
+        int status = 0;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+                "placement recovery failpoint was not reached: " + std::string(point));
+        complete(path, dense, true, cfg);
+        require(contents(path) == expected, "placement checkpoint recovery changed canonical bytes"); fs::remove(path);
+    }
+    fs::remove(reference);
+}
+
+void placement_bounds(fs::path const& root, Config cfg)
+{
+    auto dense = members(8, 96); auto reference = root / "placement-bound-reference.gplot";
+    cfg.window_bytes = 32768; cfg.checkpoint_bytes = 262144;
+    cfg.memory_limit_bytes = 1024ull * 1024 * 1024; cfg.workers = 1; cfg.io_overlap = false;
+    direct(reference, dense, cfg); auto const expected = contents(reference);
+    Engine ordinary(reference.string(), cfg, true, identity());
+    Stats evidence; evidence.read_bytes = evidence.written_bytes = 1000000000;
+    evidence.read_ns = 1000000000000000ull; evidence.write_ns = 40000000000000ull;
+    evidence.syncs = evidence.sync_ns = 2;
+    for (unsigned mode : {0u, 1u, 2u, 3u})
+    {
+        auto path = root / "placement-bound.gplot";
+        if (mode == 3)
+        {
+            // One checkpoint must save several adjacent final copies to
+            // pay for these flushes. A single crossed block is insufficient.
+            evidence.write_ns = 0;
+            evidence.syncs = 1000000000; evidence.sync_ns = 2000000000000000000ull;
+        }
+        {
+            MergeState arena(path.string(), cfg, false, identity()); arena.confirm();
+            auto const record = arena.layout(4096);
+            require(prefer_merge_placement(evidence, record.block_bytes, record.slot_bytes, 1) == (mode != 3) &&
+                prefer_merge_placement(evidence, 2 * record.block_bytes, record.slot_bytes, 1) &&
+                !prefer_merge_placement(evidence, ordinary.largest_chunk(), record.slot_bytes, 1),
+                    "placement bound fixture must distinguish whole-block and current-chunk savings");
+            arena.initialize(record, arena.required_bytes(record, 0));
+        }
+        auto const child = ::fork(); require(child >= 0, "cannot fork placement bound test");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", "merge-pack-placement-flushed", 1);
+            auto finish = [&](MergeEngine& output)
+            {
+                // Only policy evidence is synthetic. A real committed
+                // contribution establishes the transient size bound.
+                auto& stats = const_cast<Stats&>(output.stats());
+                stats.read_bytes = evidence.read_bytes; stats.read_ns = evidence.read_ns;
+                stats.written_bytes = evidence.written_bytes; stats.write_ns = evidence.write_ns;
+                stats.syncs = evidence.syncs; stats.sync_ns = evidence.sync_ns;
+                output.finish();
+            };
+            try
+            {
+                {
+                    MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity();
+                    require(output.append(dense).accepted, "placement bound input did not fit");
+                    if (mode == 1)
+                    {
+                        timespec const times[2]{{0, UTIME_OMIT}, {1, 0}};
+                        require(!::utimensat(AT_FDCWD, path.c_str(), times, 0), "cannot change placement source timestamp");
+                    }
+                    if (mode != 2) finish(output);
+                }
+                if (mode == 2)
+                {
+                    MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity(); finish(output);
+                }
+            }
+            catch (std::exception const& error) { std::cerr << error.what() << '\n'; std::_Exit(1); }
+            std::_Exit(0);
+        }
+        int status = 0;
+        bool const retained = mode == 0 || mode == 3;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == (retained ? 86 : 0),
+                "placement used an invalidated bound or failed to retain its committed bound");
+        if (retained) complete(path, dense, true, cfg);
+        require(contents(path) == expected, "placement bound invalidation changed canonical bytes"); fs::remove(path);
+    }
+    fs::remove(reference);
+}
+
+void single_pass(fs::path const& root, Members input, Config cfg)
+{
+    std::vector<Member> compact;
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        compact.emplace_back(std::vector<uint64_t>(input[i].raw().begin(), input[i].raw().end()));
+        compact.back().compact(18);
+    }
+    auto path = root / "single-pass.gplot";
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(18);
+    {
+        MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+        for (size_t member = 0; member < compact.size(); ++member)
+        {
+            auto const sized = output.stats().sized_chunks, encoded = output.stats().encode_chunks;
+            require(output.append(Members(compact).subspan(member, 1)).accepted,
+                    "bounded compact contribution did not fit");
+            require(output.stats().sized_chunks == sized && output.stats().encode_chunks == encoded + chunks,
+                    "bounded compact contribution repeated FSE sizing");
+        }
+        output.finish();
+    }
+    require(contents(path) == contents(root / "reference.gplot"), "single-pass compact contribution changed canonical bytes");
+    fs::remove(path);
+
+    // Borrowed/raw views keep the full sizing path. Resumed or changed saved
+    // sources also require their exact summary-to-payload validation.
+    {
+        Member borrowed = Member::borrowed(input[0].raw());
+        MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+        require(output.append(Members(&borrowed, 1)).accepted && output.stats().sized_chunks >= chunks,
+                "borrowed contribution bypassed exact sizing");
+    }
+    {
+        MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity();
+        require(output.append(Members(compact).subspan(1, 1)).accepted && output.stats().sized_chunks >= chunks,
+                "resumed contribution bypassed exact source validation");
+        auto const sized = output.stats().sized_chunks;
+        fs::last_write_time(path, fs::last_write_time(path) + std::chrono::seconds(1));
+        require(output.append(Members(compact).subspan(2, 1)).accepted && output.stats().sized_chunks > sized,
+                "changed saved source bypassed exact validation");
+    }
+    fs::remove(path);
+
+    auto tight = cfg;
+    tight.window_bytes = 4096; tight.checkpoint_bytes = 4096;
+    for (;;)
+    {
+        tight.memory_limit_bytes = MergeEngine::memory_bytes(18, tight, 16);
+        auto const measured = complete(path, input, false, tight, input.size()); fs::remove(path);
+        if (measured.peak_file_bytes == tight.capacity_bytes) break;
+        require(measured.peak_file_bytes < tight.capacity_bytes, "compact capacity fixture exceeded its cap");
+        tight.capacity_bytes = measured.peak_file_bytes;
+    }
+    tight.capacity_bytes -= tight.window_bytes;
+    tight.memory_limit_bytes = MergeEngine::memory_bytes(18, tight, 16);
+    {
+        MergeEngine output(path.string(), tight, false, identity()); output.confirm_identity();
+        auto excess_raw = members(input.size() * 2);
+        std::vector<Member> excess;
+        for (auto& raw : excess_raw)
+        { excess.emplace_back(std::move(raw)); excess.back().compact(18); }
+        auto const before = contents(path); auto const stamp = fs::last_write_time(path);
+        require(!output.append(excess).accepted && contents(path) == before && fs::last_write_time(path) == stamp,
+                "compact capacity rejection changed the committed destination");
+        auto const sized = output.stats().sized_chunks;
+        require(output.append(compact).accepted && output.stats().sized_chunks >= sized + chunks,
+                "near-capacity compact contribution did not retain exact sizing fallback");
+        auto const result = output.finish();
+        require(result.peak_file_bytes <= tight.capacity_bytes, "compact fallback exceeded strict capacity");
+    }
+    require(contents(path) == contents(root / "reference.gplot"), "compact sizing fallback changed canonical bytes");
+    fs::remove(path);
+    // Both boundaries follow actual provisional file writes, while the
+    // previous run checkpoint still owns the whole batch.
+    for (auto const* point : {"merge-contribution-partial", "merge-contribution-flushed"})
+    {
+        interruption(root, compact, cfg, point);
+        interruption(root, compact, cfg, point, true);
+    }
+}
+
+void contribution_consumption(fs::path const& root, Members input, Config cfg)
+{
+    using grow_controller_test::Construction;
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(18);
+    auto fresh = [&]
+    {
+        std::vector<Member> result;
+        for (size_t i = 0; i < input.size(); ++i)
+        {
+            result.emplace_back(std::vector<uint64_t>(input[i].raw().begin(), input[i].raw().end()));
+            result.back().compact(18);
+        }
+        return result;
+    };
+    for (auto const* mode : {"merged", "staged"}) for (bool overlap : {false, true})
+    {
+        cfg.io_overlap = overlap;
+        cfg.memory_limit_bytes = std::max({Engine::memory_bytes(18, cfg, uint16_t(input.size())),
+            MergeEngine::memory_bytes(18, cfg, uint16_t(input.size())), StagingEngine::memory_bytes(18, cfg, uint16_t(input.size()))});
+        auto const path = root / (std::string("consumed-") + mode + (overlap ? "-overlap" : "-serial"));
+        auto incoming = fresh(); uint64_t previous = 0, remaining = 0, calls = 0;
+        for (auto const& member : incoming) remaining += member.storage_bytes();
+        {
+            Construction engine(path.string(), cfg, false, identity(), mode); engine.confirm_identity();
+            engine.consumed([&](uint64_t first)
+            {
+                require(first >= previous && first <= chunks, "contribution consumption moved backwards");
+                previous = first; ++calls; uint64_t bytes = 0;
+                for (auto& member : incoming) { member.release_before(first); bytes += member.storage_bytes(); }
+                require(bytes <= remaining, "contribution consumption increased resident memory"); remaining = bytes;
+            });
+            require(engine.append(incoming).accepted && calls > 1 && previous == chunks &&
+                remaining == incoming.size() * FragmentBoundaries::allocation_bytes(size_t(chunks), input[0].size()),
+                "contribution encoding retained consumed input pages");
+            engine.consumed({}); engine.finish();
+        }
+        require(contents(path) == contents(root / "reference.gplot"), "consumed contribution changed canonical output");
+        fs::remove(path);
+        incoming = fresh(); calls = 0; bool interrupted = false;
+        try
+        {
+            Construction engine(path.string(), cfg, false, identity(), mode); engine.confirm_identity();
+            engine.consumed([&](uint64_t first)
+            {
+                for (auto& member : incoming) member.release_before(first);
+                if (++calls == 2) throw std::runtime_error("interrupt consumed contribution");
+            });
+            (void)engine.append(incoming);
+        }
+        catch (std::runtime_error const& error) { interrupted = std::string(error.what()) == "interrupt consumed contribution"; }
+        require(interrupted, "consumed contribution interruption was not exercised");
+        {
+            Construction engine(path.string(), cfg, true, identity(), mode); engine.confirm_identity();
+            require(engine.append(input).accepted, "interrupted contribution could not regenerate its input"); engine.finish();
+        }
+        require(contents(path) == contents(root / "reference.gplot"), "consumed contribution recovery changed canonical output");
+        fs::remove(path);
+    }
+}
+
+void contribution_pipeline(fs::path const& root, Config cfg)
+{
+    auto const directory = root / "contributions"; fs::create_directory(directory);
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(18);
+    uint64_t const range = 1ull << (18 + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+    std::vector<std::vector<uint64_t>> raw(3);
+    for (size_t member = 0; member < raw.size(); ++member)
+        for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            uint64_t const count = chunk % 17 ? 32 : 256;
+            for (uint64_t symbol = 0; symbol < count; ++symbol)
+            {
+                uint64_t const value = chunk * range + symbol * (range / count) + member + 7;
+                raw[member].push_back(value);
+                if (symbol == 3) raw[member].push_back(value);
+            }
+        }
+    cfg.window_bytes = 4096; cfg.checkpoint_bytes = 65536;
+    cfg.memory_limit_bytes = std::max(Engine::memory_bytes(18, cfg, uint16_t(raw.size())),
+        MergeEngine::memory_bytes(18, cfg, uint16_t(raw.size())));
+    auto const reference = directory / "reference.gplot"; direct(reference, raw, cfg);
+    auto const expected = contents(reference);
+    std::vector<Member> compact;
+    for (auto const& member : raw) { compact.emplace_back(std::vector<uint64_t>(member)); compact.back().compact(18); }
+    std::optional<std::pair<uint64_t, uint64_t>> admission;
+    for (unsigned workers : {1u, 4u})
+        for (bool overlap : {false, true})
+        {
+            cfg.workers = workers; cfg.io_overlap = overlap;
+            cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, uint16_t(compact.size()));
+            auto const path = directory / (std::to_string(workers) + (overlap ? "-overlap.gplot" : "-serial.gplot"));
+            MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+            auto const result = output.append(compact);
+            require(result.accepted && !output.stats().sized_chunks,
+                    "immutable contribution did not retain single-pass admission");
+            auto const bounds = std::pair(result.attempted_final_bytes, result.attempted_peak_bytes);
+            if (!admission) admission = bounds;
+            require(bounds == *admission, "parallel summary reduction changed capacity admission");
+            require(bool(output.stats().overlap_windows) == (overlap && workers > 1),
+                    "contribution overlap did not follow the requested worker/window policy");
+            auto const final = output.finish();
+            require(final.peak_file_bytes <= cfg.capacity_bytes && contents(path) == expected,
+                    "bounded contribution pipeline changed canonical bytes or exceeded capacity");
+        }
+
+    // A chunk that needs the aggregate codec allowance must still work with
+    // overlap requested. Use the codec's admission estimate for this fixture.
+    std::vector<FragmentRegion> regions(compact.size());
+    uint64_t required = ChunkCodec::estimate_base();
+    for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+    {
+        uint64_t symbols = 0;
+        for (size_t member = 0; member < compact.size(); ++member)
+        { regions[member] = compact[member].view().region(chunk); symbols += regions[member].size(); }
+        auto const detail = ChunkCodec::fresh_summary(18, chunk, regions);
+        auto const most = ChunkCodec::size_bounds(detail).second;
+        required = std::max({required, ChunkCodec::estimate_work(18, 0, symbols),
+            ChunkCodec::estimate_work(18, most + 8, 0)});
+    }
+    cfg.codec_bytes = required; cfg.workers = 4; cfg.io_overlap = true;
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, uint16_t(compact.size()));
+    auto const fallback = directory / "codec-fallback.gplot";
+    {
+        MergeEngine output(fallback.string(), cfg, false, identity()); output.confirm_identity();
+        require(output.append(compact).accepted && !output.stats().overlap_windows &&
+            output.stats().contribution_workers == 1, "tight codec budget did not retain serial contribution fallback");
+        output.finish();
+    }
+    require(contents(fallback) == expected, "tight codec budget changed packed output");
+
+    // Fail a later bounded summary window, then reuse the same destination.
+    // All queued readers must finish before their borrowed regions go away.
+    auto damaged = raw;
+    damaged[0].erase(std::lower_bound(damaged[0].begin(), damaged[0].end(), (chunks - 1) * range), damaged[0].end());
+    std::vector<Member> invalid;
+    for (auto& member : damaged) { invalid.emplace_back(std::move(member)); invalid.back().compact(18); }
+    cfg = configuration(); cfg.workers = 4; cfg.io_overlap = true; cfg.window_bytes = 4096;
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, uint16_t(compact.size()));
+    auto const failed = directory / "summary-failure.gplot";
+    {
+        MergeEngine output(failed.string(), cfg, false, identity()); output.confirm_identity();
+        bool rejected = false;
+        try { (void)output.append(invalid); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected && !output.committed_member_count() && !fs::file_size(failed),
+                "failed parallel summary scan changed the destination");
+        require(output.append(compact).accepted, "parallel summary failure prevented a valid retry"); output.finish();
+    }
+    require(contents(failed) == expected, "parallel summary retry changed canonical bytes");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    auto const write_failed = directory / "writer-failure.gplot";
+    {
+        MergeEngine output(write_failed.string(), cfg, false, identity()); output.confirm_identity();
+        require(output.append(Members(compact).subspan(0, 1)).accepted, "writer failure prefix did not fit");
+    }
+    std::pair<uint64_t, uint64_t> failure_range;
+    {
+        MergeState saved(write_failed.string(), cfg, true, identity());
+        auto const free = std::find(saved.map.begin(), saved.map.begin() + saved.state.block_limit, MergeState::free_block);
+        require(free != saved.map.begin() + saved.state.block_limit, "writer failure fixture has no free block");
+        uint64_t const begin = uint64_t(free - saved.map.begin()) * saved.state.block_bytes;
+        require(cfg.window_bytes < saved.state.block_bytes, "writer failure fixture needs multiple writes per block");
+        // Let the first full provisional buffer reach disk before failing a
+        // later write while another bounded encode has been scheduled.
+        failure_range = {begin + cfg.window_bytes, begin + saved.state.block_bytes};
+    }
+    {
+        MergeEngine output(write_failed.string(), cfg, true, identity()); output.confirm_identity();
+        struct DisableFailure { ~DisableFailure() { fail_write.store(false, std::memory_order_release); } } disable;
+        fail_write_begin.store(failure_range.first, std::memory_order_relaxed);
+        fail_write_end.store(failure_range.second, std::memory_order_relaxed);
+        fail_write.store(true, std::memory_order_release); bool rejected = false;
+        try { (void)output.append(Members(compact).subspan(1)); }
+        catch (std::runtime_error const& error)
+        { rejected = std::string_view(error.what()).starts_with("cannot write merged destination"); }
+        require(rejected && !fail_write.load(std::memory_order_acquire) && output.stats().overlap_windows && output.committed_member_count() == 1,
+                "provisional writer failure did not drain a pending contribution window");
+    }
+    complete(write_failed, compact, true, cfg);
+    require(contents(write_failed) == expected, "provisional writer failure changed resumed canonical bytes");
+#endif
+
+    auto denied = cfg; --denied.memory_limit_bytes;
+    bool rejected = false;
+    try
+    {
+        MergeEngine output((directory / "memory-denied.gplot").string(), denied, false, identity());
+        output.confirm_identity(); (void)output.append(compact);
+    }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "bounded contribution descriptors bypassed memory admission");
+
+    // These exits occur after provisional writes while the following encode
+    // may still be running; recovery must discard the whole uncommitted run.
+    for (auto const* point : {"merge-contribution-partial", "merge-contribution-flushed"})
+    {
+        interruption(directory, compact, cfg, point);
+        interruption(directory, compact, cfg, point, true);
+    }
+
+    // One task's member descriptors can exceed a tiny I/O window. Its batch
+    // metadata is bounded even when the chunk cannot use the size-index code.
+    auto sparse = members(size_t(cfg.window_bytes / sizeof(FragmentRegion) + 1), 3);
+    std::vector<Member> many;
+    for (auto const& member : sparse) { many.emplace_back(std::vector<uint64_t>(member)); many.back().compact(18); }
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, uint16_t(many.size()));
+    auto const sparse_path = directory / "sparse.gplot";
+    {
+        MergeEngine output(sparse_path.string(), cfg, false, identity()); output.confirm_identity();
+        bool rejected = false;
+        try { rejected = !output.append(many).accepted; } catch (UnencodableChunkSize const&) { rejected = true; }
+        require(rejected && !output.committed_member_count() && !fs::file_size(sparse_path),
+                "oversized task descriptors bypassed bounded chunk admission");
+        require(output.append(compact).accepted, "oversized task descriptors prevented a valid retry"); output.finish();
+    }
+    require(contents(sparse_path) == expected, "oversized task descriptors changed the subsequent output");
+}
+
+template<class F> void rejects_unchanged(fs::path const& path, F&& operation)
+{
+    auto const before = contents(path); auto const stamp = fs::last_write_time(path);
+    bool rejected = false;
+    try { operation(); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected && contents(path) == before && fs::last_write_time(path) == stamp,
+            "invalid merged recovery changed committed bytes");
+}
+void admission(fs::path const& root, Members input, Config cfg)
+{
+    auto path = root / "capacity.gplot";
+    auto const measured = complete(path, input, false, cfg);
+    fs::remove(path);
+    cfg.capacity_bytes = measured.peak_file_bytes;
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, 16);
+    auto const tight = complete(path, input, false, cfg);
+    require(tight.peak_file_bytes <= cfg.capacity_bytes && contents(path) == contents(root / "reference.gplot"),
+            "near-capacity merge differs");
+    fs::remove(path);
+    for (auto const* point : {"merge-pack-committed:2", "merge-layout-partial"})
+        interruption(root, input, cfg, point);
+
+    // Capacity denial of a complete ordinary group is read-only, including
+    // when its trailing recovery metadata cannot be admitted at all.
+    direct(path, input.subspan(0, 1), configuration());
+    cfg.capacity_bytes = fs::file_size(path); cfg.memory_limit_bytes = configuration().memory_limit_bytes;
+    auto const before = contents(path); auto const stamp = fs::last_write_time(path);
+    {
+        MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity();
+        require(!output.append(input.subspan(1, 1)).accepted, "full ordinary destination admitted merge workspace");
+    }
+    require(contents(path) == before && fs::last_write_time(path) == stamp, "capacity denial changed ordinary group");
+    fs::remove(path);
+
+    for (unsigned corruption : {0u, 1u, 2u, 3u})
+    {
+        cfg = configuration();
+        {
+            MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+            require(output.append(input.subspan(0, 1)).accepted, "corruption fixture did not fit");
+        }
+        auto smaller = cfg; smaller.codec_bytes = 1;
+        rejects_unchanged(path, [&] { MergeEngine output(path.string(), smaller, true, identity()); });
+        {
+            MergeState arena(path.string(), cfg, true, identity()); arena.confirm();
+            if (corruption == 1)
+            {
+                arena.map[arena.state.runs[0].head] = arena.state.runs[0].head;
+                arena.checkpoint("test-corrupt-map");
+            }
+            else if (corruption == 0)
+            {
+                uint64_t const offset = uint64_t(arena.state.summary.head) * arena.state.block_bytes;
+                auto byte = arena.value<uint8_t>(offset); byte ^= 1; arena.value(offset, byte); arena.sync();
+            }
+            else if (corruption == 2)
+            {
+                for (unsigned slot = 0; slot < 2; ++slot)
+                {
+                    uint64_t const offset = arena.state.anchor + 2 * arena.alignment() + slot * arena.state.slot_bytes;
+                    auto byte = arena.value<uint8_t>(offset); byte ^= 1; arena.value(offset, byte);
+                }
+                arena.sync();
+            }
+            else
+            {
+                arena.state.chunk = 1; arena.checkpoint("test-corrupt-phase");
+            }
+        }
+        rejects_unchanged(path, [&]
+        {
+            MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity();
+            (void)output.append(input.subspan(1, 1));
+        });
+        fs::remove(path);
+    }
+}
+void writers(fs::path const& root)
+{
+    std::array<StorageDevice, 5> drives{{{"a", {"one"}}, {"b", {"two"}}, {"c", {"one", "three"}},
+        {"d", {"three"}}, {"e", {"four"}}}};
+    auto groups = writer_groups(drives);
+    require(groups[0] == groups[2] && groups[2] == groups[3] && groups[0] != groups[1] && groups[1] != groups[4],
+            "overlapping physical drives got independent writers");
+    drives[4].drives.clear(); groups = writer_groups(drives);
+    require(std::all_of(groups.begin(), groups.end(), [](auto group) { return group == 0; }),
+            "unknown physical topology was treated as independent");
+    auto const device = storage_device(root);
+    require(!device.filesystem.empty(), "destination filesystem identity is missing");
+    std::vector<int> order;
+    OrderedWriter writer([] {});
+    std::promise<void> started, release; auto signal = release.get_future().share();
+    auto first = writer.submit([&, signal] { started.set_value(); signal.wait(); order.push_back(1); });
+    started.get_future().get();
+    auto second = writer.submit([&] { order.push_back(2); });
+    require(!writer.has_room() && writer.busy(), "ordered writer did not bound its pending queue");
+    bool rejected = false;
+    try { (void)writer.submit([] {}); } catch (std::exception const&) { rejected = true; }
+    require(rejected, "ordered writer accepted an unbounded queue");
+    {
+        OrderedWriter independent([] {});
+        auto separate = independent.submit([] {}); separate.get();
+        require(first.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
+                "independent drive work waited for another drive");
+    }
+    release.set_value(); first.get(); second.get();
+    require(order == std::vector<int>({1, 2}), "drive writes were reordered");
+    auto failed = writer.submit([] { throw std::runtime_error("writer failure"); });
+    bool propagated = false;
+    try { failed.get(); } catch (std::runtime_error const& error) { propagated = std::string_view(error.what()) == "writer failure"; }
+    require(propagated, "destination writer lost its failure");
+}
+void group_prefetch(fs::path const& root, Members input)
+{
+    using namespace grow_controller_test;
+    auto const requested = identity_from(identity());
+    Fixtures fixture{requested, {}, 0};
+    for (uint16_t index = 0; index < 4; ++index)
+    {
+        auto const path = root / ("prefetch-member-" + std::to_string(index));
+        PlotData data; data.t3_proof_fragments.assign(input[index].raw().begin(), input[index].raw().end());
+        fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, requested.params, index, requested.memo));
+        fixture.paths.push_back(path);
+    }
+    // Compare controller scheduling with full-first rewrites of the same
+    // immutable input, both from empty and from a published ordinary prefix.
+    for (uint16_t prefix : {0, 1})
+    {
+        Arguments options; options.max_ram = 512 * mib; options.batch = prefix ? 2 : 3;
+        options.workers = 2; options.window = options.checkpoint_bytes = 65536;
+        options.window_set = options.checkpoint_set = true;
+        options.construction = "incremental"; options.generation_overlap = false;
+        auto cfg = grow_controller_test::configuration(options, 128 * mib, mib);
+        cfg.private_output = false;
+        auto const reference = root / ("full-first-" + std::to_string(prefix));
+        auto const reordered = root / ("short-first-" + std::to_string(prefix));
+        uint64_t read = 0, written = 0;
+        {
+            Engine full(reference.string(), cfg, false, identity()); full.confirm_identity();
+            if (prefix) require(full.append(input.subspan(0, prefix)).accepted, "reference prefix did not fit");
+            auto const before = full.stats();
+            for (uint16_t first = prefix; first < 4;)
+            {
+                auto const count = std::min<uint64_t>(options.batch, 4 - first);
+                require(full.append(input.subspan(first, count)).accepted, "full-first reference did not fit");
+                first += count;
+            }
+            read = full.stats().read_bytes - before.read_bytes;
+            written = full.stats().written_bytes - before.written_bytes;
+        }
+        if (prefix) { direct(reordered, input.subspan(0, prefix), cfg); options.resume = true; }
+        std::unique_ptr<Backend> backend;
+        auto const result = run_group(options, reordered, &fixture, requested, 4, cfg.capacity_bytes, 0, backend);
+        require(result.members == 4 && result.batches == 2 && result.max_batch_members == options.batch &&
+            result.read_bytes < read && result.written_bytes < written && contents(reordered) == contents(reference),
+            "continued or explicitly capped batches added prefix I/O or changed canonical bytes");
+    }
+    Arguments args; args.max_ram = 512 * mib; args.batch = args.max_members = 4;
+    args.workers = 2; args.window = 65536; args.checkpoint_bytes = mib;
+    args.construction = "merged"; args.member_storage = "compact";
+    Backend model; model.mode = "fixture"; model.generation_overlap = true;
+    Producer producer{requested, &fixture, model, args, args.max_ram, mib, mib};
+    GroupPrefetch partial;
+    require(prefetch_group(partial, producer, requested, 1, 4, 0, "test prefetch member ", [&]
+        { return partial.members.size() == 2; }) == 2 && partial.hash && partial.hash->size() == 2 &&
+        producer.fill_stop == Producer::FillStop::requested && !fill_wait_reason(producer.fill_stop),
+        "next group producer did not stop at a completed packing boundary");
+    require(!prefetch_group(partial, producer, requested, 2, 4, 0, "unexpected prefetch ", [] { return false; }) &&
+        partial.owner == 1 && partial.members.size() == 2, "next group queue retained more than one batch");
+    auto const generated = model.generated_members;
+    auto const retained = partial.resident_bytes();
+    producer.budget = sum(sum(producer.fixed, retained), producer.next_peak(2)) - 1;
+    require(!prefetch_group(partial, producer, requested, 1, 4, 0, "unexpected prefetch ", [] { return false; }) &&
+        producer.fill_stop == Producer::FillStop::memory && partial.members.size() == 2 &&
+        partial.resident_bytes() == retained && partial.hash->size() == 2 && model.generated_members == generated,
+        "blocked prefetch refill changed its retained prefix or exceeded RAM admission");
+    producer.budget = args.max_ram;
+    require(prefetch_group(partial, producer, requested, 1, 4, 0, "test prefetch refill ", [] { return false; }) == 2 &&
+        partial.members.size() == 4 && partial.hash->size() == 4 && model.generated_members == generated + 2 &&
+        producer.peak <= args.max_ram, "prefetch refill regenerated its prefix or lost its owning hash");
+    require(!prefetch_group(partial, producer, requested, 1, 4, 0, "unexpected prefetch ", [] { return false; }) &&
+        producer.fill_stop == Producer::FillStop::full && model.generated_members == generated + 2,
+        "complete prefetch did not stop without generating more members");
+    std::vector<Member> transferred; std::unique_ptr<MemberBatchHash> transferred_hash;
+    partial.take(transferred, transferred_hash, 1, 1);
+    require(transferred.size() == 1 && transferred[0].compact() && partial.members.empty() && !partial.identity,
+        "smaller next engine admission lost owning members or retained the old batch");
+    GroupPrefetch suffix;
+    require(prefetch_group(suffix, producer, requested, 1, 3, 0, "test suffix prefetch ", [] { return false; }, 1) == 3 &&
+        suffix.hash_first == 1 && suffix.hash && suffix.hash->size() == 2,
+        "next group prefetch did not retain a hash for its post-staging suffix");
+    suffix.metadata_bytes = batch_hash_bytes(args, 3);
+    uint64_t const metadata = suffix.metadata_bytes;
+    auto const count_before = model.generated_members;
+    auto const suffix_digest = members_digest(requested.params.get_k(), Members(suffix.members).subspan(1, 2), nullptr, [] {});
+    transferred.clear(); transferred_hash.reset();
+    suffix.take(transferred, transferred_hash, 1, 3);
+    require(transferred.size() == 1 && !transferred_hash && suffix.members.size() == 2 && suffix.first == 1 &&
+        !suffix.hash_first && suffix.metadata_bytes == metadata && suffix.hash &&
+        suffix.hash->digest_for(suffix.members) == suffix_digest,
+        "short staging handoff discarded the suffix, its cached digest or its memory charge");
+    require(producer.fill(suffix.members, 1, 3, resident(transferred), suffix.hash.get(), nullptr,
+        "test suffix prefetch refill ") == 1 && model.generated_members == count_before + 1,
+        "post-staging prefetch regenerated a retained member");
+    transferred.clear(); suffix.take(transferred, transferred_hash, 3, 4);
+    require(suffix.members.empty() && !suffix.identity && !suffix.metadata_bytes && transferred.size() == 3 &&
+        transferred_hash && transferred_hash->digest_for(transferred) ==
+            members_digest(requested.params.get_k(), input.subspan(1, 3), nullptr, [] {}),
+        "larger receiver admission lost its suffix hash or changed member order");
+    GroupPrefetch denied;
+    producer.budget = sum(producer.fixed, producer.next_peak(0)) - 1;
+    require(!prefetch_group(denied, producer, requested, 1, 4, 0, "unexpected prefetch ", [] { return false; }) &&
+        denied.members.empty(), "next group prefetch ignored insufficient RAM");
+    producer.budget = args.max_ram;
+    for (auto const* mode : {"cpu", "idle"})
+    {
+        model.mode = mode;
+        require(!prefetch_group(denied, producer, requested, 1, 4, 0, "unexpected prefetch ", [] { return false; }),
+            "next group prefetch enabled an unavailable or CPU producer");
+    }
+    model.mode = "fixture"; args.generation_overlap = false;
+    require(!group_prefetch_enabled(args, model), "next group prefetch ignored overlap off");
+    args.generation_overlap = true; args.member_storage = "raw";
+    require(!group_prefetch_enabled(args, model), "next group prefetch enabled a raw borrowed-output handoff");
+    args.member_storage = "compact"; model.generation_overlap = false;
+    require(!group_prefetch_enabled(args, model), "next group prefetch ignored the effective overlap policy");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    // The final writer is held at its first real syscall. Fixture loading uses
+    // the normal owning producer on this thread while the old engine packs.
+    for (bool failure : {false, true})
+    {
+        std::unique_ptr<Backend> backend;
+        GroupPrefetch next;
+        auto const current = root / (failure ? "prefetch-failed-current" : "prefetch-current");
+        auto const following = root / (failure ? "prefetch-failed-next" : "prefetch-next");
+        std::promise<void> started, release;
+        auto started_signal = started.get_future();
+        producer_thread = std::this_thread::get_id(); background_write_started = &started;
+        background_write_release = release.get_future().share();
+        hold_background_write.store(true, std::memory_order_release);
+        bool rejected = false, injected = false;
+        try
+        {
+            auto const result = run_group(args, current, &fixture, requested, 4, 128 * mib, 0, backend,
+                nullptr, {}, {}, nullptr,
+                [&](uint64_t fixed, uint16_t cap, uint64_t retained, std::function<bool()> const& done)
+                {
+                    started_signal.get();
+                    struct Release { std::promise<void>& signal; ~Release() { signal.set_value(); } } unblock{release};
+                    uint16_t const wanted = std::min(cap, uint16_t(4));
+                    auto const next_config = grow_controller_test::configuration(args, 128 * mib, mib);
+                    Producer next_producer{requested, &fixture, *backend, args, args.max_ram,
+                        sum(fixed, prefetch_memory(args, requested, next_config, wanted, storage_device(root).nonrotating)), fixed};
+                    auto const generated = prefetch_group(next, next_producer, requested, 1, wanted, retained,
+                        "test next group member ", done);
+                    require(generated == wanted && generated > 1 && background_write_active.load(std::memory_order_acquire) &&
+                        !fs::exists(following), "next owning batch did not advance during blocked final packing");
+                    next.metadata_bytes = sum(product(wanted, 2 * sizeof(Member)), batch_hash_bytes(args, wanted));
+                    require(next_producer.peak <= args.max_ram, "next group batch exceeded combined RAM admission");
+                    if (failure)
+                    {
+                        fail_write_begin.store(0); fail_write_end.store(UINT64_MAX);
+                        fail_write.store(true, std::memory_order_release); injected = true;
+                    }
+                    return wait_bit(ControllerWait::batch_full);
+                });
+            require(!failure && result.members == 4 && result.generated_members == 4 && next.members.size() == 4,
+                "final packing did not preserve the completed current and next batches");
+            auto const generated = backend->generated_members;
+            auto const handoff = run_group(args, following, &fixture, requested, 4, 128 * mib, 0, backend,
+                nullptr, {}, {}, &next);
+            require(handoff.members == 4 && !handoff.generated_members && backend->generated_members == generated &&
+                next.members.empty() && contents(current) == contents(following),
+                "next group handoff regenerated members or changed the published bytes");
+        }
+        catch (std::runtime_error const&) { if (!failure) throw; rejected = true; }
+        require(rejected == failure && (!failure || (injected && !fail_write.load() && next.members.size() == 4)) &&
+            !background_write_active.load(std::memory_order_acquire) && !hold_background_write.load(std::memory_order_acquire),
+            "failed final packing did not drain its writer");
+        fail_write.store(false); background_write_started = nullptr; background_write_release = {};
+        next.clear();
+    }
+#endif
+    // Find the ordinary receiver's exact admission boundary. Its inherited
+    // owning payload replaces the generated prefix rather than coexisting
+    // with another complete prefix and a new generation.
+    uint64_t const base = sum(sum(fixture.bytes, sizeof(ConstructionHistory)), mib);
+    uint64_t const generation = producer.next_peak(0);
+    uint64_t const storage = member_storage_bound(args, requested);
+    auto ordinary_fits = [&](uint64_t budget)
+    {
+        auto options = args; options.max_ram = budget;
+        uint64_t const caller = sum(base, sum(2 * sizeof(Member), batch_hash_bytes(options, 1)));
+        if (caller >= budget) return false;
+        auto const cfg = grow_controller_test::configuration(options, 128 * mib, caller);
+        uint64_t const fixed = sum(base, prefetch_memory(options, requested, cfg, 4, storage_device(root).nonrotating));
+        return sum(fixed, sum(generation, product(3, storage))) <= budget;
+    };
+    uint64_t low = mib, high = args.max_ram;
+    require(ordinary_fits(high), "constrained receiver fixture has no ordinary admission");
+    while (low < high)
+    {
+        uint64_t const middle = low + (high - low) / 2;
+        if (ordinary_fits(middle)) high = middle;
+        else low = middle + 1;
+    }
+    args.max_ram = low;
+    std::unique_ptr<Backend> ordinary_backend;
+    auto const reference = root / "prefetch-constrained-reference";
+    auto const ordinary = run_group(args, reference, &fixture, requested, 4, 128 * mib, 0, ordinary_backend);
+    require(ordinary.max_batch_members == 4 && ordinary.generated_members == 4,
+        "constrained ordinary receiver did not admit its normal full batch");
+    auto handoff = [&](uint16_t prefetched_cap, uint16_t count, uint16_t receiver_cap, std::string const& name)
+    {
+        auto backend = std::make_unique<Backend>();
+        backend->mode = "fixture"; backend->generation_overlap = true;
+        Producer staged{requested, &fixture, *backend, args, args.max_ram, mib, mib};
+        GroupPrefetch batch;
+        require(prefetch_group(batch, staged, requested, 1, prefetched_cap, 0, "test constrained prefetch ", [&]
+            { return batch.members.size() == count; }) == count, "constrained prefetch did not retain its requested members");
+        batch.metadata_bytes = sum(product(prefetched_cap, 2 * sizeof(Member)), batch_hash_bytes(args, prefetched_cap));
+        auto const generated = backend->generated_members;
+        auto options = args; options.batch = receiver_cap;
+        auto const path = root / name;
+        auto const received = run_group(options, path, &fixture, requested, 4, 128 * mib, 0, backend,
+            nullptr, {}, {}, &batch);
+        require(received.members == 4 && received.max_batch_members == receiver_cap &&
+            received.generated_members == 4 - count && backend->generated_members == generated + received.generated_members &&
+            batch.members.empty() && received.peak_modeled_bytes <= args.max_ram && contents(path) == contents(reference),
+            "constrained receiver shrank its ordinary batch, regenerated inherited members or changed output bytes");
+    };
+    handoff(4, 4, 4, "prefetch-constrained-full");
+    handoff(2, 2, 4, "prefetch-constrained-larger");
+    handoff(4, 2, 2, "prefetch-constrained-smaller");
+
+    // Destination selection keeps the old metadata in fixed until take().
+    // Its incoming payload replaces a prefix; another destination's payload
+    // must still reduce the available generation room.
+    {
+        auto const caller = sum(base, sum(2 * sizeof(Member), batch_hash_bytes(args, 1)));
+        auto const cfg = grow_controller_test::configuration(args, 128 * mib, caller);
+        Construction engine((root / "prefetch-selection").string(), cfg, false, identity(), "auto");
+        ConstructionSample shape; shape.member_bytes = ordinary.final_bytes / ordinary.members;
+        engine.history.shapes.add(shape);
+        uint64_t const engine_bytes = engine.memory_bytes(4, true);
+        uint64_t const metadata = sum(product(4, 2 * sizeof(Member)), batch_hash_bytes(args, 4));
+        uint64_t const fixed = sum(sum(base, engine_bytes), metadata);
+        uint64_t const budget = sum(fixed, sum(generation, product(3, storage)));
+        Backend backend; backend.mode = "fixture"; backend.generation_overlap = true;
+        Producer receiver{requested, &fixture, backend, args, budget, fixed, fixed};
+        auto normal = automatic_selection(engine, receiver, 4, 4, engine_bytes, 0, 0, true);
+        receiver.fixed = sum(fixed, metadata);
+        auto inherited = automatic_selection(engine, receiver, 4, 4, engine_bytes, 0, 0, false,
+            product(2, storage), metadata);
+        receiver.fixed = fixed;
+        auto queued = automatic_selection(engine, receiver, 4, 4, engine_bytes, storage, 0, false);
+        require(normal && inherited && queued && normal->batch == 4 && inherited->batch == normal->batch &&
+            queued->batch < normal->batch,
+            "destination selection confused its incoming batch with other queued payload or freed its metadata early");
+    }
+
+    // A changed next-group reservation must preserve ordinary serial admission.
+    // Model an obsolete metadata reservation without allocating a large queue.
+    auto backend = std::make_unique<Backend>();
+    backend->mode = "fixture"; backend->generation_overlap = true;
+    Producer staged{requested, &fixture, *backend, args, args.max_ram, mib, mib};
+    GroupPrefetch dropped;
+    require(prefetch_group(dropped, staged, requested, 1, 4, 0, "test obsolete prefetch ", [] { return false; }) == 4,
+        "obsolete reservation fixture did not fill its owning batch");
+    auto const before = backend->generated_members;
+    dropped.metadata_bytes = args.max_ram;
+    auto const retried = run_group(args, root / "prefetch-serial-retry", &fixture, requested, 4,
+        128 * mib, 0, backend, nullptr, {}, {}, &dropped);
+    require(retried.members == 4 && retried.generated_members == 4 && dropped.members.empty() &&
+        backend->generated_members == before + retried.generated_members && retried.peak_modeled_bytes <= args.max_ram,
+        "speculative reservation prevented a valid serial next group or lost discarded generation accounting");
+}
+Result finish_with_cpu_record(grow_controller_test::Construction& engine, bool eligible, bool body = true)
+{
+    using namespace grow_controller_test;
+    std::ostringstream diagnostic;
+    Result result;
+    {
+        struct Restore
+        {
+            std::streambuf* previous;
+            ~Restore() { std::cerr.rdbuf(previous); }
+        } restore{std::cerr.rdbuf(diagnostic.rdbuf())};
+        result = engine.finish();
+    }
+    auto const output = diagnostic.str(); std::cerr << output;
+    if (controller_profile())
+    {
+        auto const record = output.find("phase=external_pack_body history_eligible=" + std::to_string(eligible));
+        require(body ? record != std::string::npos : output.find("phase=external_pack_body") == std::string::npos,
+            "packing CPU diagnostic omitted performed work, misstated eligibility or reported zero-work publication");
+    }
+    return result;
+}
+
+void successor_lookahead(fs::path const& root, Members input,
+    grow_controller_test::Fixtures const& fixture, Config cfg)
+{
+#ifdef GROW_TEST_WRAP_PWRITE
+    using namespace grow_controller_test;
+    auto const requested = identity_from(identity());
+    Arguments args; args.max_ram = 512 * mib; args.batch = 2; args.workers = 2;
+    args.member_storage = "compact"; args.window = cfg.window_bytes; args.checkpoint_bytes = cfg.checkpoint_bytes;
+    cfg.workers = 1; cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = args.max_ram;
+    for (auto const* mode : {"drain", "consumer-failure", "producer-failure", "rejected",
+            "memory", "other-retained", "off", "raw", "cpu"})
+    {
+        auto options = args;
+        bool const memory = std::string_view(mode) == "memory" || std::string_view(mode) == "other-retained";
+        bool const serial = memory || std::string_view(mode) == "off" || std::string_view(mode) == "raw" ||
+            std::string_view(mode) == "cpu";
+        if (std::string_view(mode) == "off") options.generation_overlap = false;
+        if (std::string_view(mode) == "raw") options.member_storage = "raw";
+        auto directory = root / (std::string("successor-lookahead-") + mode); fs::create_directory(directory);
+        auto scratch = directory / "scratch"; fs::create_directory(scratch);
+        auto targets = directory / "targets"; fs::create_directory(targets);
+        auto scratch_info = ScratchRoot::inspect(scratch);
+        scratch_info.device = {"lookahead-scratch-fs", {"lookahead-ssd"}, true, false};
+        auto target_info = ScratchRoot::inspect(targets);
+        target_info.device = {"lookahead-target-fs", {"lookahead-hdd"}, false, true};
+        ScratchPool pool({scratch_info}, 0);
+        require(pool.try_reserve_output(0, target_info, cfg.capacity_bytes), "lookahead output did not fit");
+        pool.seal_recovery();
+        bool const rejected = std::string_view(mode) == "rejected";
+        auto grant = rejected ? pool.grant(0, 4096, 4096, 4096, 2) : pool.grant(0, 128 * mib, 128 * mib, mib, 2);
+        require(bool(grant), "lookahead scratch did not fit");
+        GroupSuccessor next(targets / "next", requested, 4, cfg.capacity_bytes);
+        next.owner = 0; next.workers = 1; next.batch_cap = memory ? 1 : 2; next.scratch = grant;
+        next.io = pool.try_stage_io(0); require(bool(next.io), "lookahead stage lease was denied");
+        next.engine = std::make_unique<Construction>(next.path.string(), cfg, false, identity(), "external", grant);
+        next.engine->confirm_identity();
+        auto source = std::make_shared<SharedConstructionHistory>();
+        source->successor_batches.prepare(next.batch_cap); source->successor_batch_workers = next.workers;
+        next.engine->demand_history = source;
+        next.engine_bytes = sum(next.engine->memory_bytes(next.batch_cap, options.member_storage == "compact"),
+            sum(product(next.batch_cap, 2 * sizeof(Member)), batch_hash_bytes(options, next.batch_cap)));
+        next.fixed = sum(sum(fixture.bytes, next.engine_bytes), sum(pool.memory_bytes(), 4 * mib));
+        Backend backend; backend.mode = std::string_view(mode) == "cpu" ? "cpu" : "fixture";
+        backend.generation_overlap = true;
+        std::promise<void> started, release;
+        auto started_signal = started.get_future();
+        producer_thread = std::this_thread::get_id(); background_write_started = &started;
+        background_write_release = release.get_future().share(); background_write_timed_out.store(false);
+        background_check_target = next.path.string();
+        hold_background_check.store(rejected); hold_background_write.store(!rejected);
+        struct Release
+        {
+            std::promise<void>& signal; bool sent = false;
+            void send() { if (!sent) { sent = true; signal.set_value(); } }
+            ~Release() { send(); }
+        } unblock{release};
+        if (serial)
+        {
+            uint64_t const retained = std::string_view(mode) == "other-retained" ? 7 * mib : 0;
+            if (memory)
+            {
+                Producer probe{requested, &fixture, backend, options, options.max_ram, next.fixed, next.fixed};
+                options.max_ram = sum(sum(next.fixed, retained), probe.next_peak(0));
+            }
+            unblock.send(); // An unexpected async write reports through the assertion, without blocking.
+            stage_successor(next, options, backend, retained, [] { return false; }, &fixture);
+            require(hold_background_write.load() && !background_write_timed_out.load() &&
+                next.metrics.members == 4 && next.metrics.generated_members == 4 &&
+                next.metrics.peak_modeled_bytes <= options.max_ram,
+                "successor ignored serial policy or retained-memory admission");
+            hold_background_write.store(false); background_write_started = nullptr; background_write_release = {};
+            background_check_target.clear(); next.close(); continue;
+        }
+        unsigned observations = 0;
+        bool observed = false, failed = false;
+        try
+        {
+            stage_successor(next, options, backend, 7 * mib, [&]
+            {
+                if (backend.generated_members != 2) return false;
+                if (!observations++) return false; // The immutable candidate is ready to launch.
+                if (observations == 2)
+                {
+                    require(started_signal.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+                        "successor append did not start on its CPU consumer");
+                    require(!next.engine->external_batches.sizes[0].planning.count &&
+                        !source->successor_batches.sizes[0].encoding.count,
+                        "successor published batch timing before its immutable CPU consumer joined");
+                    return false; // Generate a member while the real consumer is held.
+                }
+                observed = background_write_active.load(std::memory_order_acquire);
+                if (std::string_view(mode) == "consumer-failure")
+                {
+                    fail_write_begin.store(0); fail_write_end.store(UINT64_MAX); fail_write.store(true);
+                }
+                unblock.send();
+                if (std::string_view(mode) == "producer-failure") throw std::runtime_error("successor producer failure");
+                return true; // The predecessor finished: drain, without generating further members.
+            }, &fixture);
+        }
+        catch (std::runtime_error const&) { failed = true; }
+        unblock.send();
+        require(observed && !background_write_active.load(std::memory_order_acquire) &&
+            !background_write_timed_out.load(std::memory_order_acquire) &&
+            !hold_background_write.load() && !hold_background_check.load(),
+            "successor did not overlap generation or drain its held CPU consumer");
+        bool const consumer_failure = std::string_view(mode) == "consumer-failure";
+        bool const producer_failure = std::string_view(mode) == "producer-failure";
+        require(failed == (consumer_failure || producer_failure) && (!consumer_failure || !fail_write.load()),
+            "successor lost its consumer or producer failure");
+        fail_write.store(false); background_write_started = nullptr; background_write_release = {};
+        background_check_target.clear();
+        auto const saved = ExternalEngine::inspect(next.path.string());
+        if (rejected)
+        {
+            require(next.deferred && !next.metrics.members && next.metrics.generated_members == 3 &&
+                !saved.members && !saved.finishing && next.engine->external->can_append(),
+                "rejected successor retained an obsolete lookahead or invoked full target packing");
+            require(!source->successor_batches.sizes[0].planning.count &&
+                !source->successor_batches.sizes[1].encoding.count,
+                "rejected successor trained the next group's batch policy");
+        }
+        else if (producer_failure)
+        {
+            require(saved.members == 2 && !saved.finishing && !next.metrics.members,
+                "producer unwind did not drain the immutable append to its durable frontier");
+            require(!source->successor_batches.sizes[0].planning.count,
+                "producer failure trained an unobserved successor append");
+        }
+        else if (consumer_failure)
+        {
+            require(!saved.members && !saved.finishing, "failed successor append acknowledged an uncommitted queue");
+            require(!source->successor_batches.sizes[0].encoding.count,
+                "consumer failure trained an uncommitted successor append");
+        }
+        else
+        {
+            require(next.metrics.members == 3 && next.metrics.generated_members == 3 && saved.members == 3 &&
+                !saved.finishing && next.metrics.max_batch_members == 2 && next.metrics.peak_modeled_bytes <= args.max_ram,
+                "predecessor stop lost an owning lookahead, generated further members or exceeded RAM admission");
+            require(source->successor_batches.sizes[0].planning.count == 1 &&
+                source->successor_batches.sizes[1].encoding.count == 1 &&
+                source->successor_batches.source_members == saved.members && source->successor_batches.source_bytes,
+                "joined successor did not retain accepted batch timings and source-shape provenance");
+            source->successor_batches.half_attempted = true;
+            source->successor_batches.selected = 1;
+            next.engine->external_batches = {}; // A paused lane's old snapshot must not win.
+            auto const generated = backend.generated_members;
+            stage_successor(next, args, backend, 7 * mib, [] { return false; }, &fixture);
+            require(next.metrics.members == 4 && next.metrics.generated_members == 4 && backend.generated_members == generated + 1,
+                "successor reentry regenerated its drained prefix");
+            require(source->successor_batches.half_attempted && source->successor_batches.selected == 1 &&
+                source->successor_batches.sizes[0].planning.count == 1 &&
+                source->successor_batches.sizes[1].encoding.count == 2,
+                "a stale compatible lane overwrote its shared trial, selection or completed observations");
+            ++source->successor_batch_workers;
+            stage_successor(next, args, backend, 7 * mib, [] { return true; }, &fixture);
+            require(!next.engine->external_batches.ceiling && !next.engine->external_batches.half_attempted &&
+                !next.engine->external_batches.sizes[0].planning.count,
+                "successor reused batch timings from a different compression-worker grant");
+            next.io.reset();
+            auto io = pool.try_io(0); require(bool(io), "lookahead finish could not acquire ordinary writer authority");
+            next.engine->prepare_finish(); next.engine->finish();
+            auto const reference = directory / "reference"; direct(reference, input.subspan(0, 4), cfg);
+            require(contents(next.path) == contents(reference), "successor lookahead changed member order or ordinary v2 bytes");
+        }
+        next.close();
+    }
+#endif
+}
+
+void successor_staging(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const requested = identity_from(identity());
+    auto scratch = root / "successor-scratch"; fs::create_directory(scratch);
+    auto targets = root / "successor-targets"; fs::create_directory(targets);
+    auto const current_path = group_path(targets, 0), next_path = group_path(targets, 1);
+    Fixtures fixture{requested, {}, 0};
+    for (uint16_t index = 0; index < 4; ++index)
+    {
+        auto const path = root / ("successor-member-" + std::to_string(index));
+        PlotData data; data.t3_proof_fragments.assign(input[index].raw().begin(), input[index].raw().end());
+        fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, requested.params, index, requested.memo));
+        fixture.paths.push_back(path);
+    }
+    successor_lookahead(root, input, fixture, cfg);
+    auto scratch_info = ScratchRoot::inspect(scratch);
+    scratch_info.device = {"successor-scratch-fs", {"successor-ssd"}, true, false};
+    auto target_info = ScratchRoot::inspect(targets);
+    target_info.device = {"successor-target-fs", {"successor-hdd"}, false, true};
+    ScratchPool pool({scratch_info}, 0);
+    require(pool.try_reserve_output(0, target_info, 128 * mib) &&
+        pool.try_reserve_output(1, target_info, 128 * mib), "successor test could not reserve both outputs");
+    pool.seal_recovery();
+    auto old_scratch = pool.grant(0, 128 * mib, 128 * mib, mib, 2);
+    auto next_scratch = pool.grant(1, 128 * mib, 128 * mib, mib, 2);
+    require(old_scratch && next_scratch, "successor test could not reserve independent contribution scratch");
+    auto gate = std::make_shared<std::recursive_mutex>();
+    old_scratch->target_gate = next_scratch->target_gate = gate;
+    cfg.workers = 1; cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    Construction old(current_path.string(), cfg, false, identity(), "external", old_scratch);
+    old.confirm_identity();
+    require(old.append(input.subspan(0, 4)).accepted, "successor test could not stage the current group");
+    std::optional<fs::path> old_owned;
+    for (auto const& entry : fs::directory_iterator(scratch))
+        if (entry.is_directory()) { old_owned = entry.path(); break; }
+    require(old_owned.has_value(), "successor test has no current scratch namespace");
+    auto old_io = pool.try_io(0); require(bool(old_io), "successor test could not acquire the old final writer");
+    GroupSuccessor next(next_path, requested, 4, 128 * mib);
+    next.owner = 1; next.workers = 1; next.batch_cap = 1; next.scratch = next_scratch;
+    next.io = pool.try_stage_io(1); require(bool(next.io), "independent successor stage was blocked by the old pack lease");
+    next.engine = std::make_unique<Construction>(next.path.string(), cfg, false, identity(), "external", next.scratch);
+    next.engine->confirm_identity();
+    Arguments args; args.max_ram = 512 * mib; args.batch = 1; args.workers = 2;
+    args.member_storage = "compact"; args.window = cfg.window_bytes; args.checkpoint_bytes = cfg.checkpoint_bytes;
+    Backend backend; backend.mode = "fixture"; backend.generation_overlap = true;
+    next.engine_bytes = sum(next.engine->memory_bytes(1, true),
+        sum(2 * sizeof(Member), batch_hash_bytes(args, 1)));
+    next.fixed = sum(sum(sum(fixture.bytes, old.memory_bytes(4, true)), next.engine_bytes),
+        sum(pool.memory_bytes(), 4 * mib));
+    require(next.fixed < args.max_ram, "successor fixture has no modeled producer headroom");
+    auto tight = args; tight.max_ram = next.fixed;
+    require(stage_successor(next, tight, backend, 0, [] { return false; }, &fixture) == wait_bit(ControllerWait::producer_memory) &&
+        !next.metrics.members && !next.metrics.generated_members,
+        "blocked successor generation did not expose its observed RAM-admission reason");
+    std::promise<void> release;
+    auto signal = release.get_future().share();
+    group_grow::Result old_result;
+    OrderedWriter writer([] {});
+    auto pending = writer.submit([&] { signal.wait(); old_result = old.finish(); });
+    struct Release { std::promise<void>& value; bool sent = false; ~Release() { if (!sent) value.set_value(); } } unblock{release};
+    // Reenter stage service to model yielding to a different ready drive. Each
+    // call retains the previous durable prefix and the same explicit grants.
+    stage_successor(next, args, backend, 0, [&] { return next.metrics.members >= 2; }, &fixture);
+    require(next.metrics.members >= 2 && next.metrics.members <= 3 && next.metrics.batches == next.metrics.members &&
+        pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
+        "successor did not retain its prefix while the prior final task remained live");
+    auto const first_peak = next.metrics.peak_modeled_bytes;
+    auto const full_reason = stage_successor(next, args, backend, 0, [] { return false; }, &fixture);
+    auto const saved = ExternalEngine::inspect(next.path.string());
+    require(full_reason == wait_bit(ControllerWait::group_full) && next.metrics.members == 4 && next.metrics.batches == 4 && next.metrics.max_batch_members == 1 &&
+        next.metrics.generated_members == 4 && next.metrics.peak_modeled_bytes >= first_peak &&
+        next.metrics.peak_modeled_bytes <= args.max_ram && saved.members == 4 && !saved.finishing &&
+        saved.target_bytes < next.metrics.final_bytes && next.engine->external->can_append(),
+        "successor did not durably stage beyond one RAM batch without packing its target");
+    // A stopped lane must retain the pending job without keeping an inactive
+    // engine in the global construction count or hiding its completed neighbor.
+    { std::ofstream file(*old_owned / "preserved"); file.put('!'); }
+    next.io.reset(); next.workers = 0;
+    unblock.sent = true; release.set_value(); pending.get(); old_io.reset();
+    auto const old_workspace = old.memory_bytes(4, true);
+    old.release_external();
+    require(!old.scratch_cleanup_complete && fs::exists(*old_owned / "preserved"),
+        "successor terminal fixture did not preserve changed current scratch");
+    old.external.reset();
+    auto contents = [](fs::path const& path)
+    { auto in = group_tools::input(path.string()); return std::vector<uint8_t>{std::istreambuf_iterator<char>(in), {}}; };
+    struct SavedFile { std::vector<uint8_t> bytes; struct stat stamp; };
+    std::map<fs::path, SavedFile> next_files;
+    auto retain = [&](fs::path const& path)
+    { next_files.emplace(path, SavedFile{contents(path), Construction::snapshot(path.string())}); };
+    auto const checkpoint = fs::path(next.path.string() + ".external") / "checkpoint";
+    retain(next.path); retain(checkpoint);
+    for (auto const& entry : fs::directory_iterator(scratch)) if (entry.is_directory() && entry.path() != *old_owned)
+        for (auto const& segment : fs::directory_iterator(entry.path())) if (segment.is_regular_file()) retain(segment.path());
+    next.guard = snapshot(next.path, 1);
+    output_auxiliary(next.path, next.guard, args.max_ram);
+    next.guard.members = next.guard.pending_members = uint16_t(next.metrics.members); next.guard.pending = true;
+    FarmingRun farm; farm.memory_limit = args.max_ram; farm.lanes.resize(1);
+    FarmingDrivePlan layout; layout.fixed_members = true; layout.group_members = 4; layout.meta_slots = 1;
+    FarmingDestination storage; storage.capacity_bytes = 128 * mib;
+    farm.state.directories.push_back({targets.string(), "test", storage.capacity_bytes, 0, layout, storage});
+    auto current = snapshot(current_path, 0); output_auxiliary(current_path, current, args.max_ram);
+    current.members = current.pending_members = 4;
+    auto& lane = farm.lanes[0]; lane.outputs = {current, next.guard};
+    lane.reserved_members = lane.next_reserved_members = 4; lane.successor_ordinal = 1;
+    auto remaining_root = root / "successor-remaining"; fs::create_directory(remaining_root);
+    auto remaining_info = ScratchRoot::inspect(remaining_root);
+    remaining_info.device = {"remaining-fs", {"remaining-drive"}, false, true};
+    auto const pool_before = pool.memory_bytes();
+    require(pool.try_reserve_output(3, remaining_info, 128 * mib), "remaining output reservation did not fit");
+    uint64_t fixed = sum(next.fixed - old_workspace, pool.memory_bytes() - pool_before);
+    size_t active = 1;
+    auto memory = [&](unsigned, uint16_t) { return Engine::memory_bytes(18, cfg, 1); };
+    uint64_t const base = fixed - next.engine_bytes, budget = sum(base, memory(1, 1));
+    auto const plan = destination_plan(budget, base, 0, 0, 1, 1, 1, 1, memory,
+        [](size_t active, unsigned, uint16_t) { return 1.0L / active; });
+    require(plan.active && active >= plan.active && sum(fixed, memory(1, 1)) > budget,
+        "terminal fixture did not retain a blocking active/workspace grant");
+    auto const quota = pool.available_for_output(1, target_info), pool_memory = pool.memory_bytes();
+    auto const staged_stats = next.engine->stats();
+    auto const staged_waits = next.metrics.controller_waits.nanoseconds;
+    auto const preserved = detach_successor(next, fixed, active, lane.successor_ordinal);
+    lane.reserved_members = lane.next_reserved_members = 0;
+    require(!next.engine && !next.io && next.detached && !lane.successor_ordinal && active < plan.active &&
+        sum(fixed, memory(1, 1)) <= budget && pool.memory_bytes() == pool_memory &&
+        pool.available_for_output(1, target_info) == quota && farm.membership(0, 1) == 4,
+        "terminal successor kept a live grant or lost its durable reservation/certificate extent");
+    require(preserved.members == 4 && preserved.final_bytes == next.guard.bytes &&
+        preserved.controller_waits.nanoseconds == staged_waits &&
+        preserved.generated_members == 4 && preserved.batches == 4 && preserved.staged_batches == 4 &&
+        preserved.written_bytes == staged_stats.written_bytes && preserved.scratch_peak_bytes &&
+        !preserved.scratch_released && preserved.peak_file_bytes >= next.guard.charge(),
+        "terminal successor omitted acknowledged stage work or reported canonical bytes as published");
+    for (auto const& [path, before] : next_files)
+    {
+        Construction::unchanged(before.stamp, path.string());
+        require(contents(path) == before.bytes, "terminal successor changed checkpoint, segment or target bytes");
+    }
+    bool repeated = false;
+    try { (void)detach_successor(next, fixed, active, lane.successor_ordinal); }
+    catch (std::runtime_error const&) { repeated = true; }
+    require(repeated && active < plan.active && sum(fixed, memory(1, 1)) <= budget,
+        "terminal successor accounted its work or workspace twice");
+    farm.check();
+    { std::ofstream file(checkpoint, std::ios::binary | std::ios::trunc); file.put('!'); }
+    bool audited = false;
+    try { farm.check(); } catch (std::runtime_error const&) { audited = true; }
+    { std::ofstream file(checkpoint, std::ios::binary | std::ios::trunc);
+      auto const& bytes = next_files.at(checkpoint).bytes;
+      file.write(reinterpret_cast<char const*>(bytes.data()), std::streamsize(bytes.size())); }
+    require(audited, "detached successor retained a live checkpoint audit exemption");
+    farm.check();
+    auto remaining_cfg = cfg; remaining_cfg.memory_limit_bytes = budget - fixed;
+    auto remaining_io = pool.try_io(3); require(bool(remaining_io), "remaining construction lost I/O admission");
+    Construction remaining((remaining_root / "remaining.gplot").string(), remaining_cfg, false, identity());
+    remaining.confirm_identity();
+    require(remaining.append(input.subspan(0, 1)).accepted && remaining.finish().members == 1,
+        "remaining construction could not finish within released workspace and active admission");
+    remaining_io.reset();
+    pool.release_after_cleanup(3, allocated_bytes(remaining_root / "remaining.gplot"));
+    GroupSuccessor recovered(next.path, requested, 4, 128 * mib);
+    recovered.guard = next.guard; recovered.recovery = ExternalEngine::inspect(next.path.string());
+    auto saved_ordinal = std::optional<uint64_t>(1);
+    auto const saved_fixed = fixed, saved_active = active;
+    auto const saved_work = detach_successor(recovered, fixed, active, saved_ordinal);
+    require(fixed == saved_fixed && active == saved_active && !saved_ordinal && saved_work.recovered &&
+        saved_work.members == 4 && !saved_work.generated_members && !saved_work.written_bytes,
+        "saved terminal successor released nonexistent workspace or counted historical work twice");
+    auto resumed_cfg = cfg; resumed_cfg.workers = 2;
+    auto next_io = pool.try_io(1); require(bool(next_io), "successor recovery did not acquire full I/O ownership");
+    Construction resumed(next.path.string(), resumed_cfg, true, identity(), "external", next_scratch);
+    auto pack_history = std::make_shared<SharedConstructionHistory>(); resumed.attach_history(pack_history);
+    resumed.confirm_identity();
+    require(resumed.staged_recovery && resumed.external->can_append(), "successor fixture did not reopen its acknowledged staging prefix");
+    resumed.prepare_finish(); resumed.prepare_finish();
+    require(resumed.fresh_external_pack && resumed.member_count() == 4 && finish_with_cpu_record(resumed, true).members == old_result.members &&
+        contents(next.path) == contents(current_path) && backend.generated_members == 4,
+        "successor recovery regenerated its acknowledged prefix or changed ordinary v2 bytes");
+    require(pack_history->snapshot().external_packing.count == 1 && !pack_history->snapshot().shapes.count,
+        "reopened staged successor lost its whole-pack rate or relaxed conservative recovery shape sampling");
+    resumed.release_external(); next_io.reset();
+    pool.release_after_cleanup(1, sum(allocated_bytes(next.path), resumed.remaining_metadata_bytes));
+
+    // A stage-only singleton rejection cannot invoke Construction's full-pack
+    // fallback. Its empty recoverable target and checkpoint remain untouched.
+    require(pool.try_reserve_output(2, target_info, 128 * mib), "rejected successor output was not reserved");
+    auto tiny = pool.grant(2, 4096, 4096, 4096, 2);
+    require(bool(tiny), "rejected successor scratch fixture was not granted");
+    tiny->target_gate = gate;
+    GroupSuccessor rejected(targets / "rejected", requested, 1, 128 * mib);
+    rejected.owner = 2; rejected.workers = rejected.batch_cap = 1; rejected.scratch = tiny;
+    rejected.io = pool.try_stage_io(2); require(bool(rejected.io), "rejected successor lost stage ownership");
+    rejected.engine = std::make_unique<Construction>(rejected.path.string(), cfg, false, identity(), "external", tiny);
+    rejected.engine->confirm_identity();
+    rejected.fixed = sum(fixture.bytes, sum(rejected.engine->memory_bytes(1, true), 4 * mib));
+    auto const before = fs::file_size(rejected.path);
+    auto const rejected_reason = stage_successor(rejected, args, backend, 0, [] { return false; }, &fixture);
+    require(rejected_reason == wait_bit(ControllerWait::scratch_capacity) && rejected.deferred && !rejected.metrics.members && rejected.engine->external &&
+        rejected.engine->external->can_append() && fs::file_size(rejected.path) == before &&
+        ExternalEngine::inspect(rejected.path.string()).members == 0,
+        "stage-only rejection performed full target packing or lost its recoverable owner");
+    rejected.close();
+    {
+        // Known contribution consumers omit the optional producer cache. A
+        // scratch rejection must still hash the compact batch through ordinary
+        // exact admission after its recoverable empty external handoff.
+        std::vector<Member> compact;
+        compact.emplace_back(std::vector<uint64_t>(input[0].raw().begin(), input[0].raw().end()));
+        compact.back().compact(18);
+        Construction fallback(rejected.path.string(), cfg, true, identity(), "external", tiny);
+        fallback.confirm_identity();
+        require(fallback.append(compact, nullptr).accepted && fallback.incremental && !fallback.external && fallback.fallbacks,
+            "hash-free external rejection could not use ordinary exact admission");
+        fallback.finish();
+        auto const reference = targets / "hash-free-reference"; direct(reference, input.subspan(0, 1), cfg);
+        require(contents(rejected.path) == contents(reference), "hash-free fallback changed ordinary v2 bytes");
+    }
+    for (auto const* mode : {"incremental", "merged", "staged"})
+    {
+        auto policy = args; policy.construction = mode;
+        GroupSuccessor denied(targets / (std::string("policy-") + mode), requested, 1, 128 * mib);
+        auto const before = pool.memory_bytes();
+        require(!prepare_successor(denied, policy, backend, pool, 3, next.fixed, 0, 1, gate, &fixture) &&
+            !fs::exists(denied.path) && pool.memory_bytes() == before,
+            "successor staging overrode an explicit new-group construction policy");
+    }
+}
+
+void destination_admission()
+{
+    using namespace grow_controller_test;
+    std::vector<StorageDevice> devices;
+    for (size_t i = 0; i < 64; ++i)
+        devices.push_back({std::to_string(i), {"drive-" + std::to_string(i)}});
+    auto groups = writer_groups(devices);
+    size_t const independent = *std::max_element(groups.begin(), groups.end()) + 1;
+    require(independent == devices.size(), "independent destination drives were combined");
+    uint64_t const budget = 14000000000ull, metadata = devices.size() * mib;
+    uint64_t const generation = 4ull * 1024 * mib, member = 512 * mib;
+    auto memory = [](unsigned workers, uint16_t batch)
+    { return 256 * mib + workers * mib + uint64_t(batch) * 4096; };
+    auto neutral = [](size_t active, unsigned, uint16_t) { return 1.0L / active; };
+    auto packing = [&](size_t writers, size_t limit, uint64_t bytes)
+    { return destination_plan(bytes, metadata, 0, 0, 3, 1, 1, 1, memory, neutral, limit, writers); };
+    require(packing(0, 0, budget).active == 1 && packing(1, 0, budget).active == 2 &&
+        packing(2, 0, budget).active == 3 && packing(0, 1, budget).active == 1 &&
+        packing(1, 1, budget).active == 2 &&
+        packing(2, 0, metadata + 2 * memory(1, 1)).active == 2,
+        "packing writers did not share a codec worker within the RAM and receiver limits");
+    auto const bounded = destination_plan(budget, metadata, generation, member, independent, 32, 64, 1, memory, neutral);
+    require(bounded.active > 1 && bounded.active < devices.size() && bounded.batch && bounded.workers,
+        "many destinations did not activate a bounded useful subset");
+    require(bounded.active * bounded.workers <= 32 && metadata + generation + bounded.active *
+        memory(bounded.workers, bounded.batch) + (bounded.active * bounded.batch - 1) * member <= budget,
+        "destination leases overcommitted combined CPU or RAM");
+    auto const plentiful = destination_plan(128ull * 1024 * mib, metadata, generation, member,
+        independent, 32, 64, 1, memory, neutral);
+    require(plentiful.active >= bounded.active && plentiful.batch >= bounded.batch,
+        "additional RAM did not admit more destination work");
+    auto const expensive_rewrites = destination_plan(budget, metadata, generation, member,
+        independent, 32, 16, 1, memory, [](size_t active, unsigned, uint16_t batch) { return (batch < 16 ? 10000.0L : 1.0L) / active; });
+    require(expensive_rewrites.active < bounded.active && expensive_rewrites.batch == 16,
+        "observed rewrite costs did not favor fewer larger batches");
+    devices.back().drives.clear(); groups = writer_groups(devices);
+    auto const unknown = destination_plan(budget, metadata, generation, member,
+        *std::max_element(groups.begin(), groups.end()) + 1, 32, 64, 1, memory, neutral);
+    require(unknown.active == 1 && unknown.workers == 32, "unknown topology lost serialization or CPU capacity");
+    auto const impossible = destination_plan(metadata + generation, metadata, generation, member,
+        independent, 32, 64, 1, memory, neutral);
+    require(!impossible.active, "destination activation ignored the next producer peak");
+    auto const recovery = destination_plan(budget, metadata, generation, member,
+        independent, 32, 1, 3, memory, neutral);
+    require(recovery.active && recovery.batch >= 3, "saved recovery membership was reduced to the new batch bound");
+
+    Config worker_config; worker_config.window_bytes = 65536; worker_config.codec_bytes = 4 * mib;
+    auto worker_memory = [&](unsigned count, uint16_t batch)
+    {
+        auto cfg = worker_config; cfg.workers = count;
+        return Engine::memory_bytes(18, cfg, batch);
+    };
+    uint64_t const worker_room = worker_memory(12, 1);
+    require(worker_room < worker_memory(24, 1), "worker admission fixture lost its descriptor boundary");
+    auto const fewer_workers = destination_plan(metadata + generation + worker_room, metadata, generation,
+        member, 1, 24, 1, 1, worker_memory, neutral);
+    require(fewer_workers.active == 1 && fewer_workers.workers == 12 && fewer_workers.batch == 1,
+        "destination admission discarded a fitting intermediate worker grant");
+    require(!destination_plan(metadata + generation + worker_memory(1, 1) - 1, metadata, generation,
+        member, 1, 24, 1, 1, worker_memory, neutral).active,
+        "worker fallback admitted a destination below its singleton workspace");
+
+    // A successor can keep the former working batch while another owner uses
+    // the genuinely released RAM. The reference ceiling is never a lease.
+    uint16_t const maximum = 8, former = 6;
+    uint64_t const retained_member = 8 * mib;
+    auto workspace = [](uint16_t count) { return 4 * mib + uint64_t(count) * 4096; };
+    uint64_t const live_room = sum(workspace(maximum), product(maximum - 1, retained_member));
+    uint64_t const former_room = sum(workspace(former), product(former - 1, retained_member));
+    uint64_t const released = live_room - former_room;
+    auto const batch = successor_batch_cap(maximum, live_room, released, retained_member, workspace);
+    require(batch == former, "successor admission did not preserve the derived pre-transition batch ceiling");
+    uint64_t const fixed = sum(workspace(batch), product(batch - 1, retained_member));
+    auto next_memory = [&](unsigned, uint16_t) { return released; };
+    require(destination_plan(live_room, fixed, 0, 0, 1, 1, 1, 1, next_memory, neutral).active &&
+        !destination_plan(live_room, sum(fixed, released), 0, 0, 1, 1, 1, 1, next_memory, neutral).active,
+        "successor admission retained phantom workspace instead of leaving the released RAM available");
+    require(successor_batch_cap(maximum, live_room, 0, retained_member, workspace) == maximum,
+        "successor admission changed without a predecessor release");
+    require(successor_batch_cap(maximum, live_room, live_room, retained_member, workspace) == 1,
+        "zero reference admission disabled a newly fitting successor singleton");
+    require(!successor_batch_cap(maximum, workspace(1) - 1, live_room, retained_member, workspace),
+        "successor singleton fallback bypassed actual workspace admission");
+}
+
+void execution_planning()
+{
+    using namespace grow_controller_test;
+    GenerationHistory generation;
+    require(generation.member_ns() == 0, "cold generation acquired an invented rate");
+    for (unsigned i = 0; i < 8; ++i) generation.add(4, 400);
+    generation.add(1, 10000);
+    require(generation.member_ns() == 100, "generation history lost its bounded robust rate");
+    std::vector<ExecutionLane> lanes;
+    for (size_t i = 0; i < 60; ++i)
+    {
+        ExecutionWork work; work.generation = 1000; work.cpu = 240; work.destination = 100;
+        work.batches = 98; work.known = work.io_overlap = true;
+        lanes.push_back({work, i});
+    }
+    auto memory = [](unsigned, uint16_t batch) { return mib + uint64_t(batch) * 4096; };
+    auto select = [&](size_t resources, unsigned workers = 24)
+    {
+        return destination_plan(14000000000ull, mib, mib, mib, lanes.size(), workers, 16, 1, memory,
+            [&](size_t active, unsigned grant, uint16_t)
+            { return pipeline_execution_estimate(lanes, active, workers, grant, resources, true).completion; }, lanes.size());
+    };
+    auto const producer_bound = select(lanes.size());
+    require(producer_bound.active == 1,
+        "shared generation was divided by destination count instead of limiting useful concurrency");
+    for (auto& lane : lanes) { lane.work.generation = 1; lane.work.destination = 1000; }
+    auto const independent = select(lanes.size());
+    require(independent.active > 1, "independent measured outputs did not admit useful overlap");
+    require(select(lanes.size(), 1).active > 1, "one shared codec worker serialized independent measured HDDs");
+    for (auto& lane : lanes) lane.destination = 0;
+    require(select(1).active == 1 && select(1, 1).active == 1, "partitions multiplied one physical output's execution capacity");
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        lanes[i].destination = i; lanes[i].scratch = {{lanes.size(), 1}};
+        lanes[i].work.destination = 1; lanes[i].work.scratch_read = lanes[i].work.scratch_write = 1000;
+    }
+    require(select(lanes.size() + 1).active == 1, "shared scratch demand was divided by active destinations");
+    lanes.back().work.known = false;
+    require(!pipeline_execution_estimate(lanes, 1, 24, 24, lanes.size() + 1, true).known,
+        "an unmeasured destination inherited another drive's service rate");
+    lanes.back().work.known = true; lanes.back().scratch.clear();
+    require(!pipeline_execution_estimate(lanes, 1, 24, 24, lanes.size() + 1, true).known,
+        "unknown scratch attribution acquired an execution estimate");
+    std::array<ExecutionReady, 3> ready{{{7, 0, 100, true}, {8, 0, 300, true}, {9, 0, 200, true}}};
+    require(execution_generation_order(ready) == 8, "generation did not start the longest measured downstream tail");
+    ready.back().known = false;
+    require(execution_generation_order(ready) == 7, "unknown consumers changed the safe rotating generation order");
+    ready[1].members_to_pack = 2; ready[2].members_to_pack = 1;
+    require(execution_generation_order(ready) == 9, "cold generation did not release the nearest packable group");
+    ready[2].tight_capacity = true;
+    require(execution_generation_order(ready) == 8, "speculative capacity probe delayed a fitting measured destination");
+    ready[1].tight_capacity = true;
+    require(execution_generation_order(ready) == 7, "speculative capacity probes displaced a fitting destination");
+    ready.back().deferrals = ready.size();
+    require(execution_generation_order(ready) == 9, "generation order starved a deferred capacity probe");
+
+    Config cfg; cfg.capacity_bytes = 1000000000000ull; cfg.window_bytes = mib;
+    cfg.checkpoint_bytes = 16 * mib; cfg.workers = 24; cfg.merge_inputs = 4;
+    auto const large = construction_external_forecast(28, cfg, 0, 1, 98, 1000000000, 1000000000, 4, 64);
+    auto const narrow = construction_external_forecast(28, cfg, 0, 1, 98, 1000000000, 1000000000, 4, 4);
+    auto const smaller = construction_external_forecast(28, cfg, 0, 1, 48, 1000000000, 1000000000, 4, 64);
+    require(large.members == 98 && smaller.members == 48 && large.batches > smaller.batches &&
+        large.merged.read < narrow.merged.read && large.merged.write < narrow.merged.write,
+        "representative grouping and retained-reader choices lost their run and merge costs");
+    long double const summary_bytes = static_cast<long double>(PlotGroupFile::getChunkCountForK(28)) *
+        (sizeof(ChunkSummary) + sizeof(uint64_t));
+    require(smaller.merged.read == smaller.members * 1000000000.0L + (smaller.batches - 1) * summary_bytes,
+        "external final packing invented a compaction below its hard run limit");
+    std::array<ConstructionRun, 4> unequal{{{1, 100}, {2, 200}, {3, 300}, {4, 400}}};
+    auto const unequal_tail = construction_external_forecast(28, cfg, 10, 1, 11, 100, 100, 4, 4, unequal);
+    require(unequal_tail.merged.read == summary_bytes + 1100 && unequal_tail.packing.read == 1100,
+        "external forecast compacted unequal adjacent tail ranges or lost the cached committed runs");
+    ConstructionHistory history;
+    ConstructionSample sample; sample.elapsed_ns = 1000; sample.written_bytes = 100;
+    sample.write_ns = 100; sample.read_bytes = 100; sample.read_ns = 100;
+    sample.codec_bytes = 100; sample.codec_ns = 100; sample.workers = 2;
+    sample.cpu_ns = 100; sample.serial_cpu_ns = 20; sample.cpu_measured = sample.serial_cpu_measured = true;
+    sample.io_attributed = true;
+    sample.scratch_io = {100, 100, 10, 100, 100, 1, 1, 1};
+    sample.destination_io = {10, 100, 10, 10, 100, 1, 1, 1};
+    history.execution_contributions.add(sample); history.execution_packing.add(sample);
+    require(!history.count && construction_execution_work(large, history, 1000, true, true, true).known,
+        "external execution estimates still required ordinary append history");
+    history.execution_packing = {};
+    require(!construction_execution_work(large, history, 1000, true, true, true).known,
+        "missing completed external packing acquired a final-output rate");
+    history.execution_packing.add(sample);
+    history.execution_packing.samples[0].cpu_measured = false;
+    require(!construction_execution_work(large, history, 1000, true, true, true).known,
+        "missing thread CPU time was replaced by codec wall time");
+
+    require(streamed_input_candidate(1, 2, true, true, true, false, false) &&
+        !streamed_input_candidate(2, 2, true, true, true, false, false) &&
+        !streamed_input_candidate(1, 2, false, true, true, false, false) &&
+        !streamed_input_candidate(1, 2, true, false, true, false, false) &&
+        !streamed_input_candidate(1, 2, true, true, false, false, false) &&
+        !streamed_input_candidate(1, 2, true, true, true, true, false) &&
+        !streamed_input_candidate(1, 2, true, true, true, false, true),
+        "compact-input cold admission weakened physical, capacity, recovery or singleton-progress gates");
+    auto retained_memory = [](unsigned workers, uint16_t batch)
+    { return 256 * mib + workers * mib + uint64_t(batch) * 4096; };
+    auto input_memory = [&](unsigned workers, uint16_t batch) { return sum(retained_memory(workers, batch), 16 * mib); };
+    auto neutral = [](size_t active, unsigned, uint16_t) { return 1.0L / active; };
+    uint64_t const budget = 14000000000ull, fixed = 60 * mib, producer = 4ull * 1024 * mib, member = 512 * mib;
+    auto const ordinary = destination_plan(budget, fixed, producer, member, 60, 24, 16, 1, retained_memory, neutral);
+    auto const streamed = destination_plan(budget, fixed, producer, 0, 60, 24, 16, 1, input_memory,
+        [&](size_t active, unsigned workers, uint16_t batch)
+        {
+            return input_memory(workers, batch) <= (budget - fixed - producer) / active ?
+                1.0L / active : std::numeric_limits<long double>::infinity();
+        });
+    require(streamed.active > ordinary.active && fixed + producer + streamed.active *
+        input_memory(streamed.workers, streamed.batch) <= budget,
+        "bounded compact input did not admit another writer while preserving an ordinary singleton producer");
+    auto const useful = destination_plan(budget, fixed, producer, member, 60, 24, 16, 1, retained_memory,
+        [](size_t active, unsigned, uint16_t batch) { return (batch < 16 ? 10000.0L : 1.0L) / active; });
+    auto scratch_bytes = [](uint16_t count) { return 2 * mib + uint64_t(count) * 4 * mib; };
+    uint64_t const scratch_capacity = sum(scratch_bytes(4), useful.batch);
+    uint16_t const scratch_batch = admitted_batch_cap(useful.batch, 1, scratch_capacity, 0, scratch_bytes);
+    auto const scratch_fitting = destination_plan(budget, fixed, producer, 0, 60, 24, scratch_batch, 1, input_memory,
+        [&](size_t active, unsigned workers, uint16_t batch)
+        {
+            return input_memory(workers, batch) <= (budget - fixed - producer) / active ?
+                1.0L / active : std::numeric_limits<long double>::infinity();
+        });
+    require(useful.active && scratch_batch && scratch_batch < useful.batch && scratch_fitting.active > useful.active &&
+        scratch_fitting.batch <= scratch_batch && scratch_bytes(scratch_fitting.batch) <= scratch_capacity,
+        "a smaller scratch-fitting batch lost the ordinary useful ceiling or rejected additional streamed writers");
+    require(!admitted_batch_cap(useful.batch, 1, scratch_bytes(1) - 1, 0, scratch_bytes),
+        "compact-input batch admission ignored scratch too small for an ordinary singleton");
+    require(execution_singleton_fallback(100, 60, 10, 30) && !execution_singleton_fallback(100, 60, 11, 30) &&
+        !execution_singleton_fallback(100, 101, 0, 0) && !execution_singleton_fallback(100, 60, 0, 41),
+        "a heterogeneous peer consumed another owner's ordinary singleton fallback headroom");
+    std::array<ExecutionLane, 2> mixed;
+    for (auto& lane : mixed) { lane.work.generation = 1; lane.work.batches = 1; lane.work.known = lane.work.io_overlap = true; }
+    mixed[0].destination = 0; mixed[0].scratch = {{1, 1}}; mixed[0].work.scratch_write = 1000;
+    mixed[1].destination = 1; mixed[1].work.destination = 1000;
+    auto const same_nvme = pipeline_execution_estimate(mixed, 2, 24, 12, 2, true);
+    require(same_nvme.known && same_nvme.completion >= mixed[0].work.scratch_write + mixed[1].work.destination,
+        "NVMe output and another owner's scratch multiplied the same physical resource");
+    mixed[0].scratch = {{1, 2}, {2, 1}, {2, 1}}; mixed[0].parallel_scratch = true;
+    mixed[0].work.scratch_bytes = 3000;
+    auto stripe = [&](long double bandwidth)
+    { return pipeline_execution_estimate(mixed, 2, 24, 12, 3, false, bandwidth).completion; };
+    require(stripe(0) == 1502 && stripe(1) == 3002,
+        "striped execution lost shared destination service or exceeded observed simultaneous bandwidth");
+    mixed[1].work.destination = 0;
+    require(stripe(0) == 502, "two paths to one scratch disk multiplied its parallel service");
+    mixed[0].parallel_scratch = false;
+    require(stripe(0) == 1002, "an unmeasured stripe earned an unobserved bandwidth gain");
+    mixed[0].parallel_scratch = true;
+    mixed[0].scratch.front().transfer_ns = 4000;
+    require(stripe(0) == 4002, "a fall in available scratch bandwidth left the execution estimate unchanged");
+    StreamingInputCohort cohort(3);
+    require(cohort.stream_allowed(0) && !cohort.stream_allowed(1), "cold compact input split an existing cohort");
+    cohort.admit(0, 98, 10, true, 100); cohort.admit(1, 48, 11, false, 110);
+    cohort.complete(0, 98, 1000, 200, 1);
+    require(!cohort.may_admit(2) && !cohort.stream_allowed(1), "compact-input cohort did not drain at durable completion");
+    cohort.complete(1, 48, 500, 300, 0);
+    require(cohort.calibrating() && !cohort.stream_allowed(0) && cohort.may_admit(0) && !cohort.may_admit(2),
+        "compact-input trial skipped its matching ordinary baseline");
+    cohort.admit(0, 98, 10, false, 400); cohort.complete(0, 98, 1000, 600, 0);
+    require(!cohort.may_admit(0) && cohort.may_admit(1), "baseline admitted extra work for an already completed owner");
+    cohort.admit(1, 48, 11, false, 610); cohort.complete(1, 48, 500, 900, 0);
+    require(std::string(cohort.status()) == "accepted" && cohort.stream_allowed(1),
+        "faster durable compact-input cohort was not retained");
+    require(cohort.context_allowed(0, 98, 10) && !cohort.context_allowed(0, 48, 10) &&
+        !cohort.context_allowed(0, 98, 11) && !cohort.context_allowed(2, 98, 10),
+        "learned compact-input retention escaped its owner, group work or physical/options context");
+    StreamingInputCohort slower(1);
+    slower.admit(0, 98, 10, true, 100); slower.complete(0, 98, 1000, 500, 0);
+    slower.admit(0, 98, 10, false, 600); slower.complete(0, 98, 1000, 700, 0);
+    require(std::string(slower.status()) == "rejected" && !slower.stream_allowed(0),
+        "slower compact input was retained after a completed ordinary baseline");
+    StreamingInputCohort changed(1);
+    changed.admit(0, 98, 10, true, 100); changed.complete(0, 98, 1000, 200, 0);
+    changed.admit(0, 48, 10, false, 300);
+    require(std::string(changed.status()) == "uncalibrated" && changed.may_admit(0) && !changed.stream_allowed(0),
+        "different group work manufactured a comparable compact-input baseline");
+    StreamingInputCohort resources(1);
+    resources.admit(0, 98, 10, true, 100); resources.complete(0, 98, 1000, 200, 0);
+    resources.admit(0, 98, 11, false, 300);
+    require(std::string(resources.status()) == "uncalibrated", "different physical context trained compact-input retention");
+    StreamingInputCohort incomplete(1);
+    incomplete.admit(0, 98, 10, true, 100); incomplete.complete(0, 98, 1000, 200, 0);
+    require(std::string(incomplete.status()) == "uncalibrated" && !incomplete.stream_allowed(0),
+        "an unfinished baseline was reported as a learned compact-input gain");
+    incomplete.cancel();
+    require(!incomplete.calibrating() && incomplete.may_admit(0), "cancelled compact-input calibration blocked ordinary progress");
+    StreamingInputCohort failed(1);
+    failed.admit(0, 98, 10, true, 100); failed.complete(0, 1, 10, 200, 0);
+    require(!failed.stream_allowed(0) && std::string(failed.status()) == "uncalibrated",
+        "partial or failed group work trained a complete durable compact-input cohort");
+    StreamingInputCohort preflight(1);
+    preflight.admit(0, 98, 10, true, 100); preflight.complete(0, 98, 1000, 200, 0, false);
+    require(std::string(preflight.status()) == "uncalibrated" && !preflight.stream_allowed(0),
+        "a declined input preflight was reported as a measured streaming cohort");
+    StreamingInputCohort missing_peer(2);
+    missing_peer.admit(0, 98, 10, true, 100, 2); missing_peer.complete(0, 98, 1000, 200, 0);
+    require(std::string(missing_peer.status()) == "uncalibrated" && !missing_peer.stream_allowed(0),
+        "a predicted extra writer that never admitted trained compact-input retention");
+}
+void worker_grants(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    cfg.cpu_scheduler = std::make_shared<CodecScheduler>(4);
+    auto contents = [](fs::path const& path)
+    { auto in = group_tools::input(path.string()); return std::vector<uint8_t>{std::istreambuf_iterator<char>(in), {}}; };
+    std::vector<uint8_t> expected;
+    for (auto const* mode : {"incremental", "merged", "staged"})
+    {
+        auto const path = root / (std::string("worker-grant-") + mode);
+        Construction engine(path.string(), cfg, false, identity(), mode);
+        engine.confirm_identity();
+        auto envelope = cfg; envelope.workers = 4;
+        auto const admitted = engine.memory_for(envelope, 2, false, false);
+        for (unsigned count : {1u, 4u})
+        {
+            engine.set_workers(count, 2, false, admitted);
+            require(engine.config.workers == count && engine.append(input.subspan(count == 1 ? 0 : 2, 2)).accepted,
+                "idle construction could not change its task worker grant");
+        }
+        bool rejected = false;
+        try { engine.set_workers(0, 2, false, admitted); }
+        catch (std::runtime_error const&) { rejected = true; }
+        require(rejected && engine.config.workers == 4, "invalid worker grant changed construction state");
+        engine.finish();
+        auto const bytes = contents(path);
+        if (expected.empty()) expected = bytes;
+        else require(bytes == expected, "task worker grants changed ordinary v2 output bytes");
+    }
+    // A serial merge lease cannot silently acquire the parallel I/O window.
+    auto serial = cfg; serial.workers = 1; serial.io_overlap = true;
+    auto const admitted = MergeEngine::memory_bytes(18, serial, 2);
+    Construction bounded((root / "worker-grant-memory").string(), serial, false, identity(), "merged");
+    auto const before = bounded.config;
+    bool rejected = false;
+    try { bounded.set_workers(4, 2, false, admitted); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected && bounded.config.workers == before.workers,
+        "parallel worker grant exceeded the admitted merge workspace");
+    // A saved arena retains its own map geometry even with a larger runtime
+    // capacity. Worker admission must price that restored geometry.
+    auto const saved_path = root / "worker-grant-restored-arena";
+    {
+        Construction saved(saved_path.string(), cfg, false, identity(), "merged");
+        saved.confirm_identity();
+        require(saved.append(input.subspan(0, 2)).accepted, "worker resume fixture did not stage its prefix");
+    }
+    auto larger = cfg; larger.capacity_bytes = 64ull * 1024 * mib;
+    Construction resumed(saved_path.string(), larger, true, identity(), "merged");
+    auto resumed_grant = larger; resumed_grant.workers = 4;
+    auto const saved_lease = resumed.memory_for(resumed_grant, 2, false, false);
+    require(MergeEngine::memory_bytes(18, larger, 2) > saved_lease,
+        "worker resume fixture did not distinguish saved and maximum arena maps");
+    resumed.confirm_identity();
+    resumed.set_workers(4, 2, false, saved_lease);
+    require(resumed.append(input.subspan(2, 2)).accepted && resumed.finish().members == 4 &&
+        contents(saved_path) == expected, "restored arena could not retune workers within its admitted workspace");
+}
+void cache_frontiers(fs::path const& root, Config cfg)
+{
+    cfg.release_cache = true;
+    auto const path = root / "cache-frontiers.gplot";
+    MergeState arena(path.string(), cfg, false, identity()); arena.confirm();
+    auto record = arena.layout(cfg.window_bytes);
+    uint64_t const block = record.block_bytes;
+    arena.initialize(record, arena.required_bytes(record, 12 * block));
+    auto& source = arena.state.runs[0]; auto& neighbor = arena.state.runs[1];
+    source.count = 1; neighbor.first = 1; neighbor.count = 1;
+    arena.state.run_count = 2; arena.state.members = arena.state.target.group_size = 2;
+    MergeState::Writer output(arena, source, cfg.window_bytes), other(arena, neighbor, cfg.window_bytes);
+    std::vector<uint8_t> expected(size_t(3 * block + 41));
+    for (size_t i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i * 17 + i / block);
+    auto const bytes = std::span<uint8_t const>(expected);
+    output.write(bytes.first(size_t(block))); output.flush(); arena.checkpoint("cache-first"); output.evict();
+    // Interleave a second stream so the physical source map is fragmented.
+    other.write(bytes.first(size_t(block + 17))); other.flush();
+    output.write(bytes.subspan(size_t(block), size_t(block + 29))); output.flush();
+    arena.checkpoint("cache-second"); output.evict(); other.evict();
+    output.write(bytes.subspan(size_t(2 * block + 29))); output.flush();
+    arena.checkpoint("cache-third"); output.evict(); output.evict();
+
+    MergeState::Reader input(arena, source, 2 * block);
+    std::vector<uint8_t> actual(expected.size());
+    input.read(std::span(actual).first(size_t(block + 17)));
+    uint64_t const read_before = arena.stats.read_bytes;
+    for (uint64_t offset : {block + 31, 2 * block - 4, 2 * block + 8})
+    {
+        uint64_t value = 0; std::memcpy(&value, expected.data() + offset, sizeof(value));
+        require(input.value_at<uint64_t>(offset) == value, "fragmented run lookahead changed packet bytes");
+    }
+    auto const cached = input.peek();
+    require(input.position() == block + 17 && cached.size() == block - 17 &&
+        arena.stats.read_bytes == read_before + 2 * sizeof(uint64_t) &&
+        std::equal(cached.begin(), cached.end(), expected.begin() + size_t(block + 17)),
+        "run lookahead moved its consumer or replaced its unconsumed cache");
+    uint32_t const retired = source.head;
+    arena.release(source, input.position()); arena.checkpoint("cache-consumed");
+    // Cache advice must use the reader's saved physical map after retirement,
+    // and leave its separately prefetched, unconsumed bytes available.
+    input.evict(input.position());
+    require(arena.allocate() == retired, "cache fixture did not recycle its consumed source");
+    arena.value(uint64_t(retired) * block, uint64_t(0x12345678));
+    input.read(std::span(actual).subspan(size_t(block + 17)));
+    require(actual == expected && !input.remaining(), "cache frontier changed fragmented input bytes");
+    input.evict(input.position()); input.evict(input.position());
+    bool rejected = false;
+    try { input.evict(input.position() - 1); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "merge cache frontier moved backwards");
+}
+void construction_histories()
+{
+    ConstructionHistories histories(8);
+    ConstructionContext context{{"8:16"}, 18, 2, 0, 3, 536870912, 1048576, 16777216, 8388608, 2, true, true, true};
+    auto first = histories.find(context);
+    require(first && first->snapshot().count == 0 && first->snapshot().shapes.count == 0,
+            "a new physical drive inherited unrelated construction observations");
+    ConstructionSample sample{1000, 0, 0, 0, 0, 1, 0, 100, 1, 1000};
+    first->history.add(sample);
+    require(histories.find(context) == first && histories.find(context)->snapshot().count == 1,
+            "compatible groups on the same physical drive lost completed evidence");
+    uint64_t const before_lookup = histories.memory_bytes();
+    auto unobserved = context; unobserved.workers = 1;
+    require(histories.find(context, false) == first && !histories.find(unobserved, false) &&
+        histories.memory_bytes() == before_lookup,
+        "candidate history lookup allocated or crossed the worker compatibility boundary");
+    auto other = context; other.drives = {"8:32"};
+    require(histories.find(other) != first && histories.find(other)->snapshot().count == 0,
+            "unrelated physical drives shared construction observations");
+    other.drives.clear(); require(!histories.find(other), "unknown topology shared construction history");
+    other = context; other.k = 20;
+    require(histories.find(other) != first, "different plot parameters shared construction observations");
+    other = context; other.compact = false;
+    require(histories.find(other) != first, "different producer settings shared construction observations");
+    other = context; other.checkpoint /= 2;
+    require(histories.find(other) != first, "different explicit I/O settings shared construction observations");
+    other = context; other.scratch_drives = {"8:48"};
+    auto const demand = histories.find(other);
+    require(demand != first, "external scratch shared destination-only construction observations");
+    auto phase = other; phase.workers = 1;
+    uint64_t const demand_memory = histories.memory_bytes();
+    require(histories.reuse_external(demand, phase) == demand && !histories.find(phase, false) &&
+        histories.memory_bytes() == demand_memory,
+        "changed phase grant lost compatible CPU evidence or weakened ordinary worker isolation");
+    std::array<ConstructionContext, 8> incompatible{phase, phase, phase, phase, phase, phase, phase, phase};
+    incompatible[0].scratch_drives = {"8:64"}; incompatible[1].drives.clear();
+    incompatible[2].k = 20; incompatible[3].max_ram /= 2; incompatible[4].io_overlap = false;
+    incompatible[5].window /= 2; incompatible[6].checkpoint /= 2; incompatible[7].codec /= 2;
+    for (auto const& candidate : incompatible)
+        require(!histories.reuse_external(demand, candidate), "incompatible external phase context reused CPU evidence");
+
+    auto cfg = configuration(); cfg.workers = 1;
+    ConstructionForecast forecast;
+    forecast.batches = 4; forecast.incremental.codec = 100;
+    forecast.merged.codec = 10; forecast.merged.syncs = 2;
+    forecast.finalization.codec = forecast.packing.codec = 8;
+    forecast.finalization.syncs = forecast.layout.syncs = 2;
+    require(prefer_merged(forecast, cfg, first->history), "completed codec evidence did not price merged work");
+    auto const codec = construction_rates(first->history).codec;
+    ConstructionSample layout{100000, 0, 0, 100000, 0, 1, 1};
+    first->history.layout.add(layout);
+    require(!prefer_merged(forecast, cfg, first->history) && construction_rates(first->history).codec == codec &&
+        construction_rates(first->history.layout).codec == 0,
+        "layout timing entered the codec model or failed to price finalization");
+    first->history.layout = {};
+    auto packing = sample; packing.codec_ns *= 100; packing.elapsed_ns = packing.codec_ns;
+    first->history.packing.add(packing);
+    require(!prefer_merged(forecast, cfg, first->history) && construction_rates(first->history).codec == codec,
+        "packing throughput failed to price its own codec work separately");
+
+    auto const ordinary = construction_forecast(18, cfg, 1, 654187, 1, 64);
+    ConstructionHistory initial_history; initial_history.add(sample);
+    auto const base_cost = construction_cost(ordinary.merged, cfg, construction_rates(initial_history));
+    require(std::abs(construction_merged_cost(ordinary, cfg, initial_history) - base_cost) <=
+        std::max(1.0L, std::abs(base_cost)) * std::numeric_limits<long double>::epsilon() * 16,
+        "phase separation changed the first group's unobserved finalization estimate");
+
+    auto const unknown = construction_forecast(18, cfg, 0, 0, 1, 64);
+    auto const inherited = construction_forecast(18, cfg, 0, 0, 1, 64, 654187);
+    require(!unknown.batches && inherited.batches && inherited.members == 64 && inherited.incremental.read > 0,
+        "fresh-group forecasting ignored compatible canonical size evidence");
+    auto const single = construction_forecast(18, cfg, 0, 0, 64, 64, 654187);
+    require(single.batches == 1 && single.incremental.read == 0 && !prefer_merged(single, cfg, first->history),
+        "inherited history changed fresh single-pass construction admission");
+    auto fresh_config = cfg; fresh_config.checkpoint_bytes = 16 * 1024 * 1024;
+    auto const fresh = construction_forecast(18, fresh_config, 0, 0, 1, 1, 654187);
+    require(fresh.incremental.syncs == 11,
+        "fresh ordinary forecast imposed a nonexistent old-source checkpoint frontier");
+    auto const full_first = construction_forecast(18, fresh_config, 0, 0, 9, 10, 654187);
+    auto const short_first = construction_forecast(18, fresh_config, 0, 0, 9, 10, 654187, true);
+    require(short_first.incremental_batches == 2 && full_first.incremental_batches == 2 &&
+        short_first.incremental.read == 2 * 654187 && full_first.incremental.read == 18 * 654187 &&
+        short_first.incremental.write < full_first.incremental.write &&
+        short_first.incremental.codec < full_first.incremental.codec &&
+        short_first.merged.read == full_first.merged.read && short_first.merged.write == full_first.merged.write,
+        "automatic first-batch order was omitted from ordinary costs or changed merged run balancing");
+    auto const continued = construction_forecast(18, fresh_config, 1, 654187, 9, 19, 0, true);
+    auto const fixed = construction_forecast(18, fresh_config, 1, 654187, 9, 19);
+    require(continued.incremental.read == fixed.incremental.read && continued.incremental.write == fixed.incremental.write &&
+        construction_initial_batch(UINT16_MAX, 9) == 9 && construction_initial_batch(10, 0) == 0 &&
+        construction_initial_batch(9, 9) == 9,
+        "batch forecasting changed a complete batch or unbounded group");
+    auto const remainder = construction_forecast(18, fresh_config, 4, 4 * 654187, 9, 19, 0, true);
+    auto const full_remainder = construction_forecast(18, fresh_config, 4, 4 * 654187, 9, 19);
+    require(remainder.incremental_batches == 2 && full_remainder.incremental_batches == 2 &&
+        remainder.incremental.read == 28 * 654187 && full_remainder.incremental.read == 34 * 654187 &&
+        remainder.incremental.write < full_remainder.incremental.write &&
+        remainder.incremental.codec < full_remainder.incremental.codec &&
+        remainder.merged.read == full_remainder.merged.read && remainder.merged.write == full_remainder.merged.write,
+        "continued group forecast did not put the short batch before repeated prefix work");
+    // Independently minimize total written membership over every possible
+    // partition. This includes odd caps and nonempty starting groups.
+    for (uint16_t prefix : {0, 1, 7}) for (uint16_t cap = 1; cap <= 17; ++cap)
+    {
+        std::array<uint64_t, 65> best{};
+        for (uint16_t remaining = 1; remaining < best.size(); ++remaining)
+        {
+            best[remaining] = UINT64_MAX;
+            for (uint16_t count = 1; count <= std::min(remaining, cap); ++count)
+                best[remaining] = std::min(best[remaining], best[remaining - count] + prefix + remaining);
+            uint64_t written = 0, members = prefix;
+            uint16_t last = 0;
+            for (uint16_t left = remaining; left;)
+            {
+                uint16_t const count = construction_initial_batch(left, std::min(left, cap));
+                members += count; written += members; left -= count; last = count;
+            }
+            require(written == best[remaining], "short-first batches did not minimize repeated prefix writes");
+            require(last == std::min(remaining, cap), "short-first batches did not retain the largest final batch");
+        }
+    }
+    auto clipped = fresh_config; clipped.capacity_bytes = 9 * 654187;
+    auto const capacity = construction_forecast(18, clipped, 0, 0, 9, 10, 654187, true);
+    require(capacity.members == 9 && capacity.batches == 1 && capacity.incremental_batches == 2,
+        "capacity-limited forecasting lost the distinct incremental and merged schedules");
+    ConstructionSample shape; shape.member_bytes = 654187; shape.chunk_bytes = 4096;
+    for (size_t i = 0; i < first->history.shapes.samples.size(); ++i) first->history.shapes.add(shape);
+    auto outlier = shape; outlier.member_bytes *= 100;
+    first->history.shapes.add(outlier);
+    require(construction_shape(first->history.shapes) == shape.member_bytes,
+        "one skewed group replaced the canonical size history");
+    for (size_t i = 0; i < first->history.shapes.samples.size(); ++i) first->history.shapes.add(outlier);
+    require(construction_shape(first->history.shapes) == outlier.member_bytes,
+        "canonical size history did not adapt to sustained change");
+}
+void phase_worker_demand()
+{
+    ConstructionHistory history;
+    unsigned const workers = 8, neutral = workers / 2;
+    require(external_staging_workers(workers, history) == neutral && !external_staging_workers(1, history),
+        "unobserved phase demand changed the conservative worker split");
+    ConstructionSample busy; busy.elapsed_ns = 1000000; busy.workers = 4;
+    busy.cpu_ns = busy.elapsed_ns * busy.workers; busy.cpu_measured = true;
+    auto idle = busy; idle.cpu_ns = 1;
+    for (unsigned i = 0; i < 4; ++i)
+    { history.external_staging.add(busy); history.external_packing.add(idle); }
+    require(external_staging_workers(workers, history) == neutral + 1,
+        "sustained measured staging demand did not receive its bounded extra worker");
+    history.overlap_workers = workers; history.overlap_staging_workers = neutral + 1;
+    history.external_packing.add(busy);
+    require(external_staging_workers(workers, history) == neutral + 1,
+        "one conflicting sample defeated phase-demand hysteresis");
+    for (unsigned i = 0; i < 4; ++i)
+    { history.external_staging.add(idle); history.external_packing.add(busy); }
+    require(external_staging_workers(workers, history) == neutral - 1,
+        "sustained opposite phase demand did not reverse the bounded grant");
+    auto missing = busy; missing.cpu_measured = false; history.external_staging.add(missing);
+    require(external_staging_workers(workers, history) == neutral,
+        "unsupported thread CPU evidence masqueraded as zero demand");
+}
+void joined_worker_cpu(Members input)
+{
+    Member compact(std::vector<uint64_t>(input[0].raw().begin(), input[0].raw().end())); compact.compact(18);
+    std::array<FragmentRegion, 1> regions{compact.view().region(0)};
+    std::array<ChunkInput, 1> tasks{ChunkInput{0, {}, 0, regions}};
+    std::array<ChunkSummary, 1> summaries;
+    std::array<uint64_t, 1> lengths;
+    ParallelEncoder encoder(18, 2, 8 * 1024 * 1024);
+    encoder.summarize(tasks, summaries); auto const summarized = encoder.cpu_time();
+    encoder.encode(tasks, lengths); auto const encoded = encoder.cpu_time();
+    bool const supported = thread_cpu_nanoseconds().has_value();
+    require(encoded.measured == supported && (!supported ||
+        (summarized.nanoseconds && encoded.nanoseconds > summarized.nanoseconds && lengths[0])),
+        "joined summary/encoding jobs omitted CPU evidence or reported unsupported zero demand");
+}
+void construction_selection()
+{
+    auto cfg = configuration();
+    cfg.capacity_bytes = 256ull * 1024 * 1024; cfg.window_bytes = 1024 * 1024;
+    cfg.checkpoint_bytes = 16 * 1024 * 1024; cfg.workers = 4;
+    require(!prefer_merged(construction_forecast(18, cfg, 1, 654187, 64, 64), cfg),
+            "one remaining batch selected merging");
+    require(prefer_merged(construction_forecast(18, cfg, 1, 654187, 1, 64), cfg),
+            "many repeated rewrites did not select merging");
+    auto short_growth = construction_forecast(18, cfg, 1, 654187, 1, 3);
+    ConstructionSample sync_bound{100000000, 0, 1000000, 99000000, 0, 654187, 11, 654187, 4};
+    ConstructionSample codec_bound{100000000, 0, 1000000, 0, 0, 654187, 11, 654187, 4};
+    // Parallel joining saves codec work even for this short growth, while
+    // its checkpoint saving is too small to justify a sync-bound switch.
+    require(!prefer_merged(short_growth, cfg, sync_bound) && prefer_merged(short_growth, cfg, codec_bound),
+            "construction choice ignored measured storage and codec costs");
+    cfg.window_bytes = 16 * 1024 * 1024; cfg.capacity_bytes = 64 * 1024 * 1024;
+    require(!prefer_merged(construction_forecast(18, cfg, 1, 654187, 1, 64), cfg),
+            "construction choice ignored merge reserve");
+    cfg.window_bytes = 1024 * 1024; cfg.capacity_bytes = 128ull * 1024 * 1024 * 1024;
+    require(!prefer_merged(construction_forecast(28, cfg, 1, 1000000000, 1, 5), cfg) &&
+        prefer_merged(construction_forecast(28, cfg, 1, 1000000000, 1, 64), cfg),
+        "k28 construction choice lost the short/long growth distinction");
+    require(prefer_merged(construction_forecast(28, cfg, 60, 60000000000, 1, 64), cfg),
+            "construction choice ignored the existing ordinary prefix");
+    auto const two = construction_forecast(28, cfg, 1, 1000000000, 1, 64);
+    cfg.merge_inputs = 4;
+    auto const four_way = construction_forecast(28, cfg, 1, 1000000000, 1, 64);
+    require(four_way.merged.read < two.merged.read && four_way.merged.write < two.merged.write,
+            "four-input forecast did not reduce merge traffic");
+    uint64_t const widest = 16 * 1024 * 1024;
+    require(four_input_candidate(cfg, true, true, widest, 0) &&
+        !four_input_candidate(cfg, false, false, widest, 4) &&
+        !four_input_candidate(cfg, false, true, widest, 4),
+        "merge input selection ignored device evidence or rotating preread width");
+    cfg.window_bytes = widest;
+    require(!four_input_candidate(cfg, false, true, widest, 0) &&
+        four_input_candidate(cfg, false, true, widest, 1),
+        "rotating merge selection ignored completed timings");
+    cfg.merge_inputs = 2;
+    auto const retained_two = construction_forecast(28, cfg, 10, 10000000000ull, 9, 64);
+    cfg.merge_inputs = 4;
+    auto const retained_four = construction_forecast(28, cfg, 10, 10000000000ull, 9, 64);
+    require(retained_two.merged.read == retained_four.merged.read &&
+        retained_two.merged.write == retained_four.merged.write,
+        "final reader retention still depended on compaction fan-in");
+    // With sixteen retained readers, this larger group saves enough compaction
+    // to clear the switching margin. Price that against smaller reader refills.
+    cfg.capacity_bytes = 512ull * 1024 * 1024 * 1024;
+    cfg.merge_inputs = 2;
+    auto const hdd_two = construction_forecast(28, cfg, 10, 10000000000ull, 9, 384);
+    cfg.merge_inputs = 4;
+    auto const hdd_four = construction_forecast(28, cfg, 10, 10000000000ull, 9, 384);
+    ConstructionSample streaming;
+    streaming.elapsed_ns = 2000000000; streaming.read_ns = streaming.write_ns = 1000000000;
+    streaming.read_bytes = streaming.written_bytes = 100 * widest;
+    streaming.read_calls = streaming.write_calls = 100; streaming.workers = cfg.workers;
+    ConstructionHistory streaming_history; streaming_history.add(streaming);
+    require(prefer_four_inputs(hdd_four, hdd_two, cfg, streaming_history),
+        "rotating merge selection ignored substantial sequential traffic savings");
+    auto latency = streaming;
+    latency.read_ns *= 10; latency.read_bytes *= 8; latency.write_ns /= 100;
+    latency.elapsed_ns = latency.read_ns + latency.write_ns;
+    ConstructionHistory latency_history; latency_history.add(latency);
+    require(!prefer_four_inputs(hdd_four, hdd_two, cfg, latency_history) &&
+        !prefer_four_inputs(hdd_two, hdd_two, cfg, streaming_history),
+        "rotating merge selection ignored refill cost or its saving margin");
+    ConstructionHistory history;
+    for (unsigned i = 0; i < 4; ++i) history.add(sync_bound);
+    auto const stable = construction_rates(history);
+    auto delayed = sync_bound; delayed.sync_ns *= 100; delayed.elapsed_ns *= 100;
+    history.add(delayed);
+    require(construction_rates(history).sync == stable.sync, "one delayed flush replaced the timing history");
+    for (unsigned i = 0; i < 8; ++i) history.add(codec_bound);
+    require(construction_rates(history).sync == 0, "timing history did not adapt to sustained change");
+    cfg.capacity_bytes = 64 * 1024 * 1024 / 3; cfg.window_bytes = 16 * 1024 * 1024;
+    auto const oversized = construction_forecast(18, cfg, 1, 640000, 1, 16);
+    cfg.window_bytes = 4 * 1024 * 1024;
+    auto const fitting = construction_forecast(18, cfg, 1, 640000, 1, 16);
+    require(fitting.incremental.syncs < oversized.incremental.syncs,
+            "ordinary forecast ignored a redo window that cannot fit near capacity");
+    cfg.window_bytes = 65536; cfg.checkpoint_bytes = 16 * 1024 * 1024;
+    cfg.capacity_bytes = 128ull * 1024 * 1024 * 1024;
+    auto const large_blocks = construction_forecast(18, cfg, 1, 654187, 1, 16);
+    cfg.capacity_bytes = 64 * 1024 * 1024;
+    auto const small_blocks = construction_forecast(18, cfg, 1, 654187, 1, 16);
+    require(small_blocks.finalization.syncs > large_blocks.finalization.syncs,
+            "layout forecast ignored dependent moves between smaller blocks");
+    cfg.window_bytes = 16 * 1024 * 1024; cfg.capacity_bytes = 128ull * 1024 * 1024 * 1024;
+    cfg.checkpoint_bytes = 256 * 1024 * 1024;
+    auto const block = MergeEngine::block_bytes(cfg), memory = MergeEngine::memory_bytes(28, cfg, 64);
+    auto const short_transaction = construction_forecast(28, cfg, 1, 1000000000, 1, 64);
+    cfg.checkpoint_bytes = 1024 * 1024 * 1024;
+    auto const long_transaction = construction_forecast(28, cfg, 1, 1000000000, 1, 64);
+    require(block == 256 * 1024 * 1024 && MergeEngine::block_bytes(cfg) == block &&
+        MergeEngine::memory_bytes(28, cfg, 64) == memory,
+        "longer merge transactions enlarged blocks or codec memory");
+    require(long_transaction.minimum_merge_bytes > short_transaction.minimum_merge_bytes &&
+        long_transaction.merged.syncs < short_transaction.merged.syncs,
+        "checkpoint forecast ignored the reserve and sync tradeoff");
+    auto const rates = construction_rates(sync_bound);
+    require(construction_cost(long_transaction.merged, cfg, rates) < construction_cost(short_transaction.merged, cfg, rates),
+        "checkpoint selection ignored measured durability cost");
+    cfg.capacity_bytes = 7ull * 1024 * 1024 * 1024 / 2;
+    auto const oversized_transaction = construction_forecast(28, cfg, 1, 1000000000, 1, 8);
+    cfg.checkpoint_bytes = 256 * 1024 * 1024;
+    auto const fitting_transaction = construction_forecast(28, cfg, 1, 1000000000, 1, 8);
+    require(oversized_transaction.minimum_merge_bytes > cfg.capacity_bytes &&
+        fitting_transaction.minimum_merge_bytes <= cfg.capacity_bytes &&
+        !prefer_merged(oversized_transaction, cfg, sync_bound),
+        "longer checkpoint bypassed merge space admission");
+}
+void external_batch_selection()
+{
+    using namespace grow_controller_test;
+    Arguments args; args.batch = 8; args.member_storage = "compact";
+    auto const requested = identity_from(identity());
+    Backend backend; backend.mode = "gpu"; backend.generation_overlap = true;
+    backend.generated_members = 8; backend.generation_ns = 8000000000ull;
+    // No GPU is constructed or called. The controller uses its real member
+    // bound and a modeled producer peak to exercise the actual policy helper.
+    Producer producer{requested, nullptr, backend, args, args.max_ram, mib, 0};
+    auto const storage = member_storage_bound(args, requested);
+    producer.budget = sum(sum(producer.fixed, producer.next_peak(8)), product(7, storage));
+    group_grow::ExternalEngine::BatchResources resources;
+    resources.members = 8; resources.runs = resources.packets = 1;
+    resources.bytes = 8 * mib; resources.source_bytes = mib / 16;
+    resources.packet_bytes = 8; resources.readers = 64;
+    auto cfg = configuration(); cfg.window_bytes = 16 * mib;
+    ExternalBatchHistory history;
+    auto select = [&](ExternalBatchHistory& observations, uint16_t maximum = 64, uint64_t retained = 0)
+    { return external_batch_size(observations, resources, producer, cfg, maximum, 8, retained, 0); };
+    auto sample = [](uint64_t seconds)
+    {
+        group_grow::ConstructionSample value; value.elapsed_ns = seconds * 1000000000ull;
+        value.written_bytes = 8 * mib; value.codec_bytes = 8 * mib;
+        return value;
+    };
+    auto add = [&](ExternalBatchHistory& observations, uint16_t count, uint64_t planning, uint64_t encoding)
+    { observations.add(count, sample(planning), sample(encoding)); };
+    require(select(history) == 8 && history.ceiling == 8 && !history.half_attempted,
+        "external batching probed before observing its maximum batch");
+    add(history, 8, 8, 8);
+    auto clone = history;
+    require(select(clone) == 4 && clone.half_attempted && !history.half_attempted,
+        "ambiguous external planning did not permit one isolated half-batch trial");
+    require(select(clone) == 8 && clone.half_attempted,
+        "an unobserved or rejected external trial was repeated");
+    require(select(history) == 4, "external batching did not try its fitting overlap candidate");
+    for (unsigned i = 0; i < 4; ++i) add(history, 4, 4, 4);
+    require(select(history) == 4 && history.selected == 4,
+        "measured external overlap did not select the faster batch");
+    add(history, 4, 1000, 1000);
+    require(select(history) == 4, "one external timing outlier overturned the measured median");
+    auto hysteresis = history; hysteresis.sizes[1].planning = {}; hysteresis.sizes[1].encoding = {};
+    add(hysteresis, 4, 5, 5);
+    auto undecided = hysteresis; undecided.selected = 8;
+    require(select(hysteresis) == 4 && select(undecided) == 8,
+        "external batch selection lost its improvement margin or incumbent hysteresis");
+    hysteresis.sizes[1].planning = {}; hysteresis.sizes[1].encoding = {};
+    add(hysteresis, 4, 12, 12);
+    require(select(hysteresis) == 8, "slower measured external half batches were retained");
+    auto serial = history; serial.sizes[0].planning = {}; serial.sizes[0].encoding = {};
+    serial.sizes[1].planning = {}; serial.sizes[1].encoding = {}; serial.half_attempted = false;
+    add(serial, 8, 64, 1);
+    require(select(serial) == 8 && !serial.half_attempted,
+        "serial external scan overhead was treated as free codec throughput");
+
+    auto guarded = history; guarded.half_attempted = false;
+    guarded.sizes[1].planning = {}; guarded.sizes[1].encoding = {};
+    resources.readers = 8;
+    require(select(guarded) == 8 && !guarded.half_attempted,
+        "half batching crossed the external retained-reader limit");
+    resources.readers = 64;
+    auto const original = resources;
+    resources.members = resources.packets = 64; resources.source_bytes = 1;
+    require(select(guarded, 128) == 8 && !guarded.half_attempted,
+        "half batching reduced the descriptor-limited final packing window");
+    resources = original;
+    auto refill = guarded; refill.sizes[0].encoding = {};
+    auto buffered = refill;
+    auto slow_write = sample(8); slow_write.write_ns = slow_write.elapsed_ns; slow_write.write_calls = 1;
+    buffered.sizes[0].encoding.add(slow_write);
+    require(select(buffered) == 4 && buffered.half_attempted,
+        "buffered write waits were charged as unmeasured reader refill latency");
+    auto larger_payload = buffered;
+    auto expanded = sample(4); expanded.codec_bytes = 128 * mib;
+    larger_payload.add(4, sample(4), expanded);
+    require(select(larger_payload) == 8,
+        "smaller batches ignored their observed additional final packing input");
+    auto slow_read = sample(8); slow_read.read_ns = slow_read.elapsed_ns;
+    slow_read.read_bytes = 8 * mib; slow_read.read_calls = 1;
+    refill.sizes[0].encoding.add(slow_read);
+    require(select(refill) == 8 && !refill.half_attempted,
+        "extra external packet reads and reader refills were omitted");
+    auto const budget = producer.budget;
+    producer.budget = sum(sum(producer.fixed, producer.next_peak(8)), product(6, storage));
+    require(select(guarded) == 8 && !guarded.half_attempted,
+        "external overlap admitted two batches without their complete member headroom");
+    producer.budget = budget;
+    require(select(guarded, 64, storage) == 8 && !guarded.half_attempted,
+        "external overlap ignored another destination's retained member");
+    args.batch = 2;
+    require(select(guarded) == 2 && !guarded.half_attempted,
+        "an explicit upper bound already fitting two batches was needlessly halved");
+    args.batch = 8;
+    require(select(guarded, uint16_t(resources.members + 3)) == 3,
+        "external batching split or exceeded the final partial batch");
+    for (auto const& mode : {"cpu", "idle", "fixture"})
+    {
+        backend.mode = mode;
+        require(select(guarded) == 8 && !guarded.half_attempted,
+            "external batching assumed an available GPU for another backend");
+    }
+    backend.mode = "gpu"; backend.generation_overlap = false;
+    require(select(guarded) == 8 && !guarded.half_attempted,
+        "external batching ignored effective overlap off");
+    backend.generation_overlap = true; args.generation_overlap = false;
+    require(select(guarded) == 8, "external batching ignored explicit overlap off");
+    args.generation_overlap = true; args.member_storage = "raw";
+    require(select(guarded) == 8, "external batching changed raw borrowed-output admission");
+
+    // A short group cannot train its own smaller-batch trial after its first
+    // full append. Compatible successor history must reach the next group's
+    // first selection, without changing the cold group's large-batch policy.
+    args.member_storage = "compact"; args.batch = 9;
+    backend.generated_members = 9; backend.generation_ns = 18000000000ull;
+    producer.budget = sum(sum(producer.fixed, producer.next_peak(0)), product(8, storage));
+    resources = {}; resources.packet_bytes = 8; resources.readers = 64;
+    ExternalBatchHistory successor;
+    auto next = [&](ExternalBatchHistory& observations)
+    { return external_batch_size(observations, resources, producer, cfg, 16, 9, 0, 0); };
+    require(next(successor) == 9 && !successor.half_attempted,
+        "cold short successor selected a smaller batch without completed evidence");
+    add(successor, 9, 9, 9);
+    successor.source_members = 9; successor.source_bytes = 9 * (mib / 16);
+    resources.members = 9; resources.runs = resources.packets = 1;
+    resources.bytes = 9 * mib; resources.source_bytes = successor.source_bytes;
+    require(next(successor) == 7 && !successor.half_attempted && successor.ceiling == 9,
+        "short successor lost its large baseline while draining its final partial batch");
+    resources = {}; resources.packet_bytes = 8; resources.readers = 64;
+    auto missing_shape = successor; missing_shape.source_members = 0; missing_shape.source_bytes = 0;
+    require(next(missing_shape) == 9 && !missing_shape.half_attempted,
+        "fresh successor invented a source shape for its packing forecast");
+    require(next(successor) == 4 && successor.half_attempted,
+        "compatible short successor could not try overlap at its first append");
+    require(next(successor) == 9,
+        "fresh successor repeated an interrupted trial without a completed smaller append");
+    add(successor, 4, 4, 4);
+    require(next(successor) == 4 && successor.selected == 4,
+        "completed short-successor evidence did not retain its faster batch");
+    successor.sizes[1].planning = {}; successor.sizes[1].encoding = {};
+    add(successor, 4, 9, 9);
+    require(next(successor) == 9 && successor.selected == 9,
+        "more successor overlap concealed the total cost of slower repeated appends");
+    successor.prepare(8);
+    require(!successor.half_attempted && !successor.source_members && !successor.source_bytes &&
+        !successor.sizes[0].planning.count && !successor.sizes[1].encoding.count,
+        "changed successor ceiling retained incompatible timing or shape evidence");
+}
+
+void external_finish_grants(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto directory = root / "packing-grant-scratch"; fs::create_directory(directory);
+    ExternalConfig external; external.scratch.push_back({directory.string(), 128 * mib}); external.segment_bytes = mib;
+    cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    auto const path = root / "packing-grant", reference = root / "packing-grant-reference";
+    direct(reference, input.subspan(0, 2), cfg);
+    uint64_t packing = 0;
+    {
+        Construction engine(path.string(), cfg, false, identity(), "external", external); engine.confirm_identity();
+        require(engine.append(input.subspan(0, 2)).accepted, "packing grant fixture did not stage");
+        auto const staging = engine.memory_bytes(2, true);
+        require(staging >= Engine::memory_bytes(18, cfg, 2, 0, 2),
+            "staging released the ordinary fallback envelope before terminal packing");
+        {
+            auto prepared = engine.external->prepare_input(2, fragment_bound(identity_from(identity()).params) / sizeof(uint64_t));
+            require(bool(prepared), "worker grant fixture could not reserve bounded input");
+            auto requested = engine.config; requested.workers = cfg.workers + 1;
+            auto const workspace = engine.memory_for(requested, 2, true, false);
+            auto const input_bytes = ExternalEngine::input_memory_bytes(cfg, 2);
+            require(staging < workspace && workspace <= sum(staging, input_bytes),
+                "worker grant fixture did not distinguish codec and live input reservations");
+            bool rejected = false;
+            try { engine.set_workers(requested.workers, 2, true, staging); }
+            catch (std::runtime_error const&) { rejected = true; }
+            require(rejected && engine.config.workers == cfg.workers && engine.member_count() == 2,
+                "worker retuning consumed live input's separate workspace grant");
+            engine.set_workers(requested.workers, 2, true, workspace);
+            engine.set_workers(cfg.workers, 2, true, staging);
+        }
+        OrderedWriter writer([] {});
+        auto transition = writer.submit([&] { engine.prepare_finish(); }); transition.get();
+        packing = engine.memory_bytes(2, true);
+        require(packing < staging && packing == engine.external->required_memory(2) && !engine.can_append() &&
+            ExternalEngine::inspect(path.string()).finishing,
+            "joined durable packing transition did not return its released RAM grant");
+        auto requested = engine.config; requested.workers = cfg.workers + 1;
+        auto const retuned = engine.memory_for(requested, 2, true, false);
+        require(retuned < staging, "packing worker metadata reacquired the ordinary fallback envelope");
+        engine.set_workers(requested.workers, 2, true, retuned);
+        require(engine.memory_for(engine.config, 2, true, false) <= retuned,
+            "packing worker retune reacquired an unrelated ordinary envelope");
+        bool rejected = false;
+        try { (void)engine.finish_staging(); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected && engine.external && engine.terminal_packing && engine.memory_bytes(2, true) == retuned,
+            "terminal packing reopened ordinary admission after giving up its workspace grant");
+    }
+    Construction resumed(path.string(), cfg, true, identity(), "external", external); resumed.confirm_identity();
+    require(resumed.memory_bytes(2, true) >= packing,
+        "recovered controller skipped its ordinary handoff reservation");
+    resumed.prepare_finish();
+    require(resumed.memory_bytes(2, true) == packing && resumed.finish().members == 2,
+        "recovered terminal pack did not reacquire its explicit live phase grant");
+    auto contents = [](fs::path const& path)
+    { auto in = group_tools::input(path.string()); return std::vector<uint8_t>{std::istreambuf_iterator<char>(in), {}}; };
+    require(contents(path) == contents(reference), "phase RAM grants changed ordinary v2 output bytes");
+    resumed.release_external();
+    auto source = std::make_shared<SharedConstructionHistory>();
+    Construction trained((root / "packing-grant-trained").string(), cfg, false, identity(), "external", external);
+    trained.attach_history(source); trained.confirm_identity();
+    require(trained.append(input.subspan(0, 2)).accepted, "CPU phase observation fixture did not stage");
+    trained.prepare_finish(); trained.finish();
+    auto const observed = source->snapshot();
+    bool const supported = thread_cpu_nanoseconds().has_value();
+    require(observed.external_staging.count == 1 && observed.external_packing.count == 1 &&
+        observed.external_staging.samples[0].cpu_measured == supported && observed.external_packing.samples[0].cpu_measured == supported &&
+        (!supported || (observed.external_staging.samples[0].cpu_ns && observed.external_packing.samples[0].cpu_ns)) &&
+        !observed.count && !observed.contributions.count && !observed.packing.count &&
+        observed.execution_contributions.count && observed.execution_packing.count &&
+        observed.execution_contributions.samples[0].io_attributed && observed.execution_packing.samples[0].io_attributed,
+        "joined external CPU phases omitted attributed execution evidence or contaminated ordinary append history");
+    finish_with_cpu_record(trained, false, false);
+    require(source->snapshot().external_packing.count == observed.external_packing.count,
+        "zero-work publication added a whole-pack observation");
+    trained.release_external();
+
+    // Interrupt after the first emitted chunk is durably checkpointed. Its
+    // resumed suffix still reports CPU work, but cannot train a whole pack.
+    auto const interrupted = root / "packing-grant-interrupted";
+    auto const child = ::fork(); require(child >= 0, "packing CPU recovery fork failed");
+    if (!child)
+    {
+        ::setenv("XCHPLOT2_GROW_FAILPOINT", "external-pack-after-checkpoint", 1);
+        auto frequent = cfg; frequent.checkpoint_bytes = 1;
+        Construction engine(interrupted.string(), frequent, false, identity(), "external", external);
+        engine.confirm_identity(); require(engine.append(input.subspan(0, 2)).accepted, "packing CPU recovery input did not stage");
+        engine.prepare_finish(); engine.finish(); std::_Exit(0);
+    }
+    int status = 0;
+    require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+        "packing CPU recovery did not interrupt an emitted prefix");
+    auto partial_history = std::make_shared<SharedConstructionHistory>();
+    Construction partial(interrupted.string(), cfg, true, identity(), "external", external);
+    partial.attach_history(partial_history); partial.confirm_identity();
+    require(partial.staged_recovery && !partial.external->can_append(), "packing CPU recovery did not restore the interrupted pack phase");
+    partial.prepare_finish();
+    require(!partial.fresh_external_pack && finish_with_cpu_record(partial, false).members == 2 &&
+        partial.external->packing_body_ns() && !partial_history->snapshot().external_packing.count &&
+        !partial_history->snapshot().shapes.count && contents(interrupted) == contents(reference),
+        "partial packing trained a whole-phase rate, omitted runtime work or changed ordinary v2 bytes");
+    partial.release_external();
+}
+
+void external_batch_observations(fs::path const& root, Members members, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto directory = root / "external-batch-scratch"; fs::create_directory(directory);
+    ExternalConfig external; external.scratch.push_back({directory.string(), 128 * mib});
+    external.segment_bytes = mib; external.packing_inputs = 8;
+    cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    auto source = std::make_shared<SharedConstructionHistory>();
+    source->successor_batches.prepare(4); source->successor_batches.half_attempted = true;
+    source->successor_batch_workers = 2;
+    Construction engine((root / "external-batch-observations").string(), cfg, false, identity(), "external", external);
+    engine.attach_history(source); engine.external_batches.prepare(2); engine.confirm_identity();
+    auto const before = engine.external->stats();
+    require(engine.append(members.subspan(0, 2)).accepted, "external observation contribution did not fit");
+    require(!engine.external_batches.sizes[0].planning.count,
+        "external worker published observations before its consumer joined");
+    engine.observe_external(2, before);
+    auto const shape = engine.external->batch_resources();
+    require(shape.members == 2 && shape.runs == 1 && shape.packets == 1 && shape.bytes &&
+        shape.source_bytes && shape.packet_bytes == 8 && shape.readers == 8,
+        "external batch resource snapshot omitted its live packing state");
+    require(engine.external_batches.sizes[0].planning.count == 1 &&
+        engine.external_batches.sizes[0].encoding.count == 1 && !source->snapshot().count &&
+        !source->snapshot().contributions.count, "external timings contaminated same-file construction history");
+    require(source->successor_batch_workers == 2 && source->successor_batches.ceiling == 4 &&
+        source->successor_batches.half_attempted && !source->successor_batches.sizes[0].planning.count,
+        "foreground external observations overwrote a successor's different worker context");
+    engine.shape_recorded = true;
+    auto grant = cfg; grant.workers = cfg.workers + 1;
+    engine.set_workers(grant.workers, 2, false, engine.memory_for(grant, 2, false, false));
+    require(!engine.external_batches.ceiling && !engine.shape_recorded && !engine.shared_history,
+        "worker retune retained incompatible external batch timings or shape context");
+    engine.finish_staging();
+    require(!engine.external && !engine.external_batches.ceiling && !engine.external_batches.sizes[0].planning.count &&
+        !source->snapshot().count && !source->snapshot().contributions.count,
+        "external timing evidence survived ordinary handoff");
+
+    auto const requested = identity_from(identity());
+    Fixtures fixture{requested, {}, 0};
+    for (uint16_t index = 0; index < 4; ++index)
+    {
+        auto const path = root / ("external-prefetch-member-" + std::to_string(index));
+        PlotData data; data.t3_proof_fragments.assign(members[index].raw().begin(), members[index].raw().end());
+        fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, requested.params, index, requested.memo));
+        fixture.paths.push_back(path);
+    }
+    Arguments args; args.max_ram = 512 * mib; args.batch = 3; args.max_members = 4;
+    args.workers = 2; args.window = args.checkpoint_bytes = 65536;
+    args.window_set = args.checkpoint_set = true;
+    args.construction = "external"; args.member_storage = "compact";
+    args.temporary.push_back(directory);
+    auto const reference = root / "external-prefetch-reference";
+    direct(reference, members.subspan(0, 4), cfg);
+    for (uint16_t cap : {2, 3})
+    {
+        auto backend = std::make_unique<Backend>(); backend->mode = "fixture"; backend->generation_overlap = true;
+        Producer producer{requested, &fixture, *backend, args, args.max_ram, mib, mib};
+        GroupPrefetch prefetched;
+        require(prefetch_group(prefetched, producer, requested, 0, cap, 0, "test external prefetch ", [] { return false; }, 1) == cap,
+            "external prefetch fixture did not fill its admitted batch");
+        prefetched.metadata_bytes = sum(product(cap, 2 * sizeof(Member)), batch_hash_bytes(args, cap));
+        auto const path = root / ("external-prefetch-handoff-" + std::to_string(cap));
+        auto const result = run_group(args, path, &fixture, requested, 4, cfg.capacity_bytes, 0, backend,
+            nullptr, {}, {}, &prefetched);
+        require(result.members == 4 && result.generated_members == 4 - cap && backend->generated_members == 4 &&
+            result.batches == 2 && result.max_batch_members == 3 && result.peak_modeled_bytes <= args.max_ram &&
+            prefetched.members.empty() && contents(path) == contents(reference),
+            "external short-first handoff regenerated members, exceeded RAM admission or changed canonical bytes");
+    }
+}
+
+void bounded_saved_reads(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto reject = [](auto operation, char const* message)
+    {
+        bool rejected = false;
+        try { operation(); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, message);
+    };
+    for (auto const& text : {std::string{}, std::string("checkpoint bytes")})
+    {
+        std::istringstream in(text);
+        require(stream_state::read_exact(in, text.size()) == text, "bounded saved-state read changed its bytes");
+    }
+    std::istringstream short_input("short"), trailing_input("prefix with more bytes");
+    reject([&] { (void)stream_state::read_exact(short_input, 16); }, "bounded saved-state read accepted truncation");
+    reject([&] { (void)stream_state::read_exact(trailing_input, 6); }, "bounded saved-state read accepted growth");
+    // An input that never reaches EOF represents an appender staying ahead of
+    // a reader. Only the admitted prefix and a non-consuming probe may run.
+    struct GrowingInput : std::streambuf
+    {
+        size_t extracted = 0, probes = 0;
+        std::streamsize xsgetn(char* out, std::streamsize count) override
+        { std::fill_n(out, size_t(count), 'x'); extracted += size_t(count); return count; }
+        int_type underflow() override { ++probes; return traits_type::to_int_type('x'); }
+    } buffer;
+    std::istream growing(&buffer);
+    reject([&] { (void)stream_state::read_exact(growing, 32); }, "bounded saved-state read followed an appender");
+    require(buffer.extracted == 32 && buffer.probes == 1, "saved-state growth escaped the admitted read bound");
+
+    auto const work = root / "bounded-stream-state"; fs::create_directory(work);
+    stream_state::State state; state.config = {1, 2, 4096, 4096, false, false}; state.raw.resize(1);
+    stream_state::save_state(work, state, "bounded-state-fixture", "bounded-state-fixture");
+    auto const checkpoint = work / "checkpoint";
+    auto const bytes = contents(checkpoint);
+    std::string const saved(bytes.begin(), bytes.end());
+    auto const restored = stream_state::load_state(work, state.config, "bounded-state-fixture", 1, mib, 1);
+    require(restored.config == state.config && restored.raw.size() == state.raw.size(),
+        "bounded stream checkpoint read changed recovery state");
+    auto replace = [&](std::string const& text) { stream_state::atomic_save(checkpoint, text); };
+    replace(saved.substr(0, saved.size() - 1));
+    reject([&] { (void)stream_state::load_state(work, state.config, "bounded-state-fixture", 1, mib, 1); },
+        "stream checkpoint accepted truncated bytes");
+    replace(saved + "extra");
+    reject([&] { (void)stream_state::load_state(work, state.config, "bounded-state-fixture", 1, mib, 1); },
+        "stream checkpoint accepted trailing bytes");
+    replace(std::string(512, 'a') + '\n' + saved.substr(65));
+    reject([&] { (void)stream_state::load_state(work, state.config, "bounded-state-fixture", 1, mib, 1); },
+        "stream checkpoint accepted an oversized checksum line");
+    replace(saved);
+    reject([&] { (void)stream_state::load_state(work, state.config, "bounded-state-fixture", 1, 8, 1); },
+        "stream checkpoint ignored its read budget");
+}
+
+FarmingState farming_format_fixture(unsigned version)
+{
+    FarmingState state; state.version = version;
+    state.fingerprint = std::string(64, '0'); state.job_id = std::string(64, 'a');
+    state.seed = std::string(64, 'b'); state.farmer = std::string(96, 'c'); state.pool = std::string(64, 'd');
+    state.seed_owner = "owner"; state.fixed_extent = true;
+    state.capacity = 256; state.headroom = 32; state.max_groups = 8; state.max_total_members = 16;
+    state.manifest_reserved_bytes = 4096;
+    if (version >= 4) state.capacity_fill = true;
+    if (version == 4) state.profile_json = "{}";
+    auto& c = state.config;
+    c.k = 18; c.strength = 2; c.filter_bits = 9; c.future_filter_bits = 8;
+    c.reader = FarmingReader::cached; c.objective = FarmingObjective::latency;
+    c.harvester_cores = 3; c.lookup_workers = 4; c.index_cache_bytes = 1024; c.memory_bytes = 8192;
+    c.deadline_seconds = 8; c.challenge_seconds = 16; c.group_members_override = c.meta_slots_override = 2;
+    c.meta_group_override = 1; c.fixed_meta = true; c.chain_seconds_per_member = 0.125L;
+    c.index_seconds_per_entry = 0.25L; c.compressed_index_bytes_per_entry = 8; c.lookup_memory_per_member = 64;
+    c.cpu_work_weight = 2; c.io_work_weight = 3; c.max_eligible_families_per_resource = 4;
+    auto& e = state.estimate;
+    e.feasible = true; e.index_bytes = 5; e.reader_memory_bytes = 6; e.planning_memory_bytes = 7;
+    e.candidates_evaluated = 8; e.cpu_utilization = 0.5L; e.worker_utilization = 0.25L;
+    e.reason = "fixture"; e.response_bound_seconds = 1; e.dynamic_work_seconds_per_sp = 2;
+    e.cpu_work_seconds_per_sp = 3; e.io_work_seconds_per_sp = 4; e.max_eligible_families_per_resource = 1;
+    for (size_t lane = 0; lane < 2; ++lane)
+    {
+        FarmingDirectory d; d.directory = lane ? "/b" : "/a"; d.filesystem = "fs";
+        d.capacity_bytes = lane ? 96 : 128; d.resource = lane;
+        d.directory_identity = lane ? "identity-b" : "identity-a";
+        d.identity_resources = 2; d.identity_resource = lane;
+        auto& p = d.layout;
+        p.total_members = 3; p.files = 2; p.families = 1; p.group_bytes = 4096;
+        p.group_members = p.meta_slots = 2; p.meta_bits = 8; p.meta_base = 1; p.fixed_members = true;
+        auto& s = d.storage;
+        s.resource = lane; s.known_device = true; s.read_bytes_per_second = 128;
+        s.read_latency_seconds = 0.5L; s.read_concurrency = 1; s.capacity_bytes = d.capacity_bytes;
+        s.max_file_bytes = lane ? 48 : 64; s.max_total_members = 16; s.max_groups = 8;
+        if (version >= 4) { d.extents = {2, 1}; d.sealed_files = 1; }
+        state.estimate.destinations.push_back(p); state.directories.push_back(std::move(d));
+    }
+    return state;
+}
+void replot_save_diagnostics(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace farm;
+    auto const directory = root / "replot-save-diagnostics"; fs::create_directory(directory);
+    auto const source = directory / "source.plot";
+    { std::ofstream out(source); out << "protected synthetic source bytes"; }
+    Arguments args; args.max_ram = 2 * 1024 * mib; args.workers = args.batch = 1;
+    args.construction = "incremental"; args.backend = "cpu"; args.destination_temp = "off";
+    args.window = 65536; args.json = true; args.compute_mode = "off";
+    ReplotInputs inputs; auto& review = inputs.review;
+    review.farm = farming_format_fixture(6); auto& state = review.farm;
+    state.capacity_fill = false;
+    state.seed.assign(64, '0'); state.seed_owner.clear(); state.farmer.assign(96, '0'); state.pool.assign(64, '0');
+    state.config = FarmingConfig{}; state.config.k = 18; state.config.strength = 2;
+    state.config.group_members_override = state.config.meta_slots_override = 1;
+    state.capacity = 4 * 1024 * mib; state.headroom = 0; state.max_groups = state.max_total_members = 1;
+    state.directories.resize(1); auto& destination = state.directories.front();
+    auto const device = storage_device(directory); auto const host = profile_detail::host_name(); auto const disk = replot_storage_id(device);
+    destination.directory = file_io::path_text(directory); destination.directory_identity = farming_directory_identity(directory);
+    destination.filesystem = device.filesystem; destination.capacity_bytes = state.capacity;
+    destination.resource = destination.identity_resource = 0; destination.identity_resources = 1;
+    destination.extents.clear(); destination.sealed_files = 0;
+    destination.storage = farming_destination_profile(device); destination.storage.capacity_bytes = state.capacity;
+    destination.storage.max_groups = destination.storage.max_total_members = 1; destination.storage.resource = 0;
+    state.estimate = farming_plan(state.config, {destination.storage}); require(state.estimate.feasible, "save diagnostic native fixture is infeasible");
+    destination.layout = state.estimate.destinations.front();
+    std::array<fs::path, 1> roots{directory}; inputs.inventory = scan_farm_inventory(roots, replot_inventory_limits(args));
+    inputs.inventory.plots.front().workload_id = "old";
+    auto& profile = inputs.resources; profile.source = profile.producer = "declared-save-diagnostic-fixture";
+    Resource cpu; cpu.id = "cpu"; cpu.host = host; cpu.kind = ResourceKind::cpu; cpu.capacity = 64; cpu.capacity_known = true;
+    Resource ram = cpu; ram.id = "ram"; ram.kind = ResourceKind::host_memory; ram.capacity = 64 * 1024 * mib;
+    Resource storage = cpu; storage.id = disk; storage.kind = ResourceKind::storage; storage.capacity = 1; storage.conditional_shared = true;
+    if (device.drives.empty()) storage.aliases = {"storage:unknown:" + host};
+    else for (auto const& drive : device.drives) storage.aliases.push_back("drive:" + drive);
+    profile.resources = {cpu, ram, storage};
+    Workload old; old.id = "old"; old.plot_count = 1; old.cost = CostKind::serialized; old.bounded = old.scope_complete = true;
+    old.format = old.decoder = old.decoder_version = old.backend = old.pool_difficulty = old.source = "declared";
+    old.quality_burst = old.proof_burst = old.future_quality_burst = old.future_proof_burst = 1;
+    old.period_us = old.deadline_us = 100000000;
+    Use use; use.resource = "cpu"; use.required_units = use.quality_us = use.proof_us = 1; old.uses = {use}; profile.workloads = {old};
+    auto service = [&](std::string resource)
+    { Demand d; d.resource = std::move(resource); d.required_units = 2; d.work_us = 1000; d.period_us = d.deadline_us = 100000000; d.bounded = true; return d; };
+    auto memory = [](uint64_t bytes) { Demand d; d.resource = "ram"; d.transient_units = bytes; d.bounded = true; return d; };
+    auto& native = profile.native;
+    native.bounded = native.scope_complete = native.covers_future_filter = native.phase_totals_include_controller = true;
+    native.host = host; native.k = 18; native.strength = 2; native.reader = "stateless"; native.backend = "cpu"; native.engine = "incremental";
+    native.max_ram_bytes = args.max_ram; native.max_cpu_threads = 2; native.max_batch_members = native.max_group_members = 1;
+    native.max_construction_us = native.max_verification_us = 100000000; native.verification_cpu_threads = 1;
+    native.output_resources = native.source_resources = {disk};
+    auto io = service(disk); io.required_units = 1;
+    native.construction = native.verification = native.supervision = {service("cpu"), memory(8 * 1024 * mib), io};
+    NativeCohort cohort; cohort.max_members = 1; cohort.new_farming = cohort.proof_reserve = {service("cpu"), memory(mib), io}; native.cohorts = {cohort};
+    review.memory_limit_bytes = args.max_ram; review.sources = {0};
+    auto const bound = canonical_bound(replot_bound_identity(state.config), 1);
+    file_io::Space space{}; require(!file_io::space_path(directory, &space), "cannot inspect save diagnostic allocation unit");
+    auto const unit = std::max({uint64_t(space.f_bsize), uint64_t(space.f_frsize), uint64_t(file_io::page_size())});
+    review.batches = {{0, 0, 0, 1, bound, args.max_ram, product(unit, 5), unit}};
+    review.space = {{64 * 1024 * mib, 0, bound, args.max_ram, replot_metadata_allowance(state, unit)}};
+    review.inventory_json = farm_inventory_text(inputs.inventory, replot_inventory_limits(args));
+    std::ostringstream resources; write_profile_json(resources, profile); review.resources_json = resources.str();
+    replot_input_memory(inputs, args);
+    auto const initial = assess_replot_review(args, inputs);
+    require(initial.feasible, initial.reasons.empty() ? "save diagnostic review did not initially fit" : initial.reasons.front().c_str());
+    auto render = [&](ReplotInputs value)
+    {
+        std::ostringstream output; auto* previous = std::cout.rdbuf(output.rdbuf()); int code = 0;
+        try { code = print_replot_review(args, std::move(value), false); }
+        catch (...) { std::cout.rdbuf(previous); throw; }
+        std::cout.rdbuf(previous); return std::pair{code, profile_detail::JsonReader(output.str()).read()};
+    };
+    {
+        auto structural = inputs; structural.review.verification = ReplotVerification{};
+        structural.resources.native.verification.clear(); structural.resources.native.max_verification_us = 0;
+        structural.resources.native.verification_cpu_threads = 0;
+        std::ostringstream resource_text; write_profile_json(resource_text, structural.resources);
+        structural.review.resources_json = resource_text.str();
+        auto const bounded = replot_request(args, structural);
+        require(bool(replot_mapping_capacity(structural.resources, structural.inventory, structural.review, bounded)) &&
+            assess_replot_review(args, structural).feasible, "structural mapping required a migration proof grant");
+        structural.review.verification = ReplotVerification{ReplotVerificationMode::sampled, 0, 2};
+        require(bool(replot_mapping_capacity(structural.resources, structural.inventory, structural.review, bounded)),
+            "unsampled mapping required another group's proof grant");
+        for (auto policy : {ReplotVerification{ReplotVerificationMode::strict}, ReplotVerification{ReplotVerificationMode::sampled, 1, 0}})
+        {
+            auto selected = structural; selected.review.verification = policy;
+            bool rejected = false;
+            try { (void)replot_mapping_capacity(selected.resources, selected.inventory, selected.review, bounded); }
+            catch (std::runtime_error const&) { rejected = true; }
+            require(rejected, "selected proof binding escaped mapper initialization's refusal boundary");
+            args.save_plan = directory / "missing-proof-grant.plan";
+            auto const refused = render(selected);
+            require(refused.first == 2 && !inventory_detail::boolean(refused.second, "feasible") &&
+                !inventory_detail::required_field(refused.second, "infeasibility_reasons").items.empty() && !fs::exists(args.save_plan),
+                "missing selected proof grant lost structured infeasibility or wrote a refused plan");
+        }
+        args.save_plan.clear();
+    }
+    args.save_plan = directory / "refused.plan";
+    auto constrained = inputs;
+    constrained.review.space[0].free_bytes = sum(constrained.review.space[0].metadata_allowance_bytes,
+        sum(bound, sum(args.max_ram, sum(product(unit, 5), unit))));
+    require(assess_replot_review(args, constrained).feasible, "metadata-reserve refusal fixture was already infeasible");
+    auto const refused = render(constrained);
+    auto const& reasons = inventory_detail::required_field(refused.second, "infeasibility_reasons");
+    require(refused.first == 2 && !profile_detail::boolean(inventory_detail::required_field(refused.second, "feasible")) &&
+        !reasons.items.empty() && inventory_detail::string(refused.second, "saved_plan").empty() && !fs::exists(args.save_plan),
+        "metadata reservation failure lost structured reasons or wrote an infeasible review");
+    require(std::any_of(reasons.items.begin(), reasons.items.end(), [](auto const& reason)
+        { return profile_detail::text(reason) == "saved migration review would consume required prefix space"; }),
+        "metadata-reserve reassessment dropped its specific refusal cause");
+    args.save_plan = directory / "saved.plan";
+    auto expected = inputs.review; expected.space[0].free_bytes -= sum(replot_review_text(expected).size(), 65536 + 65);
+    auto expected_body = replot_review_text(expected); expected_body += stream_state::digest(expected_body) + '\n';
+    auto const accepted = render(inputs); auto const actual = contents(args.save_plan);
+    require(accepted.first == 0 && std::string(actual.begin(), actual.end()) == expected_body &&
+        inventory_detail::string(accepted.second, "saved_plan") == file_io::path_text(args.save_plan),
+        "feasible review changed its compatible saved bytes or reported path");
+    auto const source_bytes = contents(source);
+    require(std::string(source_bytes.begin(), source_bytes.end()) == "protected synthetic source bytes" &&
+        !fs::exists(directory / ".xchplot2"), "save diagnostic rendering changed the source or published a private journal");
+}
+
+void replot_journal_protocol(fs::path const& root)
+{
+    using grow_controller_test::mib;
+    ReplotJournal journal; journal.review_digest = std::string(64, 'a');
+    journal.farm = farming_format_fixture(6); journal.farm.capacity_fill = false;
+    for (auto& directory : journal.farm.directories) { directory.extents.clear(); directory.sealed_files = 0; }
+    journal.retirements.resize(2);
+    ReplotReview review; review.inventory_json = "{}"; review.resources_json = "{}";
+    review.memory_limit_bytes = 16 * grow_controller_test::mib;
+    review.farm = parse_farming_state(farming_state_text(journal.farm, true), 16 * mib);
+    review.sources = {0, 1}; review.space.resize(review.farm.directories.size());
+    uint64_t source = 0;
+    for (size_t lane = 0; lane < review.farm.directories.size(); ++lane)
+        for (uint64_t ordinal = 0; ordinal < review.farm.directories[lane].layout.files; ++ordinal)
+        {
+            uint64_t const count = source < review.sources.size() ? 1 : 0;
+            review.batches.push_back({lane, ordinal, source, count, 4096, 8192, 16384, 4096}); source += count;
+        }
+    for (auto& space : review.space) space.metadata_allowance_bytes = 65536;
+    auto const review_body = replot_review_text(review);
+    require(replot_review_text(parse_replot_review(review_body, 16 * mib)) == review_body,
+        "replot review changed canonical bytes");
+    auto roundtrip = [&](ReplotJournal const& value)
+    {
+        auto const body = replot_journal_text(value);
+        require(replot_journal_text(parse_replot_journal(body, 16 * mib)) == body, "replot journal changed canonical bytes");
+    };
+    roundtrip(journal);
+    auto advance = [&](auto change)
+    {
+        auto next = journal; ++next.revision; next.parent_digest = stream_state::digest(replot_journal_text(journal)); change(next);
+        validate_replot_journal(next); require(valid_replot_revision(journal, next), "legal replot revision rejected");
+        roundtrip(next); journal = std::move(next);
+    };
+    advance([](auto& value) { value.phase = ReplotPhase::replacing; });
+    auto early_retirement = journal; ++early_retirement.revision;
+    early_retirement.parent_digest = stream_state::digest(replot_journal_text(journal));
+    early_retirement.retirements[0].state = ReplotRetirement::claim_intent;
+    require(!valid_replot_revision(journal, early_retirement), "replot retirement lacked replacement or explicit predelete state");
+    advance([](auto& value) { value.retirements[0] = {ReplotRetirement::claim_intent, true}; });
+    advance([](auto& value) { value.retirements[0].state = ReplotRetirement::claimed; });
+    advance([](auto& value) { value.retirements[0].state = ReplotRetirement::retired; });
+    advance([](auto& value) { value.verified_stage = stream_state::Stamp{1, 2, 4096, 3, 4, 5, 6}; });
+    advance([](auto& value) { value.published = value.verified_stage; });
+    advance([](auto& value) { value.ready = value.published; });
+    advance([](auto& value) { value.retirements[1].state = ReplotRetirement::claim_intent; });
+    advance([](auto& value) { value.retirements[1].state = ReplotRetirement::claimed; });
+    advance([](auto& value) { value.retirements[1].state = ReplotRetirement::retired; });
+    ReplotReceipt receipt{journal.review_digest, {}, 0, 0, 2, *journal.ready};
+    auto const body = replot_receipt_text(receipt);
+    require(replot_receipt_text(parse_replot_receipt(body)) == body, "replot receipt changed canonical bytes");
+    advance([&](auto& value)
+    {
+        ++value.batch; value.retired_prefix += value.retirements.size(); value.retirements.clear(); value.verified_stage.reset(); value.published.reset(); value.ready.reset();
+        value.receipt_digest = stream_state::digest(body);
+    });
+    auto invalid = journal; ++invalid.revision; invalid.parent_digest = stream_state::digest(replot_journal_text(journal));
+    invalid.farm.seed = std::string(64, 'e');
+    require(!valid_replot_revision(journal, invalid), "replot revision changed plot identities");
+    invalid = journal; ++invalid.revision; invalid.parent_digest = stream_state::digest(replot_journal_text(journal));
+    invalid.retired_prefix = 0;
+    require(!valid_replot_revision(journal, invalid), "replot revision forgot outstanding retirement progress");
+    auto reject = [](auto operation, char const* message)
+    { bool failed = false; try { operation(); } catch (std::runtime_error const&) { failed = true; } require(failed, message); };
+    auto directory_review = review;
+    directory_review.verification = ReplotVerification{}; directory_review.directory_confirmation = true;
+    auto const directory_body = replot_review_text(directory_review);
+    auto const restored = parse_replot_review(directory_body, 16 * mib);
+    require(restored.directory_confirmation && replot_review_text(restored) == directory_body &&
+        !parse_replot_review(review_body, 16 * mib).directory_confirmation,
+        "directory farming confirmation changed during review recovery or changed legacy policy");
+    ReplotJob job; job.review = directory_body; job.profile = "{}";
+    job.bindings = {stream_state::digest(directory_body), review.farm.job_id, "test-host", "test-user", "chia", {}, {}, {}, {}};
+    job.seed = std::string(64, 'a'); job.farmer = std::string(96, 'b'); job.pool = std::string(64, 'c');
+    auto const job_body = replot_job_text(job);
+    require(replot_job_text(parse_replot_job(job_body, 16 * mib)) == job_body,
+        "private migration preparation lost its immutable policy, local bindings or keys");
+    reject([&] { (void)parse_replot_job(job_body, 64); }, "private migration preparation ignored its parser budget");
+    reject([&] { (void)parse_replot_job(job_body + "extra", 16 * mib); }, "private migration preparation accepted trailing data");
+    job.review += ' ';
+    reject([&] { (void)replot_job_text(job); }, "private migration preparation accepted a different review");
+    reject([&] { (void)parse_replot_journal(replot_journal_text(journal), 64); }, "replot journal ignored parser budget");
+    reject([&] { (void)parse_replot_receipt(body + "extra"); }, "replot receipt accepted trailing data");
+    invalid = journal; invalid.retirements.resize(replot_maximum_batch_sources + 1);
+    reject([&] { (void)replot_journal_text(invalid); }, "replot journal retained an unbounded active batch");
+    invalid = journal; invalid.phase = ReplotPhase::complete;
+    reject([&] { (void)replot_journal_text(invalid); }, "replot handoff skipped unfinished replacements");
+    for (auto const* point : {"replot-journal-all-staged", "replot-journal-one-published"})
+    {
+        auto const base = root / point; fs::create_directory(base);
+        std::vector<fs::path> directories{base / "a", base / "b"};
+        for (auto const& path : directories) fs::create_directory(path);
+        ReplotJournal initial; initial.review_digest = std::string(64, 'b'); initial.farm = journal.farm; initial.retirements.resize(1);
+        auto replicas = load_replot_journals(directories, initial.review_digest, 16 * mib);
+        require(!replicas.present, "fresh replot journal unexpectedly exists");
+        publish_replot_journals(replicas, initial, 16 * mib, [] {});
+        auto next = initial; ++next.revision; next.parent_digest = replicas.digest; next.phase = ReplotPhase::replacing;
+        auto const child = ::fork(); require(child >= 0, "cannot fork replot journal recovery test");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
+            publish_replot_journals(replicas, next, 16 * mib, [] {}); std::_Exit(1);
+        }
+        int status = 0;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+            "replot journal did not stop at its durability boundary");
+        auto recovered = load_replot_journals(directories, initial.review_digest, 16 * mib);
+        require(recovered.state.revision == next.revision && recovered.digest == stream_state::digest(replot_journal_text(next)),
+            "replot journal selected an older interrupted revision");
+        publish_replot_journals(recovered, recovered.state, 16 * mib, [] {});
+        for (auto const& replica : recovered.replicas)
+            require(replica.digest == recovered.digest && replica.published && !replica.pending,
+                "replot journal recovery did not finish every replica");
+        reject([&] { (void)load_replot_journals(directories, std::string(64, 'c'), 16 * mib); },
+            "replot journal accepted another review's authority");
+    }
+}
+
+void replot_legacy_destination_metadata(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    Arguments args; args.max_ram = 512 * mib;
+    auto write = [](fs::path const& path, char const* text)
+    { std::ofstream out(path, std::ios::binary | std::ios::trunc); out << text; require(bool(out), "cannot write destination metadata fixture"); };
+    auto legacy = [](FarmInventory value)
+    {
+        value.version = 1; for (auto& root : value.roots) root.durable = {};
+        for (auto& plot : value.plots) plot.identity.durable = {}; return value;
+    };
+    auto find = [](FarmInventory const& inventory, std::string const& name) -> InventoryPlot const&
+    {
+        auto const at = std::find_if(inventory.plots.begin(), inventory.plots.end(), [&](auto const& plot) { return plot.relative_path == name; });
+        require(at != inventory.plots.end(), "destination metadata fixture row disappeared"); return *at;
+    };
+    auto roundtrip = [](FarmInventory const& inventory)
+    { auto const bytes = farm_inventory_text(inventory); require(farm_inventory_text(parse_farm_inventory(bytes)) == bytes, "destination metadata produced an invalid inventory schema or changed canonical bytes"); };
+    for (bool replacement : {false, true})
+    {
+        auto const destination = root / (replacement ? "legacy-metadata-replace" : "legacy-metadata-insert"); fs::create_directory(destination);
+        auto const metadata = destination / "a-explicit-input", retained = destination / "z-retained-source";
+        write(retained, "unchanged legacy source bytes"); if (replacement) write(metadata, "previous typed input bytes");
+        std::array<fs::path, 1> roots{destination}; auto inventory = legacy(scan_farm_inventory(roots));
+        auto const original_root = inventory.roots[0]; auto const original = find(inventory, "z-retained-source");
+        write(metadata, "current explicitly validated inventory/profile input");
+        std::array<ReplotMetadataFile, 1> supplied{{{metadata, stream_state::stamp(metadata)}}};
+        replot_destination_coverage(args, inventory, destination, supplied, &inventory);
+        auto const& recorded = find(inventory, "a-explicit-input");
+        require(inventory.version == 1 && inventory.roots.size() == 1 && !file_io::has_durable_identity(inventory.roots[0].durable) &&
+            !file_io::has_durable_identity(recorded.identity.durable) && replot_nonplot(recorded) &&
+            inventory.roots[0].path == original_root.path && inventory.roots[0].directory_identity == original_root.directory_identity &&
+            inventory.roots[0].device == original_root.device && inventory.roots[0].inode == original_root.inode &&
+            find(inventory, "z-retained-source").identity == original.identity,
+            "fresh typed metadata upgraded a legacy root, source row or generation authority");
+        roundtrip(inventory);
+        for (bool prospective : {false, true})
+        {
+            auto mismatched = scan_farm_inventory(roots);
+            if (!prospective) mismatched = legacy(std::move(mismatched));
+            else if (!file_io::has_durable_identity(mismatched.roots[0].durable)) continue;
+            mismatched.roots[0].device ^= UINT64_C(0x40000000);
+            for (auto& plot : mismatched.plots) plot.identity.stamp.device = mismatched.roots[0].device;
+            auto const before = farm_inventory_text(mismatched); auto const file_before = contents(metadata); bool refused = false;
+            try { replot_destination_coverage(args, mismatched, destination, supplied, &mismatched); } catch (std::exception const&) { refused = true; }
+            require(refused && farm_inventory_text(mismatched) == before && contents(metadata) == file_before,
+                "fresh metadata silently changed a retained native-device association or mutated a refused observation");
+        }
+    }
+    auto const source = root / "legacy-metadata-old-root", destination = root / "legacy-metadata-new-root";
+    fs::create_directory(source); fs::create_directory(destination); write(source / "z-retained-source", "retained original source");
+    std::array<fs::path, 1> roots{source}; auto inventory = legacy(scan_farm_inventory(roots));
+    auto const original_root = inventory.roots[0]; auto const original = inventory.plots[0];
+    auto const root_count = inventory.roots.size(), plot_count = inventory.plots.size();
+    auto const metadata = destination / "a-explicit-input"; write(metadata, "typed input on a newly observed destination root");
+    std::array<ReplotMetadataFile, 1> supplied{{{metadata, stream_state::stamp(metadata)}}};
+    replot_destination_coverage(args, inventory, destination, supplied, &inventory);
+    auto const& appended = inventory.plots.back(); bool const durable = file_io::has_durable_identity(inventory.roots.back().durable);
+    require(inventory.roots.size() == root_count + 1 && inventory.plots.size() == plot_count + 1 && appended.root == root_count && replot_nonplot(appended) &&
+        inventory.version == (durable ? 2u : 1u) && (!file_io::has_durable_identity(appended.identity.durable) || durable) &&
+        !file_io::has_durable_identity(inventory.roots[0].durable) && inventory.roots[0].device == original_root.device &&
+        inventory.roots[0].inode == original_root.inode && inventory.roots[0].directory_identity == original_root.directory_identity &&
+        inventory.plots[0].identity == original.identity, "new destination metadata lost its explicit schema or upgraded old native owners");
+    roundtrip(inventory);
+}
+
+void replot_execution_resource_bindings(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    auto const base = root / "execution-resource-bindings"; fs::create_directories(base / "source"); fs::create_directory(base / "destination");
+    auto capture = [&](fs::path const& path)
+    {
+        inventory_detail::RootHandle pin(path); auto const native = inventory_detail::stat(pin.handle);
+        InventoryRoot owner{file_io::path_text(pin.path), farming_directory_identity(pin.path), storage_device(pin.path),
+            uint64_t(native.st_dev), uint64_t(native.st_ino)};
+        pin.matches(owner); (void)file_io::capture_durable_identity(pin.handle.fd, &owner.durable); pin.matches(owner); return owner;
+    };
+    auto const actual_source = capture(base / "source"), actual_destination = capture(base / "destination");
+    auto const host = profile_detail::host_name(); Arguments args;
+    auto text = [](Profile const& profile) { std::ostringstream out; write_profile_json(out, profile); return out.str(); };
+    auto rejected = [](auto operation, char const* message)
+    { bool refused = false; try { operation(); } catch (std::exception const&) { refused = true; } require(refused, message); };
+    auto resource = [&](std::string const& filesystem, uint64_t capacity)
+    {
+        Resource value; value.id = "storage:" + filesystem; value.host = host; value.kind = ResourceKind::storage;
+        value.capacity = capacity; value.capacity_known = true; return value;
+    };
+    auto input = [&](InventoryRoot const& source, InventoryRoot const& destination, Profile profile)
+    {
+        ReplotInputs value; value.inventory.host = host; value.inventory.roots = {source}; value.inventory.captured_at = "saved-native-fixture";
+        value.inventory.producer_build = GROW_IDENTITY; value.inventory.version = file_io::has_durable_identity(source.durable) ? 2 : 1;
+        value.resources = std::move(profile);
+        value.review.owned_roots = {destination}; FarmingDirectory lane; lane.directory = destination.path;
+        lane.directory_identity = destination.directory_identity; lane.filesystem = destination.storage.filesystem;
+        value.review.farm.directories = {lane}; value.review.sources = {0}; value.review.batches = {{0, 0, 0, 1, 64, 32, 0, 0}};
+        value.review.resources_json = text(value.resources); value.origin_review_body = "unchanged original review fixture";
+        ReplotRevalidation successor; successor.resources_json = value.review.resources_json; value.revalidation = successor;
+        return value;
+    };
+    Profile unchanged; unchanged.source = unchanged.producer = "native-resource-binding-fixture"; unchanged.native.host = host;
+    auto current = resource(actual_source.storage.filesystem, 1);
+    if (actual_source.storage.drives.empty()) current.aliases = {"storage:unknown:" + host};
+    else for (auto const& drive : actual_source.storage.drives) current.aliases.push_back("drive:" + drive);
+    unchanged.resources = {current};
+    auto legacy = input(actual_source, actual_source, unchanged); legacy.inventory.roots[0].durable = {}; legacy.inventory.version = 1; legacy.review.owned_roots.clear();
+    auto const strict_policy = text(legacy.resources);
+    bind_replot_execution_resources(args, legacy); check_replot_execution_resources(args, legacy);
+    require(!legacy.execution_resources && &replot_resources(legacy) == &legacy.resources && text(legacy.resources) == strict_policy,
+        "unchanged legacy roots copied or changed their already matching physical resource policy");
+    auto changed_legacy = legacy; changed_legacy.inventory.roots[0].device ^= UINT64_C(0x40000000);
+    rejected([&] { bind_replot_execution_resources(args, changed_legacy); }, "legacy source root retroactively recovered a changed native device");
+    changed_legacy = legacy; changed_legacy.review.farm.directories[0].filesystem = "unreviewed-current-storage";
+    rejected([&] { bind_replot_execution_resources(args, changed_legacy); }, "legacy destination borrowed prospective source-root authority for another storage association");
+    if (!file_io::has_durable_identity(actual_source.durable) || !file_io::has_durable_identity(actual_destination.durable))
+    { std::cout << "native root generation capture unavailable; strict legacy resource bindings checked\n"; return; }
+
+    // Historical native-device/storage fields are simulated; the opaque root
+    // generations and every current storage observation come from real pins.
+    auto source = actual_source; source.device ^= UINT64_C(0x40000000); source.storage.filesystem = std::to_string(source.device); source.storage.drives = {"reviewed-source-drive"};
+    auto destination = actual_destination; destination.device ^= UINT64_C(0x80000000); destination.storage.filesystem = std::to_string(destination.device); destination.storage.drives = {"reviewed-destination-drive"};
+    Profile reviewed; reviewed.source = reviewed.producer = "saved-native-storage-fixture"; reviewed.native.host = host;
+    auto source_resource = resource(source.storage.filesystem, 3), destination_resource = resource(destination.storage.filesystem, 1);
+    source_resource.aliases = {"drive:reviewed-source-drive"}; destination_resource.aliases = {"drive:reviewed-destination-drive"};
+    source_resource.conditional_shared = true; destination_resource.telemetry_required = true;
+    reviewed.resources = {source_resource, destination_resource};
+    reviewed.native.source_resources = {source_resource.id}; reviewed.native.output_resources = {destination_resource.id};
+    auto bound = input(source, destination, reviewed); auto const canonical = text(bound.resources), inventory_before = farm_inventory_text(bound.inventory);
+    auto const sources = bound.review.sources; auto const batches = bound.review.batches;
+    Stage demand; demand.name = "current-native-storage-reservations"; demand.scope_complete = true;
+    for (auto const& value : reviewed.resources) { Demand held; held.resource = value.id; held.reserved_units = 1; held.bounded = true; demand.construction.push_back(held); }
+    require(assess_stage(bound.resources, demand).feasible, "distinct saved storage fixture did not have its declared reservation capacity");
+    bind_replot_execution_resources(args, bound); check_replot_execution_resources(args, bound);
+    require(bound.execution_resources && text(bound.resources) == canonical && farm_inventory_text(bound.inventory) == inventory_before && bound.review.resources_json == canonical &&
+        bound.revalidation->resources_json == canonical && bound.origin_review_body == "unchanged original review fixture" &&
+        bound.review.sources == sources && bound.review.batches.size() == batches.size() && bound.review.batches[0].lane == batches[0].lane &&
+        bound.review.batches[0].ordinal == batches[0].ordinal, "runtime native aliases changed canonical policy bytes or fixed migration assignments");
+    resource_detail::Graph physical(replot_resources(bound));
+    auto const pool = physical.find(source_resource.id);
+    require(pool == physical.find(destination_resource.id) && pool == physical.find("storage:" + actual_source.storage.filesystem) &&
+        physical.resources[pool].capacity == 1 && physical.resources[pool].capacity_known && !physical.resources[pool].conditional_shared &&
+        physical.resources[pool].telemetry_required && !assess_stage(replot_resources(bound), demand).feasible,
+        "current aliases failed to coalesce physical pools at their conservative capacity and reservation envelope");
+    require(bound.storage_bindings.size() == 2 && bound.storage_bindings[0].reviewed_device == source.device &&
+        bound.storage_bindings[0].current_device == actual_source.device && bound.storage_bindings[0].inode == actual_source.inode &&
+        replot_filesystem(bound, source.storage.filesystem) == actual_source.storage.filesystem &&
+        replot_filesystem(bound, destination.storage.filesystem) == actual_destination.storage.filesystem &&
+        replot_filesystem(bound, "unbound-filesystem") == "unbound-filesystem", "verified root bindings lost current devices or changed an unbound filesystem label");
+    for (auto const& drive : actual_source.storage.drives) require(physical.find("drive:" + drive) == pool, "current physical drive alias escaped its verified root pool");
+    if (actual_source.storage.drives.empty()) require(physical.find("storage:unknown:" + host) == pool, "unknown current drive scope escaped conservative aliasing");
+
+    auto invalid = bound; invalid.inventory.roots[0].device = actual_source.device;
+    invalid.inventory.roots[0].durable.object.back() = invalid.inventory.roots[0].durable.object.back() == '0' ? '1' : '0';
+    auto wrong_generation = invalid;
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "same native root stat accepted a substituted generation before resource binding");
+    rejected([&] { check_replot_execution_resources(args, wrong_generation); }, "same native root stat accepted a substituted generation after resource binding");
+    invalid = bound; invalid.inventory.roots[0].durable = {}; invalid.inventory.version = 1;
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "missing saved root generation normalized a changed device");
+    invalid = bound; invalid.storage_bindings[0].current_device ^= UINT64_C(0x80000000);
+    rejected([&] { check_replot_execution_resources(args, invalid); }, "in-process current native-device drift was silently rebound");
+    invalid = bound; invalid.resources.resources[0].host = "another-physical-host";
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root mapping crossed its reviewed physical host");
+    invalid = bound; invalid.resources.resources[0].kind = ResourceKind::cpu;
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root mapping crossed its reviewed resource kind");
+    invalid = bound; invalid.inventory.roots[0].storage.filesystem = "absent-reviewed-resource";
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root invented a missing reviewed storage resource");
+    invalid = bound; invalid.resources.resources[0].aliases.clear();
+    for (unsigned index = 0; index < 32; ++index) invalid.resources.resources[0].aliases.push_back("reviewed-alias-" + std::to_string(index));
+    auto const full_policy = text(invalid.resources);
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root aliases exceeded the existing resource schema bound");
+    require(text(invalid.resources) == full_policy, "refused runtime alias expansion changed the saved resource policy");
+    auto const held = base / "source-held"; fs::rename(file_io::native_path(source.path), held); fs::create_directory(file_io::native_path(source.path));
+    rejected([&] { check_replot_execution_resources(args, bound); }, "replaced pinned root retained runtime resource authority");
+    fs::remove(file_io::native_path(source.path)); fs::rename(held, file_io::native_path(source.path)); check_replot_execution_resources(args, bound);
+
+    auto overlapping_destination = source; overlapping_destination.device = destination.device; overlapping_destination.storage.filesystem = destination.storage.filesystem;
+    auto overlapping = input(source, overlapping_destination, reviewed); bind_replot_execution_resources(args, overlapping);
+    resource_detail::Graph overlapping_pool(replot_resources(overlapping));
+    require(overlapping.storage_bindings.size() == 1 && overlapping_pool.find(source_resource.id) == overlapping_pool.find(destination_resource.id) &&
+        !assess_stage(replot_resources(overlapping), demand).feasible,
+        "shared source/destination root left a second historical storage association with independent capacity");
+
+    auto projection = bound; projection.inventory.roots.push_back(destination); projection.review.owned_roots = {source, destination};
+    auto second_lane = projection.review.farm.directories[0]; projection.review.farm.directories[0].directory = source.path;
+    projection.review.farm.directories[0].directory_identity = source.directory_identity; projection.review.farm.directories[0].filesystem = source.storage.filesystem;
+    projection.review.farm.directories.push_back(second_lane); projection.review.farm.headroom = 0;
+    projection.review.space = {{96, 0, 64, 32, 8}, {96, 0, 0, 0, 8}};
+    projection.inventory.plots.resize(1); projection.inventory.plots[0].root = 1; projection.inventory.plots[0].identity.allocated_bytes = 32;
+    projection.review.reclaim_before_bytes = 32; bind_replot_execution_resources(args, projection);
+    std::vector<std::vector<uint64_t>> early;
+    auto projected = [&](size_t batch, std::map<std::string, uint64_t> const& free, std::span<uint64_t const> selected)
+    {
+        auto const expected = projection.review.space[0].free_bytes - projection.review.space[0].metadata_allowance_bytes -
+            projection.review.space[1].metadata_allowance_bytes + projection.inventory.plots[0].identity.allocated_bytes;
+        require(!batch && free.size() == 1 && free.at(actual_source.storage.filesystem) == expected && selected.size() == 1 && selected[0] == 0,
+            "current filesystem projection multiplied shared free space, lost a replica reserve or credited the wrong source"); return true;
+    };
+    require(replot_prefix_capacity(projection, projected, {actual_source.storage.filesystem}, &early).empty() &&
+        early == std::vector<std::vector<uint64_t>>{{0}}, "same current filesystem could not reclaim its whole reviewed source across historical labels");
+    projection.review.reclaim_before_bytes = 31;
+    require(!replot_prefix_capacity(projection).empty(), "coalesced current space escaped its indivisible predelete debt cap");
+}
+
+void replot_status_receipt_evidence(fs::path const& root)
+{
+    using namespace group_grow::farm; using namespace grow_controller_test;
+    auto const base = root / "replot-status-receipts";
+    fs::create_directories(base / "source"); fs::create_directory(base / "destination");
+    { std::ofstream file(base / "source" / "old.plot"); file << "old synthetic source"; }
+    std::array<fs::path, 1> inventory_roots{base / "source"};
+    ReplotInputs inputs; inputs.inventory = scan_farm_inventory(inventory_roots);
+    auto& review = inputs.review; review.inventory_json = farm_inventory_text(inputs.inventory); review.resources_json = "{}";
+    review.memory_limit_bytes = 16 * mib; review.sources = {0}; review.space.resize(1);
+    auto farm = farming_format_fixture(6); farm.capacity_fill = false; farm.directories.resize(1); farm.estimate.destinations.resize(1);
+    auto& directory = farm.directories.front(); directory.directory = file_io::path_text(base / "destination");
+    directory.directory_identity = farming_directory_identity(base / "destination"); directory.filesystem = storage_device(base / "destination").filesystem;
+    directory.extents.clear(); directory.sealed_files = 0; directory.identity_resources = 1;
+    review.farm = parse_farming_state(farming_state_text(farm, true), 16 * mib);
+    review.batches = {{0, 0, 0, 1, 4096, 8192, 16384, 4096}, {0, 1, 1, 0, 4096, 8192, 16384, 4096}};
+    inputs.digest = stream_state::digest(replot_review_text(review));
+    Arguments args; args.max_ram = 16 * mib; args.json = true;
+    auto status = [&]
+    {
+        std::ostringstream output; auto* previous = std::cout.rdbuf(output.rdbuf()); int result;
+        try { result = print_replot_status(args, inputs); } catch (...) { std::cout.rdbuf(previous); throw; }
+        std::cout.rdbuf(previous); return std::pair{result, profile_detail::JsonReader(output.str()).read()};
+    };
+    auto absent = status(); require(!absent.first && inventory_detail::integer(absent.second, "completed_full_proof_validated_groups") == 0,
+        "status without a journal reported unknown completed proof history");
+    auto const output_path = group_path(base / "destination", 0, farm.job_id);
+    { std::ofstream file(output_path); file << "replacement native fixture"; }
+    FarmingReplotDirectory metadata(base / "destination", farm.job_id, true);
+    auto const receipt_path = metadata.path / "receipt-0", journal_path = metadata.metadata.path / "grow-replot.plan";
+    ReplotReceipt receipt{inputs.digest, {}, 0, 0, 1, stream_state::stamp(output_path)};
+    auto const receipt_body = replot_receipt_text(receipt), receipt_digest = stream_state::digest(receipt_body);
+    stream_state::atomic_save(receipt_path, receipt_body + receipt_digest + '\n', false);
+    ReplotJournal journal; journal.review_digest = inputs.digest; journal.farm = farm; journal.phase = ReplotPhase::replacing;
+    journal.batch = 1; journal.retired_prefix = 1; journal.receipt_digest = receipt_digest;
+    auto save_journal = [&](bool existing)
+    { auto const body = replot_journal_text(journal); stream_state::atomic_save(journal_path, body + stream_state::digest(body) + '\n', existing); };
+    auto known = [](profile_detail::Json const& value)
+    {
+        auto const& outputs = inventory_detail::required_field(value, "completed_outputs").items;
+        return inventory_detail::boolean(value, "completed_receipt_chain_verified") &&
+            inventory_detail::integer(value, "completed_full_proof_validated_groups") == 1 && outputs.size() == 1 &&
+            inventory_detail::boolean(outputs.front(), "full_proof_validated");
+    };
+    auto unknown = [](profile_detail::Json const& value)
+    {
+        if (inventory_detail::boolean(value, "completed_receipt_chain_verified") ||
+            inventory_detail::required_field(value, "completed_full_proof_validated_groups").kind != profile_detail::Json::null) return false;
+        for (auto const& output : inventory_detail::required_field(value, "completed_outputs").items)
+            if (inventory_detail::required_field(output, "full_proof_validated").kind != profile_detail::Json::null) return false;
+        return true;
+    };
+    save_journal(false); auto anchored = status();
+    require(!anchored.first && known(anchored.second), "anchored legacy receipt lost its required-proof history");
+    { std::ofstream file(output_path, std::ios::app); file << " changed"; }
+    auto changed = status(); require(changed.first && known(changed.second), "changed native file erased independently anchored proof history");
+    journal.receipt_digest = std::string(64, 'f'); save_journal(true);
+    auto unanchored = status(); require(unanchored.first && unknown(unanchored.second), "internally valid unanchored receipts claimed completed proof evidence");
+    journal.batch = 2; journal.receipt_digest = receipt_digest; save_journal(true);
+    auto missing = status(); require(missing.first && unknown(missing.second), "missing zero-source receipt inherited the prior valid receipt root");
+    journal.batch = 1; save_journal(true);
+    stream_state::atomic_save(receipt_path, "corrupt receipt\n", true);
+    auto corrupt = status(); require(corrupt.first && unknown(corrupt.second), "corrupt receipt history claimed known proof evidence");
+    journal.batch = journal.retired_prefix = 0; journal.receipt_digest.clear(); journal.phase = ReplotPhase::preparing; journal.retirements.resize(1); save_journal(true);
+    auto empty = status(); require(inventory_detail::integer(empty.second, "completed_full_proof_validated_groups") == 0,
+        "empty journal reported unknown completed proof history");
+}
+
+void replot_status_protocol(fs::path const& root)
+{
+    using namespace group_grow::farm; using namespace grow_controller_test;
+    auto const base = root / "replot-status"; fs::create_directories(base / "source");
+    { std::ofstream file(base / "source" / "old.plot"); file << "exact old source"; }
+    std::array<fs::path, 1> inventory_roots{base / "source"};
+    ReplotInputs inputs; inputs.inventory = scan_farm_inventory(inventory_roots);
+    auto& review = inputs.review; review.inventory_json = farm_inventory_text(inputs.inventory); review.resources_json = "{}";
+    review.memory_limit_bytes = 16 * mib; review.reclaim_before_bytes = inputs.inventory.plots.front().identity.allocated_bytes;
+    auto private_farm = farming_format_fixture(6); private_farm.capacity_fill = false;
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    private_farm.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Arguments key_args; key_args.seed = private_farm.seed; key_args.seed_owner = private_farm.seed_owner;
+    key_args.farmer = private_farm.farmer; key_args.pool_ph = private_farm.pool;
+    key_args.k = private_farm.config.k; key_args.strength = private_farm.config.strength; key_args.meta = private_farm.config.meta_group_override;
+    Keys keys(key_args); private_farm.fingerprint = farming_fingerprint(keys);
+#endif
+    std::vector<fs::path> destinations;
+    for (size_t lane = 0; lane < private_farm.directories.size(); ++lane)
+    {
+        auto const path = base / ("destination-" + std::to_string(lane)); fs::create_directory(path); destinations.push_back(path);
+        auto& directory = private_farm.directories[lane]; directory.directory = file_io::path_text(path);
+        directory.directory_identity = farming_directory_identity(path); directory.filesystem = storage_device(path).filesystem;
+        directory.extents.clear(); directory.sealed_files = 0;
+        inventory_detail::RootHandle pin(path); auto const native = inventory_detail::stat(pin.handle);
+        InventoryRoot owner{file_io::path_text(pin.path), directory.directory_identity, storage_device(path),
+            uint64_t(native.st_dev), uint64_t(native.st_ino)};
+        (void)file_io::capture_durable_identity(pin.handle.fd, &owner.durable); review.owned_roots.push_back(std::move(owner));
+    }
+    if (std::none_of(review.owned_roots.begin(), review.owned_roots.end(), [](auto const& value)
+        { return file_io::has_durable_identity(value.durable); })) review.owned_roots.clear();
+    review.farm = parse_farming_state(farming_state_text(private_farm, true), 16 * mib);
+    review.sources = {0}; review.space.resize(destinations.size());
+    uint64_t first = 0;
+    for (size_t lane = 0; lane < destinations.size(); ++lane)
+        for (uint64_t ordinal = 0; ordinal < review.farm.directories[lane].layout.files; ++ordinal)
+        { uint64_t const count = first ? 0 : 1; review.batches.push_back({lane, ordinal, first, count, 4096, 8192, 16384, 4096}); first += count; }
+    inputs.digest = stream_state::digest(replot_review_text(review));
+    Arguments args; args.max_ram = 16 * mib; args.json = true; args.chia_executable = base / "must-not-execute";
+    auto status = [&]
+    {
+        std::ostringstream output; auto* previous = std::cout.rdbuf(output.rdbuf()); int result;
+        try { result = print_replot_status(args, inputs); } catch (...) { std::cout.rdbuf(previous); throw; }
+        std::cout.rdbuf(previous); return std::pair{result, output.str()};
+    };
+    auto fresh = status(); require(!fresh.first && fresh.second.find("\"durable_phase\":\"no-journal-found\"") != fresh.second.npos &&
+        fresh.second.find("\"active_full_proof_validated\":null") != fresh.second.npos &&
+        fresh.second.find("\"mode\":\"strict\"") != fresh.second.npos &&
+        !fs::exists(destinations.front() / ".xchplot2"), "read-only status started a migration");
+    auto const fresh_json = profile_detail::JsonReader(fresh.second).read();
+    auto const& fresh_diagnosis = inventory_detail::required_field(fresh_json, "diagnosis");
+    require(inventory_detail::string(fresh_diagnosis, "status") == "history-unknown" &&
+        inventory_detail::string(fresh_diagnosis, "condition").find("does not establish") != std::string::npos &&
+        inventory_detail::string(fresh_diagnosis, "next_safe_action").find("only if this reviewed job has never run") != std::string::npos,
+        "missing migration journal was reported as authorization to start or discard prior recovery artifacts");
+    args.json = false; auto fresh_human = status(); args.json = true;
+    require(!fresh_human.first && fresh_human.second.find(inventory_detail::string(fresh_diagnosis, "condition")) != std::string::npos &&
+        fresh_human.second.find(inventory_detail::string(fresh_diagnosis, "next_safe_action")) != std::string::npos,
+        "human and JSON migration diagnostics disagree about missing private history or its safe next action");
+    ReplotJournal initial; initial.review_digest = inputs.digest; initial.farm = private_farm; initial.retirements.resize(1);
+    auto journals = load_replot_journals(destinations, inputs.digest, args.max_ram);
+    publish_replot_journals(journals, initial, args.max_ram, [] {});
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    auto const preparing = audit_replot_objects(args, inputs, journals.state, keys);
+    require(!preparing.construction && preparing.publications.empty() && replot_journals_unchanged(journals) &&
+        !fs::exists(farming_replot_directory(destinations.front(), private_farm.job_id, false)),
+        "preparing journal audit required or created an unstarted construction namespace");
+#endif
+    auto advance = [&](auto change)
+    { auto next = next_replot_revision(journals.state, journals.digest, change); publish_replot_journals(journals, next, args.max_ram, [] {}); };
+    advance([](auto& value) { value.phase = ReplotPhase::replacing; });
+    advance([](auto& value) { value.retirements[0] = {ReplotRetirement::claim_intent, true}; });
+    auto pending = next_replot_revision(journals.state, journals.digest, [](auto& value) { value.retirements[0].state = ReplotRetirement::claimed; });
+    auto const& source = inputs.inventory.plots.front(); auto const& source_root = inputs.inventory.roots.front();
+    (void)claim_replot_source(source_root, source, private_farm.job_id, 0, {});
+    auto const claim_name = file_io::native_path(source_root.path) / replot_claim_path(private_farm.job_id, 0);
+    fs::rename(claim_name, base / "held-claim");
+    require(status().first, "status accepted claim intent with both native names absent");
+    fs::rename(base / "held-claim", claim_name);
+    auto text = replot_journal_text(pending); stage_farming_state(journals.replicas.front().path, text + stream_state::digest(text) + '\n', false);
+    auto before = load_replot_journals(destinations, inputs.digest, args.max_ram);
+    auto claimed = status();
+    require(!claimed.first && claimed.second.find("exact-claimed-object-present") != claimed.second.npos &&
+        claimed.second.find("\"replica_publication_pending\":true") != claimed.second.npos &&
+        claimed.second.find("\"live_service_health\":\"not-queried\"") != claimed.second.npos && replot_journals_unchanged(before),
+        "status changed pending recovery, missed exact claim or queried live services");
+    publish_replot_journals(before, before.state, args.max_ram, [] {}); journals = std::move(before);
+    auto const original = file_io::native_path(source_root.path) / source.relative_path;
+    auto const claim = file_io::native_path(source_root.path) / replot_claim_path(private_farm.job_id, 0);
+    fs::rename(claim, original);
+    require(!status().first, "status rejected exact rolled-back claimed source");
+    (void)claim_replot_source(source_root, source, private_farm.job_id, 0, {}, true);
+    auto const& batch = review.batches.front(); auto const final = group_path(destinations[batch.lane], batch.ordinal, private_farm.job_id);
+    FarmingReplotDirectory stage_directory(final.parent_path(), private_farm.job_id, true);
+    auto const stage = migration_stage_path(final.parent_path(), private_farm.job_id, 0);
+    { std::ofstream file(stage); file << "verified replacement native fixture"; }
+    file_io::DurableIdentity stage_owner;
+    if (!review.owned_roots.empty())
+    {
+        inventory_detail::RootHandle pin(stage.parent_path()); inventory_detail::SourceHandle source(pin, file_io::path_text(stage.filename()));
+        (void)file_io::capture_durable_identity(source.handle.fd, &stage_owner);
+    }
+    advance([&](auto& value)
+    {
+        value.verified_stage = stream_state::stamp(stage); value.verified_stage_identity = stage_owner;
+        if (file_io::has_durable_identity(stage_owner)) value.verified_stage->device ^= UINT64_C(0x40000000);
+    });
+    fs::rename(stage, final);
+    auto renamed = status(); require(!renamed.first && renamed.second.find("verified-object-renamed-publication-pending") != renamed.second.npos &&
+        renamed.second.find("\"active_full_proof_validated\":true") != renamed.second.npos &&
+        renamed.second.find("saved_verified_stage_stamp") != renamed.second.npos, "status lost verified publication rename evidence");
+    fs::remove(final);
+    require(status().first, "status accepted missing verified replacement");
+    fs::rename(destinations.back(), base / "unavailable-destination");
+    auto missing = status(); require(missing.first && missing.second.find("\"all_replicas_available\":false") != missing.second.npos,
+        "status fabricated complete progress with a missing replica");
+    fs::create_directory(destinations.back()); auto replaced = status();
+    require(replaced.first && replaced.second.find("\"matches_reviewed_identity\":false") != replaced.second.npos,
+        "status treated a replacement mountpoint as the reviewed native directory");
+
+    ReplotLocalBindings local{inputs.digest, private_farm.job_id, "local-host", "local-user", "chia", "/config", "/executable", "/profile"};
+    auto const local_text = replot_local_bindings_text(local);
+    require(local_text.starts_with("ordinary-group-replot-local-v1\n") &&
+        replot_local_bindings_text(parse_replot_local_bindings(local_text)) == local_text, "legacy private binding roundtrip changed bytes");
+    local.compute_settings = "{\"compute_settings\":{\"schema\":1,\"options\":{\"--compute-local\":\"off\"}}}";
+    auto const with_compute = replot_local_bindings_text(local);
+    require(with_compute.starts_with("ordinary-group-replot-local-v2\n") &&
+        replot_local_bindings_text(parse_replot_local_bindings(with_compute)) == with_compute,
+        "private compute selection roundtrip changed bytes");
+    auto const tight_allowance = replot_journal_allocation(4096, 4096, 4096);
+    require(!replot_local_bindings_fit(4096, 4096, local_text.size(), 4096, tight_allowance) &&
+        replot_local_bindings_fit(4096, 4096, local_text.size(), 4096, tight_allowance + 65536),
+        "optional local bindings consumed the legacy journal/handoff allowance or ignored spare metadata room");
+    ReplotRevalidation successor{replot_review_text(review), review.inventory_json, review.resources_json, {}, journals.digest};
+    auto const successor_text = replot_revalidation_text(successor);
+    require(replot_revalidation_text(parse_replot_revalidation(successor_text, args.max_ram)) == successor_text, "flat successor roundtrip changed bytes");
+    auto policy = next_replot_revision(journals.state, journals.digest, [](auto& value) { value.policy_digest = std::string(64, 'f'); });
+    require(replot_journal_text(policy).starts_with(file_io::has_durable_identity(stage_owner) ?
+        "ordinary-group-replot-journal-v3\n" : "ordinary-group-replot-journal-v2\n") &&
+        replot_journal_text(parse_replot_journal(replot_journal_text(policy), args.max_ram)) == replot_journal_text(policy), "active policy journal lost its version or bytes");
+    auto reverted = policy; ++reverted.revision; reverted.parent_digest = stream_state::digest(replot_journal_text(policy)); reverted.policy_digest.clear();
+    require(!valid_replot_revision(policy, reverted), "active policy silently reverted to the original review");
+    require(replot_policy_activation(journals.state, journals.digest, std::string(64, 'f'), &successor), "exact reviewed successor boundary did not require activation");
+    require(!replot_policy_activation(policy, stream_state::digest(replot_journal_text(policy)), policy.policy_digest, &successor), "already active policy required reactivation");
+    auto binding = [&](ReplotJournal const& state, std::string const& digest, std::string const& selected, ReplotRevalidation const* review)
+    { return std::string_view(replot_policy_binding(state, digest, selected, review)); };
+    require(binding(journals.state, journals.digest, {}, nullptr) == "origin" &&
+        binding(journals.state, journals.digest, policy.policy_digest, &successor) == "pending" &&
+        binding(journals.state, std::string(64, '0'), policy.policy_digest, &successor) == "stale-boundary",
+        "status confused original, matching pending and stale reviewed boundaries");
+    auto const policy_digest = stream_state::digest(replot_journal_text(policy));
+    require(binding(policy, policy_digest, policy.policy_digest, &successor) == "active" &&
+        binding(policy, policy_digest, {}, nullptr) == "origin-with-active-successor" &&
+        binding(policy, policy_digest, std::string(64, 'e'), &successor) == "different-active-policy",
+        "status invented prior activation history for an unactivated sibling or ignored the active policy");
+    auto next_successor = successor; next_successor.parent_policy_digest = policy.policy_digest; next_successor.journal_digest = policy_digest;
+    require(binding(policy, policy_digest, std::string(64, 'e'), &next_successor) == "pending" &&
+        replot_policy_activation(policy, policy_digest, std::string(64, 'e'), &next_successor),
+        "next reviewed successor classification differs from exact activation authorization");
+    auto rejects = [&](auto operation)
+    { bool refused = false; try { operation(); } catch (std::exception const&) { refused = true; } require(refused, "invalid successor or provenance was accepted"); };
+    rejects([&] { (void)parse_replot_local_bindings(with_compute.substr(0, with_compute.rfind('\n', with_compute.size() - 2) + 1)); });
+    auto construction_review = successor;
+    construction_review.construction = ReplotConstructionEvidence{0, "incremental", GROW_IDENTITY, std::string(64, 'b'), {1, 2, 4096, 3, 4, 5, 6}};
+    auto const construction_text = replot_revalidation_text(construction_review);
+    require(construction_text.starts_with("ordinary-group-replot-revalidation-v2\n") &&
+        replot_revalidation_text(parse_replot_revalidation(construction_text, args.max_ram)) == construction_text &&
+        parse_replot_revalidation(construction_text, args.max_ram).origin_review == successor.origin_review,
+        "construction successor lost its explicit version, original bytes or exact checkpoint binding");
+    auto verification_review = construction_review; verification_review.verification = ReplotVerification{ReplotVerificationMode::sampled, 1, 7};
+    auto const verification_text = replot_revalidation_text(verification_review);
+    auto const parsed_verification = parse_replot_revalidation(verification_text, args.max_ram);
+    require(verification_text.starts_with("ordinary-group-replot-revalidation-v3\n") &&
+        parsed_verification.origin_review == successor.origin_review && parsed_verification.construction == construction_review.construction &&
+        parsed_verification.verification == verification_review.verification && replot_revalidation_text(parsed_verification) == verification_text,
+        "verification successor changed its origin, checkpoint or explicit sample schedule");
+    auto legacy_again = construction_review; legacy_again.construction.reset();
+    require(successor_text.starts_with("ordinary-group-replot-revalidation-v1\n") && replot_revalidation_text(legacy_again) == successor_text,
+        "optional construction authority changed legacy successor bytes");
+    auto current_binding = construction_review.construction;
+    validate_replot_construction_binding(construction_review.construction, current_binding);
+    current_binding->inspection_digest[0] = 'c';
+    rejects([&] { validate_replot_construction_binding(construction_review.construction, current_binding); });
+    current_binding.reset(); rejects([&] { validate_replot_construction_binding(construction_review.construction, current_binding); });
+    auto damaged_binding = construction_review; damaged_binding.construction->stage.inode = 0;
+    rejects([&] { (void)replot_revalidation_text(damaged_binding); });
+    rejects([&] { (void)parse_replot_revalidation(construction_text.substr(0, construction_text.find_last_of('\n', construction_text.size() - 2) + 1), args.max_ram); });
+    rejects([&] { (void)replot_policy_activation(policy, stream_state::digest(replot_journal_text(policy)), {}, nullptr); });
+    rejects([&] { (void)replot_policy_activation(journals.state, std::string(64, '0'), std::string(64, 'f'), &successor); });
+    auto changed_inventory = inputs.inventory; changed_inventory.plots[0].reader = "chia"; changed_inventory.plots[0].reader_version = "new";
+    changed_inventory.plots[0].reader_identity = std::string(64, 'a');
+    std::array<uint64_t, 1> nonactive{0};
+    rejects([&] { validate_replot_nonactive_provenance(inputs.inventory, changed_inventory, nonactive); });
+    auto nested = successor; nested.origin_review = successor_text;
+    rejects([&] { (void)replot_revalidation_text(nested); });
+    auto loader_review = review; auto loader_inventory = inputs.inventory;
+    loader_inventory.plots[0].workload_id = "old"; loader_review.inventory_json = farm_inventory_text(loader_inventory);
+    auto loader_profile = make_profile_template({Resource{"cpu:" + loader_inventory.host, loader_inventory.host, {}, ResourceKind::cpu}},
+        {{"old", 1}}, loader_inventory.captured_at, GROW_IDENTITY);
+    std::ostringstream loader_resources; write_profile_json(loader_resources, loader_profile); loader_review.resources_json = loader_resources.str();
+    auto const noncanonical = replot_review_text(loader_review) + '\n';
+    auto const original_digest = stream_state::digest(noncanonical); auto const path = base / "original-noncanonical.plan";
+    stream_state::atomic_save(path, noncanonical + original_digest + '\n', false);
+    Arguments load_args; load_args.from_plan = path; load_args.max_ram = 64 * mib;
+    auto loaded = load_replot_review(load_args);
+    require(loaded.digest == original_digest && loaded.origin_review_body == noncanonical &&
+        replot_review_text(loaded.review) != loaded.origin_review_body, "original loader canonicalized compatible reviewed bytes");
+    ReplotRevalidation exact{loaded.origin_review_body, loaded.review.inventory_json, loaded.review.resources_json, {}, journals.digest};
+    auto exact_parsed = parse_replot_revalidation(replot_revalidation_text(exact), load_args.max_ram);
+    require(exact_parsed.origin_review == noncanonical && stream_state::digest(exact_parsed.origin_review) == original_digest,
+        "successor changed the original review's bytes or journal/receipt digest");
+
+    auto const identified_path = base / "identified-originals"; fs::create_directory(identified_path);
+    { std::ofstream first(identified_path / "active.plot"), second(identified_path / "protected.plot"); first << "active native source"; second << "protected native source"; }
+    std::array<fs::path, 1> identified_roots{identified_path}; auto identified = scan_farm_inventory(identified_roots);
+    identified.network.available = true; identified.network.network = "test-network"; identified.network.genesis_challenge = std::string(64, 'a');
+    identified.network.reader_identity = std::string(64, 'b'); identified.network.reader_version = "original-reader";
+    for (size_t index = 0; index < identified.plots.size(); ++index)
+    {
+        auto& plot = identified.plots[index]; plot.algorithm = PlotAlgorithm::pos1; plot.container = PlotContainer::chiapos_v1; plot.k = 18;
+        plot.native_identified = true; plot.reader = "chia"; plot.reader_version = "original-reader"; plot.reader_identity = std::string(64, 'b');
+        plot.plot_id = std::string(64, index ? 'c' : 'd'); plot.plot_public_key = std::string(96, 'e'); plot.pool_contract_puzzle_hash = std::string(64, 'f');
+        plot.status = index ? "protected" : "candidate";
+    }
+    auto updated = identified;
+    for (auto& plot : updated.plots) { plot.reader = "gigahorse"; plot.reader_version = "updated-reader"; plot.reader_identity = std::string(64, '1'); }
+    updated.network.reader_identity = std::string(64, '1'); updated.network.reader_version = "updated-reader";
+    auto const identified_bytes = farm_inventory_text(identified), updated_bytes = farm_inventory_text(updated);
+    validate_replot_reader_changes(identified, updated);
+    require(farm_inventory_text(identified) == identified_bytes && farm_inventory_text(updated) == updated_bytes,
+        "reader invariant comparison changed actual native identification metadata");
+    {
+        auto large = identified; auto prototype = large.plots.front(); prototype.identity.durable = {};
+        large.plots.clear(); large.plots.reserve(18000);
+        for (uint64_t index = 0; index < 18000; ++index)
+        {
+            auto plot = prototype; plot.relative_path = "large-" + std::to_string(index) + ".plot"; plot.identity.stamp.inode = index + 1;
+            large.plots.push_back(std::move(plot));
+        }
+        Arguments large_args; large_args.max_ram = 16 * 1024 * mib;
+        auto const limits = replot_inventory_limits(large_args); auto const bytes = farm_inventory_text(large, limits);
+        require(bytes.size() > InventoryLimits{}.max_output_bytes, "large successor fixture did not cross the default serialization bound");
+        auto current = parse_farm_inventory(bytes, limits); current.network.reader_version = "updated-reader";
+        rejects([&] { validate_replot_reader_changes(large, current); });
+        validate_replot_reader_changes(large, current, limits);
+        require(farm_inventory_text(large, limits) == bytes, "large successor validation changed original compatible inventory bytes");
+    }
+    auto malformed = updated; malformed.plots.front().reader_identity.clear();
+    rejects([&] { validate_replot_reader_changes(identified, malformed); });
+    malformed = identified; malformed.plots.back().reader_version.clear();
+    rejects([&] { validate_replot_reader_changes(malformed, updated); });
+    auto changed_native = updated; ++changed_native.plots.back().identity.allocated_bytes;
+    rejects([&] { validate_replot_reader_changes(identified, changed_native); });
+    auto changed_count = updated; changed_count.plots.pop_back();
+    rejects([&] { validate_replot_reader_changes(identified, changed_count); });
+    replot_status_receipt_evidence(root);
+}
+
+void replot_capacity_prefix()
+{
+    using namespace grow_controller_test;
+    require(replot_metadata_remaining(64, 0) == 64 && replot_metadata_remaining(64, 24) == 40 &&
+        !replot_metadata_remaining(64, 64) && !replot_metadata_remaining(64, 80),
+        "live migration metadata reservation omitted future allocations or charged current blocks twice");
+    require(sum(replot_metadata_remaining(64, 24), replot_metadata_remaining(64, 8)) == 96,
+        "shared-filesystem migration replicas failed to reserve every unallocated metadata allowance");
+    ReplotInputs input;
+    input.review.farm.headroom = 0;
+    FarmingDirectory destination; destination.filesystem = "output-fs";
+    input.review.farm.directories = {destination};
+    input.review.space = {{96, 96, 128, 32, 8}};
+    input.review.sources = {0, 1};
+    input.review.batches = {{0, 0, 0, 1, 64, 32, 4, 4}, {0, 1, 1, 1, 64, 32, 4, 4}};
+    farm::InventoryRoot root; root.storage.filesystem = "output-fs";
+    input.inventory.roots = {root}; input.inventory.plots.resize(2);
+    input.inventory.plots[0].identity.allocated_bytes = 32;
+    input.inventory.plots[1].identity.allocated_bytes = 64;
+    require(!replot_prefix_capacity(input).empty(),
+        "replacement-first prefix spent source bytes before its mapped replacement was ready");
+    input.review.reclaim_before_bytes = 36;
+    require(!replot_prefix_capacity(input).empty(), "pre-delete limit admitted a fraction of an indivisible old file");
+    input.review.reclaim_before_bytes = 64;
+    require(replot_prefix_capacity(input).empty(),
+        "ready replacement failed to release its outstanding pre-delete allowance for the next batch");
+    auto receipts = input;
+    for (auto& batch : receipts.review.batches) batch.receipt_allowance_bytes = 12;
+    require(!replot_prefix_capacity(receipts).empty(), "later replacement ignored retained receipt allocations");
+    auto elsewhere = input; elsewhere.inventory.roots[0].storage.filesystem = "other-fs";
+    elsewhere.review.reclaim_before_bytes = 1024;
+    require(!replot_prefix_capacity(elsewhere).empty(), "retiring another filesystem supplied output free space");
+    auto resources = input; resources.review.space[0].free_bytes = 1024;
+    std::vector<std::vector<uint64_t>> early;
+    auto requires_retirement = [&](size_t batch, auto const&, std::span<uint64_t const> selected)
+    { return selected.size() == 1 && selected.front() == resources.review.sources[batch]; };
+    require(replot_prefix_capacity(resources, requires_retirement, {"output-fs"}, &early).empty() &&
+        early == std::vector<std::vector<uint64_t>>{{0}, {1}},
+        "resource-driven retirement did not use the same bounded indivisible source mapping with ample free disk space");
+    resources.review.reclaim_before_bytes = 31;
+    require(!replot_prefix_capacity(resources, requires_retirement, {"output-fs"}, &early).empty() && early.front().empty(),
+        "resource-driven retirement exceeded the physical early-deletion cap");
+    auto no_journal = input; no_journal.review.space[0].free_bytes = 7;
+    no_journal.review.reclaim_before_bytes = 1024;
+    require(!replot_prefix_capacity(no_journal).empty(), "retirement began without space for durable private state");
+    auto oversized = input;
+    oversized.review.batches = {{0, 0, 0, 2, 120, 0, 0, 0}};
+    oversized.review.reclaim_before_bytes = 32;
+    oversized.inventory.plots[0].identity.allocated_bytes = UINT64_MAX;
+    oversized.inventory.plots[1].identity.allocated_bytes = 32;
+    require(replot_prefix_capacity(oversized, {}, {}, &early).empty() && early == std::vector<std::vector<uint64_t>>{{1}},
+        "an oversized earlier source hid a later legal indivisible predelete candidate");
+    oversized.inventory.plots[0].identity.allocated_bytes = 16;
+    oversized.inventory.plots[1].identity.allocated_bytes = UINT64_MAX;
+    oversized.inventory.plots.push_back(oversized.inventory.plots[0]);
+    oversized.review.sources.push_back(2); oversized.review.batches[0].sources = 3;
+    require(replot_prefix_capacity(oversized, {}, {}, &early).empty() && early == std::vector<std::vector<uint64_t>>{{0, 2}},
+        "a later fitting candidate lost remaining predelete allowance after an overflowing source");
+    auto fragmented = input; fragmented.review.space[0].free_bytes = 112;
+    fragmented.review.batches = {{0, 0, 0, 2, 64, 32, 0, 0}, {0, 1, 2, 0, 64, 32, 0, 0}};
+    auto exact_projection = [&](size_t batch, std::map<std::string, uint64_t> const& available, std::span<uint64_t const> prospective)
+    {
+        auto expected = fragmented.review.space[0].free_bytes - fragmented.review.space[0].metadata_allowance_bytes;
+        if (!batch)
+        {
+            for (auto source : prospective) expected += fragmented.inventory.plots.at(size_t(source)).identity.allocated_bytes;
+            require(available.at("output-fs") == expected, "an alternative trial retained credit from an earlier rejected source");
+            return std::find(prospective.begin(), prospective.end(), uint64_t(1)) != prospective.end();
+        }
+        for (auto const& plot : fragmented.inventory.plots) expected += plot.identity.allocated_bytes;
+        expected -= fragmented.review.batches[0].final_bound_bytes;
+        require(available.at("output-fs") == expected, "chosen trial release was credited more than once across the ready prefix");
+        return true;
+    };
+    require(replot_prefix_capacity(fragmented, exact_projection, {"output-fs"}, &early).empty() &&
+        early == std::vector<std::vector<uint64_t>>{{1}, {}}, "prefix admission did not retain only its feasible alternative predelete set");
+}
+
+void replot_source_selection(fs::path const& directory)
+{
+    using namespace grow_controller_test;
+    auto parse = [](std::initializer_list<char const*> options)
+    {
+        std::vector<char*> command; for (auto option : options) command.push_back(const_cast<char*>(option));
+        return pos2gpu::parse_group_options(int(command.size()), command.data(), "plan");
+    };
+    auto const options = parse({"plan", "destination", "--replot", "inventory.plan", "--replot-source-root", "old",
+        "--replot-exclude-root", "protected", "--replot-max-source-files", "2", "--replot-max-source-bytes", "32",
+        "--farm-adapter", "chia", "--chia-root", "config", "--chia-executable", "chia"});
+    require(options.replot_source_roots == std::vector<fs::path>{fs::absolute("old")} &&
+        options.replot_exclude_roots == std::vector<fs::path>{fs::absolute("protected")} &&
+        options.replot_max_source_files == 2 && options.replot_max_source_bytes == 32 &&
+        options.farm_adapter_set && options.chia_root_set && options.chia_executable_set && !options.farming_profile_set,
+        "replot source selection or explicit local connection options changed");
+    auto reject = [&](std::initializer_list<char const*> inputs)
+    {
+        bool rejected = false; try { (void)parse(inputs); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, "replot source selection accepted an unrelated action or empty limit");
+    };
+    reject({"plan", "destination", "--replot-max-source-files", "2"});
+    reject({"plan", "destination", "--replot", "inventory.plan", "--replot-max-source-bytes", "0"});
+    reject({"plan", "--metadata-only", "saved.plan", "--replot-source-root", "unread"});
+    farm::FarmInventory inventory;
+    farm::InventoryRoot first, second; first.path = file_io::path_text(directory / "old"); second.path = file_io::path_text(directory / "protected");
+    inventory.roots = {first, second}; inventory.plots.resize(3);
+    inventory.plots[0].root = 0; inventory.plots[0].identity.allocated_bytes = UINT64_MAX;
+    inventory.plots[1].root = 0; inventory.plots[1].identity.allocated_bytes = 32;
+    inventory.plots[2].root = 1; inventory.plots[2].identity.allocated_bytes = 16;
+    for (auto& plot : inventory.plots) plot.workload_id = "shared-reader";
+    Arguments args;
+    require(replot_source_roots(args, inventory) == std::vector<bool>{true, true}, "default replot selection no longer includes all inventoried roots");
+    args.replot_source_roots = {directory / "old" / ""};
+    require(replot_source_roots(args, inventory) == std::vector<bool>{true, false}, "source root selector did not normalize like native inventory roots");
+    args.replot_source_roots.clear(); args.replot_exclude_roots = {directory / "protected"};
+    require(replot_source_roots(args, inventory) == std::vector<bool>{true, false}, "excluded source root remained eligible");
+    args.replot_source_roots = args.replot_exclude_roots;
+    bool rejected = false; try { (void)replot_source_roots(args, inventory); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "conflicting source-root include/exclude selectors were accepted");
+    args.replot_source_roots = {directory / "unknown"};
+    rejected = false; try { (void)replot_source_roots(args, inventory); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "source selector accepted an unreviewed root");
+    args.replot_max_source_files = 2; args.replot_max_source_bytes = 32;
+    require(limit_replot_sources(args, inventory, {0, 1, 2}) == std::vector<uint64_t>{1},
+        "source byte limit split an old file, overflowed, or hid a later fitting source");
+    args.replot_max_source_files = 1; args.replot_max_source_bytes = 0;
+    require(limit_replot_sources(args, inventory, {2, 1}) == std::vector<uint64_t>{2}, "source file limit changed ranked order");
+    require(replot_inventory_counts(inventory).front().count == inventory.plots.size(),
+        "limiting retirement sources removed protected entries from farm resource accounting");
+    auto const protected_root = directory / "protected";
+    fs::create_directories(protected_root / "nested");
+    auto const alias = directory / "protected-alias"; fs::create_directory_symlink(protected_root, alias);
+    std::array<fs::path, 1> exclusions{protected_root};
+    require(farming_path_excluded(protected_root, exclusions) && farming_path_excluded(alias / "nested/old.plot", exclusions) &&
+        !farming_path_excluded(directory / "protected-other", exclusions),
+        "destination exclusions missed a descendant/alias or matched only a string prefix");
+}
+
+void replot_predelete_selection()
+{
+    auto const candidate = [](size_t) { return ReplotPredeleteCandidate{32, true}; };
+    auto const paired = [](std::span<size_t const> selected) { return selected.size() == 2; };
+    auto pending = select_replot_predeletions(3, 64, 32, {1}, candidate, paired);
+    require(pending.feasible && pending.sources == std::vector<size_t>{1, 0},
+        "pending predelete debt or a seeded candidate was charged twice");
+    auto bounded = select_replot_predeletions(3, 32, 0, {},
+        [](size_t source) { return ReplotPredeleteCandidate{source == 1 ? 32 : UINT64_MAX, true}; },
+        [](std::span<size_t const> selected) { return !selected.empty(); });
+    require(bounded.feasible && bounded.sources == std::vector<size_t>{1},
+        "shared predelete selection overflowed or hid a later fitting whole file");
+    bool rejected = false;
+    try { (void)select_replot_predeletions(3, 64, 64, {1, 1}, candidate, paired); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "shared predelete selection accepted duplicate pending offsets");
+    rejected = false;
+    try { (void)select_replot_predeletions(3, 32, 64, {1}, candidate, paired); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "shared predelete selection accepted debt beyond the saved allowance");
+    size_t zero_candidates = 0;
+    auto zero_source = [&](size_t) { ++zero_candidates; return ReplotPredeleteCandidate{0, true}; };
+    auto any_source = [](std::span<size_t const> selected) { return !selected.empty(); };
+    auto replacement_first = select_replot_predeletions(1, 0, 0, {}, zero_source, any_source);
+    require(!replacement_first.feasible && !replacement_first.search_exhausted && replacement_first.sources.empty() && !zero_candidates,
+        "zero-cap resource admission added an optional zero-allocation source");
+    auto pending_zero = select_replot_predeletions(1, 0, 0, {0}, zero_source, any_source);
+    require(pending_zero.feasible && pending_zero.sources == std::vector<size_t>{0} && !zero_candidates,
+        "replacement-first policy dropped an already-durable pending source");
+    auto explicit_release = select_replot_predeletions(1, 1, 0, {}, zero_source, any_source);
+    require(explicit_release.feasible && explicit_release.sources == std::vector<size_t>{0},
+        "explicit positive debt policy excluded a legitimate zero-allocation resource release");
+
+    auto fragmented = select_replot_predeletions(2, 64, 0, {},
+        [](size_t source) { return ReplotPredeleteCandidate{source ? 64u : 32u, true}; },
+        [](std::span<size_t const> selected) { return std::find(selected.begin(), selected.end(), size_t(1)) != selected.end(); });
+    require(fragmented.feasible && fragmented.sources == std::vector<size_t>{1},
+        "a small greedy debt commitment hid a feasible later source");
+    size_t const count = replot_predelete_combination_checks + 8, last = count - 1;
+    auto late = select_replot_predeletions(count, 2, 0, {},
+        [&](size_t source) { return ReplotPredeleteCandidate{source == last ? 2u : 1u, true}; },
+        [&](std::span<size_t const> selected) { return std::find(selected.begin(), selected.end(), last) != selected.end(); });
+    require(late.feasible && late.sources == std::vector<size_t>{last}, "singleton rescue stopped at the combination budget");
+    bool removed_choice = false; std::vector<size_t> previous;
+    auto combination = [&]
+    {
+        return select_replot_predeletions(4, 64, 0, {},
+            [](size_t source) { constexpr uint64_t bytes[]{32, 32, 48, 16}; return ReplotPredeleteCandidate{bytes[source], true}; },
+            [&](std::span<size_t const> selected)
+            {
+                for (auto source : previous) if (std::find(selected.begin(), selected.end(), source) == selected.end()) removed_choice = true;
+                previous.assign(selected.begin(), selected.end());
+                return std::find(selected.begin(), selected.end(), size_t(2)) != selected.end() &&
+                    std::find(selected.begin(), selected.end(), size_t(3)) != selected.end();
+            });
+    };
+    auto combined = combination(), repeated = combination();
+    require(combined.feasible && combined.sources == std::vector<size_t>({2, 3}) && repeated.sources == combined.sources && removed_choice,
+        "bounded combination search lost a legal subset, deterministic order, or replacement trial");
+    auto impossible = select_replot_predeletions(3, 3, 0, {}, [](size_t) { return ReplotPredeleteCandidate{2, true}; },
+        [](std::span<size_t const> selected) { return selected.size() >= 2; });
+    require(!impossible.feasible && !impossible.search_exhausted && impossible.sources.empty(),
+        "exhaustive infeasibility was confused with bounded search exhaustion");
+    size_t calls = 0, visits = 0, descriptors = 0;
+    auto worst = select_replot_predeletions(replot_maximum_batch_sources, replot_maximum_batch_sources, 0, {},
+        [&](size_t) { ++descriptors; return ReplotPredeleteCandidate{1, true}; },
+        [&](std::span<size_t const> selected) { ++calls; visits += std::max(size_t(1), selected.size()); return false; });
+    require(!worst.feasible && worst.search_exhausted && descriptors == replot_maximum_batch_sources &&
+        calls <= 2 * replot_maximum_batch_sources + 1 + replot_predelete_combination_checks &&
+        visits <= (replot_maximum_batch_sources + 1) * replot_maximum_batch_sources + replot_predelete_fallback_source_visits,
+        "worst-case greedy plus fallback exceeded its separate invocation/source-visit bounds");
+    std::vector<size_t> mandatory;
+    for (size_t source = 0; source < 127; ++source) mandatory.push_back(source);
+    auto exhausted = select_replot_predeletions(256, 128, 127, mandatory,
+        [](size_t) { return ReplotPredeleteCandidate{1, true}; },
+        [](std::span<size_t const> selected) { return std::find(selected.begin(), selected.end(), size_t(255)) != selected.end(); });
+    require(!exhausted.feasible && exhausted.search_exhausted && exhausted.sources == mandatory,
+        "pending commitments changed when source-visit budget prevented complete singleton coverage");
+}
+
+void replot_actionable_ranking()
+{
+    using namespace grow_controller_test; using namespace farm;
+    Profile profile; profile.source = profile.producer = "ranking-fixture";
+    Resource cpu; cpu.id = "cpu"; cpu.host = "host"; cpu.capacity = 8; cpu.capacity_known = true;
+    profile.resources = {cpu};
+    Workload large; large.id = "large"; large.plot_count = replot_maximum_batch_sources + 1;
+    large.format = large.decoder = large.decoder_version = large.backend = large.pool_difficulty = large.source = "declared";
+    large.cost = CostKind::serialized; large.bounded = large.scope_complete = true;
+    large.quality_burst = large.proof_burst = large.future_quality_burst = large.future_proof_burst = 1;
+    large.period_us = large.deadline_us = 10000;
+    Use use; use.resource = "cpu"; use.required_units = 1; use.quality_us = use.proof_us = 100; use.blocking_us = 1;
+    large.uses = {use}; auto small = large; small.id = "small"; small.plot_count = 1;
+    small.uses[0].quality_us = small.uses[0].proof_us = 80; profile.workloads = {large, small};
+    FarmInventory inventory; inventory.plots.resize(large.plot_count + small.plot_count); std::vector<uint64_t> candidates;
+    for (size_t index = 0; index < inventory.plots.size(); ++index)
+    {
+        inventory.plots[index].workload_id = index < large.plot_count ? "large" : "small";
+        inventory.plots[index].identity.allocated_bytes = 1; candidates.push_back(index);
+    }
+    Stage stage; stage.name = "ranking-fixture"; stage.scope_complete = true; stage.remaining = replot_inventory_counts(inventory);
+    Victim all_large; all_large.id = all_large.workload = "large"; all_large.count = large.plot_count; all_large.physical_bytes = large.plot_count;
+    Victim all_small; all_small.id = all_small.workload = "small"; all_small.count = all_small.physical_bytes = 1;
+    require(rank_victims(profile, stage, {all_large, all_small}, "cpu").front().victim.workload == "large",
+        "full-workload ranking fixture did not prefer the unachievable larger cohort");
+    auto ranked = rank_replot_sources(profile, inventory, candidates, 16 * mib);
+    require(ranked.size() == candidates.size() && inventory.plots.at(size_t(ranked.front())).workload_id == "small",
+        "bounded ranking claimed complete resource relief from a cohort exceeding the active batch");
+    ranked = rank_replot_sources(profile, inventory, candidates, 16 * mib, 1, 1);
+    require(ranked.size() == candidates.size() && inventory.plots.at(size_t(ranked.front())).workload_id == "small",
+        "source caps changed ranking by whole-workload rather than actionable whole-file release");
+}
+
+void replot_source_mapping()
+{
+    using namespace grow_controller_test;
+    ReplotInputs input; FarmingDirectory destination; destination.filesystem = "shared";
+    input.review.farm.directories = {destination, destination}; input.review.farm.headroom = 0;
+    input.review.space = {{4096, 0, 0, 0, 8}, {4096, 0, 0, 0, 8}};
+    input.review.batches = {{0, 0, 0, 0, 16, 0, 0, 0}, {1, 0, 0, 0, 16, 0, 0, 0}};
+    farm::InventoryRoot root; root.storage.filesystem = "shared"; input.inventory.roots = {root};
+    input.inventory.plots.resize(replot_maximum_batch_sources + 1); std::vector<uint64_t> ranked;
+    for (size_t index = 0; index < input.inventory.plots.size(); ++index)
+    {
+        input.inventory.plots[index].identity.allocated_bytes = 1; input.inventory.plots[index].workload_id = "one-cohort";
+        ranked.push_back(index);
+    }
+    auto repeated = input.review;
+    map_replot_sources(input.review, input.inventory, ranked, 16 * mib);
+    map_replot_sources(repeated, input.inventory, ranked, 16 * mib);
+    require(input.review.sources == repeated.sources && input.review.batches[0].sources == repeated.batches[0].sources &&
+        input.review.batches[1].sources == repeated.batches[1].sources && input.review.sources.size() == ranked.size(),
+        "source mapping is not deterministic or lost a selected source");
+    for (auto const& batch : input.review.batches) require(batch.sources && batch.sources <= replot_maximum_batch_sources,
+        "shared-filesystem destinations concentrated sources into the first bounded batch");
+    auto insufficient = repeated; insufficient.batches.resize(1);
+    bool rejected = false;
+    try { map_replot_sources(insufficient, input.inventory, ranked, 16 * mib); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "source mapping exceeded aggregate remaining replacement slots");
+    ReplotInputs unequal; unequal.review.farm.headroom = 0; unequal.review.farm.directories = {destination, destination};
+    unequal.review.space = {{96, 0, 0, 0, 8}, {96, 0, 0, 0, 8}};
+    unequal.review.reclaim_before_bytes = 320;
+    unequal.review.sources = {0, 1, 2}; unequal.review.batches = {{0, 0, 0, 2, 160, 32, 0, 0}, {1, 0, 2, 1, 160, 32, 0, 0}};
+    unequal.inventory.roots = {root}; unequal.inventory.plots.resize(3);
+    unequal.inventory.plots[0].identity.allocated_bytes = unequal.inventory.plots[1].identity.allocated_bytes = 32;
+    unequal.inventory.plots[2].identity.allocated_bytes = 256;
+    unequal.inventory.plots[0].workload_id = unequal.inventory.plots[1].workload_id = "small-cohort";
+    unequal.inventory.plots[2].workload_id = "large-cohort";
+    require(!replot_prefix_capacity(unequal).empty(), "equal-file partition fixture unexpectedly had bootstrap space");
+    map_replot_sources(unequal.review, unequal.inventory, {0, 1, 2}, 16 * mib);
+    require(replot_prefix_capacity(unequal).empty() && unequal.review.batches[0].sources == unequal.inventory.plots.size(),
+        "byte-based mapping left usable bootstrap release behind a later replacement");
+    auto locality = unequal; locality.review.farm.directories[0].filesystem = "other";
+    locality.review.space[0].free_bytes = locality.review.space[1].free_bytes = 4096;
+    map_replot_sources(locality.review, locality.inventory, {0, 1, 2}, 16 * mib);
+    require(!locality.review.batches[0].sources && locality.review.batches[1].sources == locality.inventory.plots.size(),
+        "source mapping ignored available same-filesystem replacement locality");
+
+    auto resources = input; resources.review.farm.directories[0].filesystem = "output-a";
+    resources.review.farm.directories[1].filesystem = "output-b"; resources.review.reclaim_before_bytes = 1;
+    resources.inventory.roots = {root, root}; resources.inventory.roots[0].storage.filesystem = "output-a";
+    resources.inventory.roots[1].storage.filesystem = "output-b";
+    size_t const hot = resources.inventory.plots.size() - 1;
+    for (size_t source = 0; source < resources.inventory.plots.size(); ++source)
+    { auto& plot = resources.inventory.plots[source]; plot.root = source == hot ? 1 : 0; plot.workload_id = source == hot ? "hot" : "local"; }
+    std::vector<uint64_t> global{hot}; for (size_t source = 0; source < hot; ++source) global.push_back(source);
+    auto requires_hot = [&](size_t batch, auto const&, std::span<uint64_t const> early)
+    { return batch || std::find(early.begin(), early.end(), uint64_t(hot)) != early.end(); };
+    auto old_locality = resources;
+    map_replot_sources(old_locality.review, old_locality.inventory, global, 16 * mib);
+    require(!replot_prefix_capacity(old_locality, requires_hot, {"output-a", "output-b"}).empty(),
+        "later-destination hot-cohort fixture unexpectedly fit locality-first mapping");
+    bool search_exhausted = false;
+    auto capacity = [&](size_t batch, std::span<uint64_t const> completed, std::span<uint64_t const> early)
+    {
+        if (batch) require(completed.size() == replot_maximum_batch_sources,
+            "resource mapping lost its completed full-batch source prefix");
+        return requires_hot(batch, completed, early);
+    };
+    auto deterministic = resources.review;
+    map_replot_sources(resources.review, resources.inventory, global, 16 * mib, capacity, &search_exhausted);
+    map_replot_sources(deterministic, resources.inventory, global, 16 * mib, capacity);
+    require(!search_exhausted && replot_prefix_capacity(resources, requires_hot, {"output-a", "output-b"}).empty() &&
+        resources.review.sources.front() == hot && resources.review.sources == deterministic.sources &&
+        resources.review.batches[0].sources == replot_maximum_batch_sources && resources.review.batches[1].sources == 1,
+        "resource-first mapping did not admit the later-filesystem hot source within source/debt slots");
+    auto identities = resources.review.sources; std::sort(identities.begin(), identities.end());
+    auto expected_identities = global; std::sort(expected_identities.begin(), expected_identities.end());
+    require(identities == expected_identities && resources.review.batches[0].lane == 0 && resources.review.batches[1].lane == 1,
+        "resource mapping changed selected source identities/count or immutable output order");
+    auto replacement_first = old_locality.review; replacement_first.reclaim_before_bytes = 0;
+    map_replot_sources(replacement_first, resources.inventory, global, 16 * mib, capacity);
+    require(replacement_first.sources == old_locality.review.sources, "zero-debt policy changed locality before any replacement was ready");
+}
+
+void replot_review_options(fs::path const& directory)
+{
+    auto parse = [](std::string_view action, std::vector<std::string> options)
+    {
+        options.insert(options.begin(), "xchplot2"); std::vector<char*> command;
+        for (auto& option : options) command.push_back(option.data());
+        return pos2gpu::parse_group_options(int(command.size()), command.data(), action);
+    };
+    auto reject = [&](std::string_view action, std::vector<std::string> options)
+    {
+        bool rejected = false; try { (void)parse(action, std::move(options)); } catch (std::exception const&) { rejected = true; }
+        require(rejected, "migration review/display options accepted an unrelated mode or profile");
+    };
+    auto const profile = directory / "resource-only.json", origin = directory / "migration.plan", ordinary = directory / "ordinary.plan";
+    { std::ofstream file(profile); file << "{\"farm_resources\":{}}\n"; }
+    { std::ofstream file(origin); file << "ordinary-group-replot-review-v1\n"; }
+    { std::ofstream file(ordinary); file << "ordinary-group-farming-plan\n"; }
+    auto const resource_only = parse("plan", {"destination", "--replot", "inventory.plan", "--harvester", profile.string(), "--compute", "off"});
+    require(resource_only.farming_profile_set && !resource_only.farming_profile,
+        "resource-only migration input invented an ordinary reader calibration");
+    require(!resource_only.replot_verification && grow_controller_test::requested_replot_verification(resource_only).mode == ReplotVerificationMode::structural,
+        "new migration review did not default to structural verification");
+    auto sampled = parse("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled", "--compute", "off"});
+    require(grow_controller_test::requested_replot_verification(sampled) == ReplotVerification{ReplotVerificationMode::sampled, 1, 0},
+        "sampled policy did not default to the initial group");
+    auto periodic = parse("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled",
+        "--replot-proof-first-groups", "0", "--replot-proof-every-groups", "7", "--compute", "off"});
+    require(grow_controller_test::requested_replot_verification(periodic) == ReplotVerification{ReplotVerificationMode::sampled, 0, 7},
+        "explicit periodic-only sample schedule was changed");
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled", "--replot-proof-first-groups", "0"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "strict", "--replot-proof-every-groups", "7"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-proof-first-groups", "1"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "unknown"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled", "--replot-proof-first-groups", "18446744073709551616"});
+    reject("plan", {"--from-plan", origin.string(), "--replot-verification", "structural"});
+    reject("fill", {"--from-plan", origin.string(), "--replot-verification", "structural"});
+    reject("plan", {"--status", origin.string(), "--replot-verification", "structural"});
+    reject("plan", {"destination", "--harvester", profile.string()});
+    reject("plan", {"--from-plan", ordinary.string(), "--harvester", profile.string()});
+    auto const saved = parse("plan", {"--from-plan", origin.string(), "--harvester", profile.string(), "--compute", "off"});
+    require(!saved.farming_profile, "saved migration did not reuse resource-only profile semantics");
+    {
+        ReplotReview review; review.memory_limit_bytes = saved.max_ram;
+        auto restored = grow_controller_test::replot_review_options(saved, review);
+        require(restored.destination_temp == "off" && restored.temporary.empty(),
+            "new scratch default widened a legacy migration review");
+        review.owned_roots.push_back({directory.string()});
+        review.scratch_directories.push_back((directory / "reviewed-scratch").string());
+        restored = grow_controller_test::replot_review_options(saved, review);
+        require(restored.destination_temp == "off" && restored.temporary == std::vector<fs::path>{directory / "reviewed-scratch"},
+            "new scratch default replaced the migration's reviewed temporary directories");
+        auto explicit_policy = saved; explicit_policy.destination_temp = "on"; explicit_policy.destination_temp_set = true;
+        restored = grow_controller_test::replot_review_options(explicit_policy, review);
+        require(restored.destination_temp == "on" && restored.temporary.empty(),
+            "saved migration option restoration discarded an explicit scratch policy");
+    }
+    for (auto const* resource_input : {"{\"schema\":1,\"resources\":[],\"workloads\":[]}",
+        "{\"schema_version\":1,\"kind\":\"farm-inventory\",\"farm_resources\":{}}"})
+    {
+        { std::ofstream file(profile); file << resource_input << '\n'; }
+        auto const migration = parse("plan", {"destination", "--replot", "inventory.plan", "--harvester", profile.string(), "--compute", "off"});
+        auto const restored = parse("plan", {"--from-plan", origin.string(), "--harvester", profile.string(), "--compute", "off"});
+        require(!migration.farming_profile && !restored.farming_profile, "raw resources or inventory wrapper invented an ordinary reader profile");
+        reject("plan", {"destination", "--harvester", profile.string()});
+        reject("plan", {"--from-plan", ordinary.string(), "--harvester", profile.string()});
+    }
+    FarmingProfile reader; reader.config.harvester_cores = 1;
+    std::ostringstream combined; write_farming_profile_json(combined, reader);
+    auto combined_text = combined.str(); combined_text.pop_back(); combined_text += ",\"farm_resources\":{}}";
+    { std::ofstream file(profile); file << combined_text << '\n'; }
+    auto const declared_reader = parse("plan", {"destination", "--replot", "inventory.plan", "--harvester", profile.string(), "--compute", "off"});
+    require(declared_reader.farming_profile && declared_reader.farming_profile->config.harvester_cores == reader.config.harvester_cores,
+        "combined top-level ordinary model inputs were ignored during migration");
+    { std::ofstream file(profile); file << "{\"farm_resources\":{},\"farming_profile\":{\"schema_version\":1,\"model\":\"wrong\"}}\n"; }
+    reject("plan", {"destination", "--replot", "inventory.plan", "--harvester", profile.string()});
+    for (auto const* ordinary_input : {"{\"farm_resources\":{},\"schema_version\":1,\"model\":\"wrong\"}",
+        "{\"farm_resources\":{},\"schema_version\":1}"})
+    {
+        { std::ofstream file(profile); file << ordinary_input << '\n'; }
+        reject("plan", {"destination", "--replot", "inventory.plan", "--harvester", profile.string()});
+    }
+    { std::ofstream file(profile); file << "{\"resource_preparation\":{}}\n"; }
+    reject("plan", {"destination", "--replot", "inventory.plan", "--harvester", profile.string()});
+    auto const status = parse("fill", {"--status", origin.string(), "--json"});
+    require(status.replot_status && status.from_plan == origin && !status.automatic_compute && !status.farming_profile &&
+        status.chia_root.empty() && status.chia_executable.empty(), "migration status initialized local farming or compute services");
+    reject("plan", {"--status", origin.string(), "--harvester", "unread-profile"});
+    reject("plan", {"--status", origin.string(), "--metadata-only"});
+    auto const ordinary_status = parse("plan", {"--status", ordinary.string()});
+    require(ordinary_status.replot_status && ordinary_status.from_plan == ordinary && !ordinary_status.automatic_compute,
+        "ordinary status initialized services or lost its selector");
+    reject("plan", {"--revalidate", "--from-plan", origin.string()});
+    reject("fill", {"--revalidate", "--from-plan", origin.string(), "--harvester", profile.string(), "--save-plan", "next.plan"});
+}
+
+void replot_destination_namespace(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    auto const destination = root / "replot-namespace", empty = root / "replot-empty";
+    fs::create_directory(destination); fs::create_directory(empty);
+    Arguments args; args.max_ram = 512 * mib;
+    std::array<fs::path, 1> roots{destination};
+    auto catalog = scan_farm_inventory(roots, replot_inventory_limits(args));
+    replot_destination_coverage(args, catalog, empty, {});
+    auto const file = destination / "opaque-farm-data";
+    { std::ofstream out(file, std::ios::binary); out << "protected existing data"; }
+    auto reject = [&](auto operation, char const* message)
+    { bool failed = false; try { operation(); } catch (std::runtime_error const&) { failed = true; } require(failed, message); };
+    reject([&] { replot_destination_coverage(args, catalog, destination, {}); },
+        "migration accepted existing destination data omitted from inventory");
+    catalog = scan_farm_inventory(roots, replot_inventory_limits(args));
+    replot_destination_coverage(args, catalog, destination, {});
+    { std::ofstream out(file, std::ios::app); out << " changed"; }
+    reject([&] { replot_destination_coverage(args, catalog, destination, {}); },
+        "migration accepted a changed inventoried destination object");
+    catalog = scan_farm_inventory(roots, replot_inventory_limits(args));
+    auto const metadata = destination / "explicit-inventory-input";
+    { std::ofstream out(metadata, std::ios::binary); out << "typed caller-validated catalog fixture"; }
+    std::array<ReplotMetadataFile, 1> supplied{{{metadata, stream_state::stamp(metadata)}}};
+    replot_destination_coverage(args, catalog, destination, supplied, &catalog);
+    require(catalog.plots.size() == 2 && replot_nonplot(catalog.plots.back()),
+        "explicit typed metadata failed to retain a protected native-stamped observation");
+    replot_destination_coverage(args, catalog, destination, {});
+    { std::ofstream out(metadata, std::ios::app); out << " stale"; }
+    reject([&] { replot_destination_coverage(args, catalog, destination, supplied); },
+        "changed metadata received an unverified destination exemption");
+
+    auto const writers = root / "reserved-writers"; fs::create_directory(writers);
+    FarmingMetadataDirectory private_metadata(writers); private_metadata.create();
+    FarmingReplotDirectory private_job(writers, std::string(64, 'e'), true);
+    for (auto const& path : {private_metadata.path, private_job.path})
+    {
+        reject([&] { require_unmanaged_group_directory(path); }, "standalone writer adopted private migration bookkeeping");
+        auto fresh = args; fresh.target = path; fresh.plan_only = true;
+        reject([&] { (void)farming_arguments(fresh); }, "ordinary farming adopted private migration bookkeeping");
+    }
+    require(fs::is_empty(private_job.path) && !fs::exists(private_metadata.path / "grow-farm.plan"),
+        "reserved destination refusal changed private migration bookkeeping");
+    require_unmanaged_group_directory(writers);
+    { std::ofstream journal(writers / "grow-replot.plan"); journal << "legacy managed marker"; }
+    reject([&] { require_unmanaged_group_directory(writers); }, "legacy migration destination lost its standalone guard");
+
+    for (bool nested : {false, true})
+    {
+        auto const base = root / (nested ? "legacy-namespace-ancestor" : "legacy-namespace-member");
+        auto path = base / ".xchplot2"; if (nested) path /= "lane";
+        fs::create_directories(path);
+        auto state = farming_format_fixture(6); state.directories.resize(1); state.estimate.destinations.resize(1);
+        state.directories[0].directory = file_io::path_text(path); state.directories[0].directory_identity = farming_directory_identity(path);
+        state.directories[0].identity_resources = 1;
+        auto const body = farming_state_text(state), bytes = body + stream_state::digest(body) + '\n';
+        stream_state::atomic_save(path / "grow-farm.plan", bytes, false);
+        auto legacy = args; legacy.target = path; legacy.plan_only = true; legacy.destination_temp = "on";
+        auto saved = farming_arguments(legacy);
+        require(saved.saved && saved.legacy_metadata.value_or(false) && saved.directories.front() == path &&
+            legacy.destination_temp == "off" && contents(path / "grow-farm.plan") == std::vector<uint8_t>(bytes.begin(), bytes.end()),
+            "legacy saved job under a reserved-name ancestor could not be inspected unchanged");
+        reject([&] { require_unmanaged_group_directory(path); }, "standalone writer inherited a legacy job's namespace exception");
+        if (!nested)
+        {
+            auto const moved = root / "relocated-legacy-namespace" / ".xchplot2"; fs::create_directory(moved.parent_path()); fs::rename(path, moved);
+            legacy.target = moved; legacy.relocations.emplace_back(path, moved);
+            auto relocated = farming_arguments(legacy);
+            require(relocated.saved && relocated.relocated.contains(0) && relocated.directories.front() == moved,
+                "explicit legacy reserved-name relocation lost its saved authority");
+        }
+    }
+}
+
+void replot_retirement_protocol(fs::path const& root)
+{
+#ifdef __linux__
+    using namespace group_grow::farm;
+    auto const base = root / "replot-retirement"; fs::create_directory(base);
+    std::string const job(64, 'd');
+    auto reject = [](auto operation, char const* message)
+    { bool failed = false; try { operation(); } catch (std::runtime_error const&) { failed = true; } require(failed, message); };
+    auto write = [](fs::path const& path, std::string const& bytes)
+    { std::ofstream out(path, std::ios::binary); out << bytes; require(bool(out), "cannot write retirement fixture"); };
+    auto read = [](fs::path const& path)
+    { auto bytes = contents(path); return std::string(bytes.begin(), bytes.end()); };
+    auto fixture = [&](std::string const& name)
+    {
+        auto const directory = base / name; fs::create_directories(directory / "nested");
+        // The low-level retirement protocol operates on an already-authorized
+        // native object. Format eligibility is covered by inventory/controller
+        // fixtures; these bytes make accidental substitution easy to detect.
+        write(directory / "nested" / "source.plot", "reviewed source bytes");
+        std::array<fs::path, 1> roots{directory}; auto inventory = scan_farm_inventory(roots);
+        require(inventory.plots.size() == 1, "retirement fixture has an unexpected inventory");
+        return inventory;
+    };
+    auto claim_path = [&](FarmInventory const& inventory)
+    { return file_io::native_path(inventory.roots[0].path) / replot_claim_path(job, 0); };
+    auto original_path = [](FarmInventory const& inventory)
+    { return file_io::native_path(inventory.roots[0].path) / inventory.plots[0].relative_path; };
+    auto claim = [&](FarmInventory const& inventory)
+    { return claim_replot_source(inventory.roots[0], inventory.plots[0], job, 0, {}); };
+    auto unlink = [&](FarmInventory const& inventory, std::function<void()> gate)
+    { unlink_replot_claim(inventory.roots[0], inventory.plots[0], job, 0, {}, gate); };
+    auto normal = fixture("normal"); auto const observed = normal.plots[0].identity;
+    require(same_inventory_contents(claim(normal), observed) && !fs::exists(original_path(normal)) &&
+        read(claim_path(normal)) == "reviewed source bytes", "claim lost or replaced the reviewed source");
+    require(same_inventory_contents(claim(normal), observed), "claim could not recover an interrupted rename");
+    reject([&] { unlink(normal, [] { throw std::runtime_error("not ready"); }); }, "retirement ignored a fresh readiness refusal");
+    require(read(claim_path(normal)) == "reviewed source bytes", "failed readiness removed the claim");
+    unsigned gates = 0; unlink(normal, [&] { ++gates; });
+    require(gates == 1 && replot_claim_missing(normal.roots[0], normal.plots[0], job, 0), "retirement did not recheck readiness or finish its claim");
+
+    auto changed = fixture("changed-source"); auto const original = original_path(changed);
+    fs::rename(original, original.parent_path() / "saved.plot"); write(original, "reviewed source bytes");
+    reject([&] { (void)claim(changed); }, "same-byte replacement inode was claimed as the old source");
+    require(read(original) == "reviewed source bytes" && fs::exists(original.parent_path() / "saved.plot") &&
+        !fs::exists(claim_path(changed)), "source mismatch changed a file");
+
+    auto collision = fixture("claim-collision"); fs::create_directory(claim_path(collision).parent_path());
+    require(!::chmod(claim_path(collision).parent_path().c_str(), 0700), "cannot protect fixture claim directory");
+    write(claim_path(collision), "unrelated claim");
+    reject([&] { (void)claim(collision); }, "claim overwrote a pre-existing file");
+    require(read(claim_path(collision)) == "unrelated claim" && read(original_path(collision)) == "reviewed source bytes",
+        "claim collision did not preserve both files");
+
+    auto unprotected = fixture("unprotected-claim"); fs::create_directory(claim_path(unprotected).parent_path());
+    require(!::chmod(claim_path(unprotected).parent_path().c_str(), 0755), "cannot set fixture claim permissions");
+    reject([&] { (void)claim(unprotected); }, "retirement accepted a claim directory accessible to other users");
+    require(fs::exists(original_path(unprotected)), "unprotected claim directory lost the original");
+
+    auto alias = fixture("new-hardlink"); fs::create_hard_link(original_path(alias), original_path(alias).parent_path() / "alias.plot");
+    reject([&] { (void)claim(alias); }, "source gained a hardlink after review but was still claimed");
+    require(fs::exists(original_path(alias)), "hardlink rejection removed the source");
+    auto changed_claim = fixture("changed-claim"); (void)claim(changed_claim);
+    reject([&] { unlink(changed_claim, [&]
+        {
+            fs::rename(claim_path(changed_claim), claim_path(changed_claim).parent_path() / "saved-claim");
+            write(claim_path(changed_claim), "substituted claim");
+        }); }, "claim substituted during live readiness was unlinked");
+    require(read(claim_path(changed_claim)) == "substituted claim" &&
+        read(claim_path(changed_claim).parent_path() / "saved-claim") == "reviewed source bytes",
+        "changed claim did not preserve both native objects");
+
+    auto changed_root = fixture("changed-root"); auto const root_path = file_io::native_path(changed_root.roots[0].path);
+    fs::rename(root_path, base / "old-root"); fs::create_directories(root_path / "nested"); write(original_path(changed_root), "new mount contents");
+    reject([&] { (void)claim(changed_root); }, "retirement accepted a different root directory");
+    require(read(original_path(changed_root)) == "new mount contents" &&
+        read(base / "old-root" / "nested" / "source.plot") == "reviewed source bytes", "root mismatch removed a file");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    auto swapped = fixture("rename-substitution");
+    retirement_rename_hook = [&](int parent, char const* name, int, char const*)
+    {
+        require(!::renameat(parent, name, parent, "saved-before-rename"), "cannot inject source substitution");
+        write(original_path(swapped), "substituted source");
+    };
+    reject([&] { (void)claim(swapped); }, "source substituted between pin and rename was accepted");
+    require(!retirement_rename_hook && read(claim_path(swapped)) == "substituted source" &&
+        read(original_path(swapped).parent_path() / "saved-before-rename") == "reviewed source bytes",
+        "failed native identity check did not preserve both files");
+
+    auto moved_parent = fixture("moved-parent"); auto const moved_root = file_io::native_path(moved_parent.roots[0].path);
+    fs::create_directory(moved_root / "other"); write(moved_root / "other" / "source.plot", "unrelated symlink target");
+    retirement_rename_hook = [&](int, char const*, int, char const*)
+    {
+        fs::rename(moved_root / "nested", moved_root / "parked");
+        fs::create_directory_symlink(moved_root / "other", moved_root / "nested");
+    };
+    require(same_inventory_contents(claim(moved_parent), moved_parent.plots[0].identity) && !retirement_rename_hook &&
+        read(claim_path(moved_parent)) == "reviewed source bytes" &&
+        read(moved_root / "other" / "source.plot") == "unrelated symlink target",
+        "retirement followed a swapped ancestor instead of its pinned parent");
+    unlink(moved_parent, [] {});
+    require(read(moved_root / "other" / "source.plot") == "unrelated symlink target", "retirement deleted through a substituted ancestor");
+#endif
+
+    for (auto const* point : {"replot-source-renamed", "replot-before-unlink", "replot-source-unlinked"})
+    {
+        auto interrupted = fixture(point); auto const child = ::fork(); require(child >= 0, "cannot fork retirement recovery fixture");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
+            (void)claim(interrupted); unlink(interrupted, [] {}); std::_Exit(1);
+        }
+        int status = 0;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+            "retirement missed its injected durability boundary");
+        bool const removed = std::string_view(point) == "replot-source-unlinked";
+        require(!fs::exists(original_path(interrupted)) &&
+            replot_claim_missing(interrupted.roots[0], interrupted.plots[0], job, 0) == removed,
+            "retirement recovery confused claimed and removed sources");
+        if (!removed)
+        {
+            require(same_inventory_contents(claim(interrupted), interrupted.plots[0].identity), "interrupted claim lost its native identity");
+            unsigned fresh = 0; unlink(interrupted, [&] { ++fresh; });
+            require(fresh == 1, "recovered retirement skipped its fresh readiness check");
+        }
+        require(replot_claim_missing(interrupted.roots[0], interrupted.plots[0], job, 0), "retirement recovery left a source behind");
+    }
+#else
+    (void)root;
+#endif
+}
+
+void farming_saved_reads(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto reject = [](auto operation, char const* message)
+    {
+        bool rejected = false;
+        try { operation(); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, message);
+    };
+    auto const state = farming_format_fixture(5);
+    auto const plan = farming_state_text(state), preview = farming_preview_text(state, {}, {}, {});
+    for (auto const& body : {plan, preview})
+    {
+        auto const path = root / (body == plan ? "bounded-farming-plan" : "bounded-farming-preview");
+        auto const saved = body + stream_state::digest(body) + '\n';
+        stream_state::atomic_save(path, saved);
+        require(read_farming_state(path, mib).body == body, "bounded farming read changed canonical bytes");
+        if (body == plan) require(load_farming_state(path, mib).job_id == state.job_id,
+            "bounded private farming read changed its identity");
+        else require(farming_state_text(load_farming_preview(path, mib).preview.state, true) == farming_state_text(state, true),
+            "bounded preview read changed its managed layout");
+        stream_state::atomic_save(path, saved.substr(0, saved.size() - 1));
+        reject([&] { (void)read_farming_state(path, mib); }, "farming read accepted truncated checksum bytes");
+        stream_state::atomic_save(path, saved + "extra");
+        reject([&] { (void)read_farming_state(path, mib); }, "farming read accepted trailing checksum bytes");
+        stream_state::atomic_save(path, saved);
+        reject([&] { (void)read_farming_state(path, 16); }, "farming read ignored its read budget");
+    }
+}
+
+void farming_compatibility_format(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto reject = [](auto operation, char const* message)
+    {
+        bool rejected = false;
+        try { operation(); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, message);
+    };
+    for (unsigned version : {3u, 4u, 5u, 6u})
+    {
+        auto state = farming_format_fixture(version);
+        auto const original = farming_state_text(state);
+        require(farming_state_text(parse_farming_state(original)) == original,
+            "farming compatibility changed canonical saved bytes");
+        state.producer_build = std::string(64, 'e');
+        auto const foreign = farming_state_text(state);
+        if (version < 6)
+        {
+            bool refused = false;
+            try { (void)parse_farming_state(foreign); }
+            catch (LegacyFarmingPlanBuildError const& error)
+            { refused = error.producer_build == state.producer_build; }
+            require(refused, "legacy recovery lost its exact-build guard or original producer diagnostic");
+        }
+        else require(farming_state_text(parse_farming_state(foreign)) == foreign,
+            "compatible farming plan did not preserve foreign producer provenance");
+        auto inspected = parse_farming_state(foreign, mib, FarmingStateLoad::metadata_only);
+        require(inspected.version == version && inspected.producer_build == state.producer_build &&
+            farming_state_text(inspected) == foreign, "metadata inspection migrated a legacy revision");
+        auto const path = root / ("foreign-farming-v" + std::to_string(version));
+        stream_state::atomic_save(path, foreign + stream_state::digest(foreign) + '\n');
+        auto const before = contents(path);
+        require(load_farming_state(path, mib, FarmingStateLoad::metadata_only).producer_build == state.producer_build &&
+            contents(path) == before, "metadata inspection changed its private source");
+        if (version >= 5)
+        {
+            Arguments args; args.command = "plan"; args.metadata_only = args.plan_only = args.json = true;
+            args.manifest = path; args.max_ram = mib;
+            struct Capture
+            {
+                std::ostringstream text; std::streambuf* previous = std::cout.rdbuf(text.rdbuf());
+                ~Capture() { std::cout.rdbuf(previous); }
+            };
+            auto const report = [&]
+            {
+                Capture capture; require(print_farming_metadata(args) == 0, "metadata report failed");
+                return capture.text.str();
+            }();
+            auto const json = profile_detail::JsonReader(report).read();
+            require(profile_detail::boolean(*profile_detail::field(json, "metadata_only")) &&
+                !profile_detail::boolean(*profile_detail::field(json, "live_readiness_checked")) &&
+                profile_detail::boolean(*profile_detail::field(json, "plan_compatible")) == (version >= 6) &&
+                report.find(state.seed) == report.npos && report.find(state.farmer) == report.npos &&
+                contents(path) == before, "metadata report exposed keys, changed its source or claimed live readiness");
+        }
+        auto preview_state = state;
+        preview_state.profile_json.clear(); // The legacy format fixture uses opaque profile bytes.
+        auto const preview = farming_preview_text(preview_state, {}, {}, {});
+        if (version < 6)
+            reject([&] { (void)parse_farming_preview(preview); }, "legacy preview recovery accepted a foreign producer build");
+        require(parse_farming_preview(preview, mib, FarmingStateLoad::metadata_only).state.producer_build == state.producer_build,
+            "metadata inspection could not read a foreign-build preview");
+    }
+    auto const state = farming_format_fixture(6);
+    auto replace = [&](std::string const& from, std::string const& to)
+    {
+        auto text = farming_state_text(state); auto const at = text.find(from);
+        require(at != text.npos, "missing compatibility fixture field"); text.replace(at, from.size(), to); return text;
+    };
+    for (auto const& text : {replace("ordinary-group-farming-v6", "ordinary-group-farming-v7"),
+        replace(farming_model_identity, "unknown-farming-model"),
+        replace(farming_key_derivation_identity, "unknown-farming-key-derivation")})
+        for (auto mode : {FarmingStateLoad::recovery, FarmingStateLoad::metadata_only})
+            reject([&] { (void)parse_farming_state(text, mib, mode); },
+                "unsupported farming compatibility was accepted for recovery or inspection");
+    auto numeric = farming_state_text(state);
+    auto const key_end = numeric.find(farming_key_derivation_identity) + std::string_view(farming_key_derivation_identity).size() + 1;
+    numeric.replace(key_end, numeric.find('\n', key_end) - key_end, " 0 0 0");
+    for (auto mode : {FarmingStateLoad::recovery, FarmingStateLoad::metadata_only})
+        reject([&] { (void)parse_farming_state(numeric, mib, mode); },
+            "unsupported numeric representation was normalized during recovery or inspection");
+    auto changed = state; changed.producer_build = std::string(64, 'f');
+    require(!valid_farming_extent_revision(state, changed), "farming revision rewrote its producer provenance");
+}
+
+void farming_joint_forecasts(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto const base = root / "joint-forecasts"; fs::create_directory(base);
+    auto save = [&](fs::path const& path, FarmingPreview const& preview)
+    { auto text = farming_preview_text(preview); stream_state::atomic_save(path, text + stream_state::digest(text) + '\n'); };
+    auto fixture = [&](std::string const& name, char id, FarmingConfig config, uint16_t membership = 1)
+    {
+        auto const directory = base / name; fs::create_directory(directory);
+        FarmingState state; state.job_id.assign(64, id); state.fixed_extent = state.capacity_fill = true;
+        state.config = config; state.max_groups = 8; state.max_total_members = 32;
+        FarmingDirectory lane; lane.directory = directory.string(); lane.directory_identity = farming_directory_identity(directory);
+        lane.filesystem = storage_device(directory).filesystem; lane.capacity_bytes = 64 * mib;
+        lane.storage.capacity_bytes = lane.capacity_bytes; lane.storage.resource = 0;
+        lane.storage.read_bytes_per_second = 1e12L; lane.storage.read_latency_seconds = 1e-9L; lane.storage.read_concurrency = 1;
+        lane.layout.files = lane.layout.families = 1; lane.layout.total_members = membership;
+        lane.layout.group_members = config.group_members_override ? config.group_members_override : membership;
+        lane.layout.fixed_members = bool(config.group_members_override);
+        lane.layout.meta_bits = uint8_t(std::min({8u, farming_filter_bits(config), farming_filter_bits(config, true)}));
+        lane.layout.meta_base = config.meta_group_override; lane.extents = {membership};
+        state.estimate.destinations = {lane.layout};
+        static_cast<FarmingAssessment&>(state.estimate) = farming_assess(config, {lane.storage}, {lane.layout}, {{membership}});
+        require(state.estimate.feasible, "single-job joint fixture is infeasible");
+        state.directories.push_back(std::move(lane));
+        FarmingProfile profile; profile.config = config; profile.source = "fixture-" + name;
+        profile.captured_at = "2026-11-03T00:00:00Z"; profile.host_name = name; set_farming_state_profile(state, profile);
+        FarmingPreview preview; preview.state = std::move(state); preview.source_digest.assign(64, 'e');
+        preview.source = base / (name + "-private-source");
+        auto const path = base / (name + ".plan"); save(path, preview); return path;
+    };
+    auto options = [&](std::initializer_list<fs::path> paths)
+    {
+        Arguments args; args.command = "plan"; args.plan_only = args.assess_jobs = true;
+        args.assessment_plans.assign(paths); args.max_ram = 64 * mib; return args;
+    };
+    auto reject = [&](Arguments const& args, char const* message)
+    {
+        bool rejected = false;
+        try { (void)farming_joint_assessment(args); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, message);
+    };
+    FarmingConfig config; config.k = 18;
+    auto const a = fixture("namespace-a", '1', config), b = fixture("namespace-b", '2', config);
+    auto const before_a = contents(a), before_b = contents(b);
+    auto const separate = farming_joint_assessment(options({a}));
+    auto const joint = farming_joint_assessment(options({a, b}));
+    require(separate.assessment.feasible && !joint.assessment.feasible &&
+        joint.assessment.max_eligible_families_per_resource == 2 && joint.resources == 1 &&
+        joint.sources[0].profile_source != joint.sources[1].profile_source &&
+        joint.sources[0].saved.digest == read_farming_state(a, 64 * mib).digest &&
+        contents(a) == before_a && contents(b) == before_b &&
+        fs::is_empty(base / "namespace-a") && fs::is_empty(base / "namespace-b"),
+        "joint assessment merged independent families, ignored sharing, compared provenance or wrote files");
+    reject(options({a, a}), "joint assessment accepted duplicate summaries");
+    auto duplicate = load_farming_preview(b, 64 * mib).preview;
+    duplicate.state.job_id = load_farming_preview(a, 64 * mib).preview.state.job_id;
+    duplicate.state.revision = 2; duplicate.state.parent_digest.assign(64, 'f');
+    auto const duplicate_path = base / "duplicate-job.plan"; save(duplicate_path, duplicate);
+    reject(options({a, duplicate_path}), "joint assessment counted revisions of the same job independently");
+    auto alias = load_farming_preview(b, 64 * mib).preview;
+    alias.state.directories = load_farming_preview(a, 64 * mib).preview.state.directories;
+    auto const alias_path = base / "alias.plan"; save(alias_path, alias);
+    reject(options({a, alias_path}), "joint assessment accepted duplicate destination aliases");
+
+    config.max_eligible_families_per_resource = 4; config.harvester_cores = config.lookup_workers = 1;
+    config.index_seconds_per_entry = 0; config.chain_seconds_per_member = 5;
+    auto const cpu_a = fixture("cpu-a", '3', config), cpu_b = fixture("cpu-b", '4', config);
+    auto const cpu = farming_joint_assessment(options({cpu_a, cpu_b}));
+    require(!cpu.assessment.feasible && cpu.assessment.reason.find("response deadline") != std::string::npos,
+        "joint assessment gave each job its own CPU grant");
+    auto changed = load_farming_preview(cpu_b, 64 * mib).preview;
+    ++changed.state.config.harvester_cores; changed.state.profile_metadata.reset();
+    auto const changed_path = base / "different-profile.plan"; save(changed_path, changed);
+    reject(options({cpu_a, changed_path}), "joint assessment normalized incompatible saved service profiles");
+
+    config.chain_seconds_per_member = 0.004L; config.reader = FarmingReader::cached;
+    config.index_cache_bytes = uint64_t(1) << (config.k - 3);
+    FarmingDestination storage; storage.capacity_bytes = 64 * mib;
+    FarmingDrivePlan layout; layout.files = layout.total_members = layout.group_members = layout.families = 1;
+    layout.meta_bits = uint8_t(std::min({8u, farming_filter_bits(config), farming_filter_bits(config, true)}));
+    config.memory_bytes = farming_assess(config, {storage}, {layout}, {{1}}).reader_memory_bytes;
+    auto const memory_a = fixture("memory-a", '5', config), memory_b = fixture("memory-b", '6', config);
+    auto const shared_memory = farming_joint_assessment(options({memory_a, memory_b}));
+    require(!shared_memory.assessment.feasible && shared_memory.assessment.reason.find("working memory") != std::string::npos,
+        "joint assessment duplicated the declared cache or reader-memory grant");
+
+    config.reader = FarmingReader::stateless; config.memory_bytes = 512 * mib;
+    auto const forecast_a = fixture("offline-a", '7', config, 2), forecast_b = fixture("offline-b", '8', config);
+    auto first = load_farming_preview(forecast_a, 64 * mib).preview;
+    first.state.directories[0].extents = {1}; save(forecast_a, first);
+    auto second = load_farming_preview(forecast_b, 64 * mib).preview;
+    second.state.directories[0].extents = {3}; save(forecast_b, second);
+    fs::rename(base / "offline-a", base / "offline-a-unavailable");
+    auto const offline = farming_joint_assessment(options({forecast_a, forecast_b}));
+    require(offline.offline_destinations == 1 && offline.resources == 1 &&
+        offline.sources[0].members == 2 && offline.sources[1].members == 3,
+        "joint assessment dropped an offline forecast or a larger admitted extent");
+    config.group_members_override = 2;
+    auto const groups_a = fixture("group-size-a", '9', config, 2);
+    config.group_members_override = 3; config.objective = FarmingObjective::latency;
+    auto const groups_b = fixture("group-size-b", 'a', config, 3);
+    require(farming_joint_assessment(options({groups_a, groups_b})).assessment.feasible,
+        "joint assessment rejected compatible saved group-size or objective choices");
+    auto limited = options({a}); limited.max_ram = 3 * mib;
+    require(farming_joint_assessment(limited).planning_memory_bytes <= limited.max_ram,
+        "single joint source exceeded its bounded parser/model grant");
+    limited.assessment_plans.push_back(b);
+    reject(limited, "joint assessment applied --max-ram independently to each source");
+    auto excessive = first; excessive.state.capacity_fill = false; excessive.state.directories[0].extents.clear();
+    excessive.state.directories[0].layout.files = farming_detail::maximum_files + 1;
+    excessive.state.directories[0].layout.total_members = farming_detail::maximum_files + 1;
+    excessive.state.directories[0].layout.group_members = 1;
+    auto const excessive_path = base / "excessive-files.plan"; save(excessive_path, excessive);
+    reject(options({excessive_path}), "joint assessment expanded a forecast beyond the file work bound");
+}
+
+void farming_reader_scope()
+{
+    using namespace grow_controller_test;
+    auto state = farming_format_fixture(6); state.config.fixed_meta = false;
+    FarmingProfile profile; profile.config = state.config; profile.source = "foreign baseline snapshot";
+    profile.host_name = "foreign harvester"; profile.captured_at = "2026-10-01T00:00:00Z";
+    profile.chia_version = "foreign snapshot"; profile.inventory_available = true; profile.inventory_v1_files = 7;
+    ReaderCalibrationScope scope; scope.k = state.config.k; scope.strength = state.config.strength;
+    scope.reader = state.config.reader; scope.margin = std::nextafter(2.0L, 3.0L);
+    scope.host_name = "local calibration machine"; scope.captured_at = "2026-11-03T00:00:00Z";
+    profile.reader_calibration = scope;
+    set_farming_state_profile(state, profile);
+    auto const text = farming_state_text(state);
+    auto const restored = parse_farming_state(text);
+    auto const recovered = farming_state_profile(restored);
+    require(recovered && recovered->reader_calibration == profile.reader_calibration &&
+        recovered->source == profile.source &&
+        recovered->host_name == profile.host_name && recovered->captured_at == profile.captured_at &&
+        recovered->chia_version == profile.chia_version && recovered->inventory_v1_files == profile.inventory_v1_files &&
+        farming_state_text(restored) == text, "scoped reader calibration changed across private recovery");
+    std::ostringstream json; write_farming_profile_json(json, *recovered);
+    std::istringstream in(json.str()); auto const exported = read_farming_profile(in);
+    require(exported.reader_calibration == profile.reader_calibration,
+        "re-exported farming profile lost its reader calibration scope");
+    auto foreign = state; foreign.producer_build.assign(64, 'e');
+    auto const foreign_text = farming_state_text(foreign);
+    require(farming_state_text(parse_farming_state(foreign_text)) == foreign_text &&
+        farming_state_profile(parse_farming_state(foreign_text))->reader_calibration == profile.reader_calibration,
+        "compatible foreign producer changed scoped calibration or canonical bytes");
+    auto reject = [](auto operation, char const* message)
+    {
+        bool rejected = false;
+        try { operation(); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, message);
+    };
+    auto legacy = state; legacy.version = 5;
+    reject([&] { (void)farming_state_text(legacy); }, "legacy farming serialization discarded a reader scope");
+    reject([&] { (void)farming_state_profile(legacy); }, "legacy farming reconstruction accepted a reader scope");
+    legacy.profile_metadata.reset(); auto const before = farming_state_text(legacy);
+    reject([&] { set_farming_state_profile(legacy, profile); }, "scoped profile attached to a legacy farming plan");
+    require(farming_state_text(legacy) == before, "rejected legacy profile attachment changed its saved state");
+    auto mismatch = state; mismatch.config.k = 28;
+    reject([&] { (void)farming_state_text(mismatch); }, "private state serialized reader costs for a different k");
+    reject([&] { (void)farming_state_profile(mismatch); }, "private profile reconstructed reader costs for a different k");
+    mismatch = state; mismatch.config.reader = FarmingReader::stateless;
+    reject([&] { (void)farming_state_profile(mismatch); }, "private profile reconstructed reader costs for a different reader");
+    Arguments args; args.k = profile.config.k; args.strength = profile.config.strength;
+    args.farming_profile = std::make_shared<FarmingProfile const>(profile);
+    require(farming_configuration(args).k == profile.config.k, "matching reader scope was rejected");
+    args.k.reset();
+    reject([&] { (void)farming_configuration(args); }, "k18 reader calibration silently applied to default k28");
+    args.k = profile.config.k; args.farming_reader = "stateless";
+    reject([&] { (void)farming_configuration(args); }, "cached reader calibration silently applied to stateless lookup");
+}
+
+void farming_legacy_format()
+{
+    // These literal legacy records come from the pre-existing serializer.
+    // Runtime build/model identities remain pinned by their production macros.
+    for (unsigned version : {3u, 4u})
+    {
+        auto state = farming_format_fixture(version);
+        std::ostringstream expected;
+        expected << "ordinary-group-farming-v" << version << '\n' << std::quoted(GROW_IDENTITY) << '\n'
+            << std::quoted(farming_model_identity) << '\n' << std::quoted(std::string(64, '0')) << '\n'
+            << std::quoted(std::string(64, 'a')) << " 1 \"\"\n"
+            << std::quoted(std::string(64, 'b')) << " \"owner\" " << std::quoted(std::string(96, 'c')) << ' '
+            << std::quoted(std::string(64, 'd')) << " 0 1\n256 32 8 16\n";
+        if (version == 4) expected << "1 \"{}\"\n";
+        expected << "4096\n18 2 9 8 1 1 3 4 1024 8192 8 16 2 2 1 1 0.125 0.25 8 64 2 3 4\n"
+            << "1 5 6 7 8 0.5 0.25\n\"fixture\" 1 2 3 4 1\n2\n"
+            << "\"/a\" \"fs\" 128 0\n\"identity-a\" 2 0 0 0\n3 2 1 4096 2 2 8 1 1 0 1\n1 0 128 0.5 1\n128 64 16 8\n";
+        if (version == 4) expected << "1 \"\" 2 2 2 1 1 1\n";
+        expected << "\"/b\" \"fs\" 96 1\n\"identity-b\" 2 1 0 0\n3 2 1 4096 2 2 8 1 1 0 1\n1 0 128 0.5 1\n96 48 16 8\n";
+        if (version == 4) expected << "1 \"\" 2 2 2 1 1 1\n";
+        auto const text = farming_state_text(state), legacy = expected.str();
+        require(text == legacy && stream_state::digest(text) == stream_state::digest(legacy),
+            "legacy farming serialization changed its canonical revision digest");
+        auto const restored = parse_farming_state(text);
+        require(restored.version == version && farming_state_text(restored) == legacy,
+            "legacy farming roundtrip migrated or changed a saved revision");
+        require(farming_state_text(parse_farming_state(text + '\n')) == legacy,
+            "legacy noncanonical whitespace changed the canonical saved revision");
+    }
+}
+
+void farming_compact_format()
+{
+    auto state = farming_format_fixture(5);
+    state.config.fixed_meta = false;
+    auto& different = state.directories.back().storage;
+    different.known_device = false; different.nonrotating = true;
+    different.read_bytes_per_second = 192; different.read_latency_seconds = 0.25L; different.read_concurrency = 3;
+    different.max_total_members = 15; different.max_groups = 7;
+    state.config.chain_seconds_per_member = std::nextafter(0.125L, 1.0L);
+    state.config.index_seconds_per_entry = std::nextafter(0.25L, 1.0L);
+    FarmingProfile profile; profile.config = state.config;
+    profile.source = "detected"; profile.captured_at = "2026-11-03T00:00:00Z";
+    profile.chia_version = "fixture version"; profile.host_name = "host é \"quoted\"";
+    profile.config_status = "configuration read"; profile.inventory_status = "complete";
+    profile.detected_logical_cpus = 12; profile.detected_available_memory_bytes = 32768;
+    profile.inventory_available = true; profile.inventory_v1_files = 11; profile.inventory_v2_files = 12;
+    profile.inventory_v2_members = 13; profile.inventory_failed_files = 14; profile.inventory_no_key_files = 15;
+    profile.assumptions = {"line one\nline two", "path \\ quote \"", "Unicode é"};
+    set_farming_state_profile(state, profile);
+    auto const text = farming_state_text(state);
+    auto restored = parse_farming_state(text);
+    require(restored.version == 5 && restored.profile_json.empty() && restored.config == state.config &&
+        same_farming_profile_metadata(state, restored) && farming_state_text(restored) == text,
+        "compact farming roundtrip changed configuration, provenance or canonical bytes");
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+        require(restored.directories[lane].storage == state.directories[lane].storage &&
+            restored.directories[lane].layout == state.directories[lane].layout &&
+            restored.directories[lane].extents == state.directories[lane].extents,
+            "compact storage overrides changed a heterogeneous drive or frozen assignment");
+    auto const public_profile = farming_state_profile(restored);
+    std::ostringstream before, after;
+    write_farming_profile_json(before, profile); write_farming_profile_json(after, *public_profile);
+    require(before.str() == after.str(), "compact private metadata changed public profile JSON or provenance");
+    auto changed = restored;
+    changed.config.lookup_workers = 7;
+    require(farming_state_profile(changed)->config.lookup_workers == 7,
+        "restored public profile retained a second authoritative farming configuration");
+    require(farming_state_text(parse_farming_state(text + '\n')) == text,
+        "compact noncanonical whitespace changed the canonical saved revision");
+
+    auto reject = [](auto action, char const* message)
+    {
+        bool refused = false;
+        try { action(); } catch (std::exception const&) { refused = true; }
+        require(refused, message);
+    };
+    reject([&] { (void)farming_state_profile(restored, 1); },
+        "compact profile restoration bypassed its memory budget");
+    reject([&] { (void)parse_farming_state(text, text.size() * 4); },
+        "compact parsing bypassed its input memory budget");
+    reject([&] { auto p = profile; ++p.config.lookup_workers; set_farming_state_profile(changed, p); },
+        "compact profile accepted a conflicting farming configuration");
+    reject([&] { auto p = profile; p.assumptions.resize(65); set_farming_state_profile(state, p); },
+        "compact profile accepted an unbounded assumption count");
+    reject([&] { auto p = profile; p.assumptions = {std::string(farming_profile_metadata_bytes, 'x')};
+        set_farming_state_profile(state, p); }, "compact profile accepted metadata beyond its byte bound");
+
+    auto replace = [&](std::string const& from, std::string const& to)
+    {
+        auto malformed = text; auto const position = malformed.find(from);
+        require(position != std::string::npos, "compact malformed-record fixture is missing");
+        malformed.replace(position, from.size(), to); return malformed;
+    };
+    std::string const defaults = "511 1 0 128 0.5 1 128 64 16 8\n";
+    reject([&] { (void)parse_farming_state(replace(defaults, "0\n")); },
+        "compact storage accepted an incomplete shared record");
+    reject([&] { (void)parse_farming_state(replace(defaults, "512\n")); },
+        "compact storage accepted an unknown shared-field mask");
+    reject([&] { (void)parse_farming_state(replace(defaults, "4294967296\n")); },
+        "compact storage accepted an overflowing shared-field mask");
+    reject([&] { (void)parse_farming_state(replace(defaults, "")); },
+        "compact storage accepted a missing shared record");
+    std::string const overrides = "511 0 1 192 0.25 3 96 48 15 7\n";
+    reject([&] { (void)parse_farming_state(replace(overrides, "512\n")); },
+        "compact storage accepted unknown per-drive override fields");
+    reject([&] { (void)parse_farming_state(replace(overrides, "511 0 1 192 0.25 3 18446744073709551616 48 15 7\n")); },
+        "compact storage accepted an overflowing per-drive field");
+    auto const position = text.find(overrides);
+    require(position != std::string::npos, "compact overrides are missing from the heterogeneous fixture");
+    reject([&] { (void)parse_farming_state(text.substr(0, position) + "511 0 1 192\n"); },
+        "compact storage accepted truncated per-drive override values");
+}
+
+void controller_wakeups()
+{
+    ControllerWake wake;
+    auto const observed = wake.generation();
+    require(!wake.wait_for(observed, std::chrono::milliseconds(0)), "idle controller fabricated a notification");
+    wake.notify();
+    require(wake.wait_for(observed, std::chrono::milliseconds(0)),
+        "controller lost a notification between its readiness scan and wait");
+    for (bool fail : {false, true})
+    {
+        auto const before = wake.generation();
+        std::promise<void> notified, release;
+        auto notification = notified.get_future(); auto released = release.get_future().share();
+        std::atomic<bool> joined = false;
+        auto pending = NotifiedFuture<int>::submit(wake, [fail]
+        {
+            if (fail) throw std::runtime_error("injected receiver failure");
+            return 7;
+        }, [&](auto task)
+        {
+            return std::async(std::launch::async, [&, task = std::move(task)]() mutable
+            {
+                std::exception_ptr failure;
+                try { task(); } catch (...) { failure = std::current_exception(); }
+                notified.set_value(); released.wait(); joined = true;
+                if (failure) std::rethrow_exception(failure);
+            });
+        });
+        bool const notified_before_return = notification.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        bool const woken = wake.wait_for(before, std::chrono::milliseconds(0));
+        bool const ready = pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        release.set_value();
+        bool propagated = false;
+        try { propagated = pending.get() == 7 && !fail; }
+        catch (std::runtime_error const& error)
+        { propagated = fail && std::string(error.what()) == "injected receiver failure"; }
+        require(notified_before_return && woken && ready && propagated && joined && !pending.valid(),
+            "receiver notification preceded result publication or lost failure/borrower cleanup");
+    }
+}
+
+void replot_publication_names(fs::path const& root, Members input)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "replot-publication-names"; fs::create_directory(directory);
+    auto cfg = configuration(); cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    auto const ordinary = group_path(directory, 0); direct(ordinary, input.subspan(0, 2), cfg);
+    auto const before = contents(ordinary); auto const job = std::string(64, 'a');
+    auto const published = group_path(directory, 0, job); fs::rename(ordinary, published);
+    auto const saved = snapshot(published, 0);
+    require(saved.published_plot2 && group_tools::hex(saved.publication_job) == job && group_output_path(directory, saved) == published &&
+        rollover_entry(directory, published, 512 * mib) == 0 && contents(published) == before,
+        "migration publication changed bytes or lost its canonical name");
+    Arguments args; args.max_ram = 512 * mib; args.workers = 1; args.max_groups = 4; args.max_total_members = 8; args.headroom = 0;
+    auto fixture = [&]
+    {
+        FarmingRun run; run.state = farming_format_fixture(6); run.state.capacity_fill = false; run.state.job_id = job;
+        run.state.directories.resize(1); auto& d = run.state.directories.front(); d.directory = directory.string();
+        d.capacity_bytes = 128 * mib; d.layout.files = 1; d.layout.total_members = d.layout.group_members = 2;
+        d.extents.clear(); d.sealed_files = 0; run.lanes.resize(1); run.lanes.front().outputs.push_back(saved);
+        run.available = {1}; run.memory_limit = args.max_ram; run.metadata = mib; return run;
+    };
+    std::vector<fs::path> const directories{directory}; std::vector<StorageDevice> const devices{{"fs", {"drive"}}};
+    std::vector<size_t> const physical{0}; std::map<std::string, uint64_t> const spaces{{"fs", 128 * mib}};
+    auto valid = fixture(); valid.audit_outputs(args, nullptr, directories, devices, physical, spaces, 1);
+    require(valid.lanes.front().ordinal == 1 && valid.path(0) == group_path(directory, 1),
+        "complete published fixed group was scheduled for regrowth");
+    auto wrong = fixture(); wrong.state.job_id = std::string(64, 'b'); bool rejected = false;
+    try { wrong.audit_outputs(args, nullptr, directories, devices, physical, spaces, 1); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected && contents(published) == before, "wrong migration output nonce was accepted or changed");
+    fs::copy_file(published, ordinary); rejected = false;
+    try { check_outputs(directory, std::span(&saved, 1), args.max_ram); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "ordinary and published aliases for one ordinal were accepted");
+}
+
+void farming_parallel_audits(fs::path const& root, Members input)
+{
+    using namespace grow_controller_test;
+    std::vector<fs::path> directories{root / "audit-first", root / "audit-second"};
+    std::vector<StorageDevice> devices{{"first-fs", {"first-drive"}}, {"second-fs", {"second-drive"}}};
+    std::vector<size_t> const physical{0, 1}, shared{0, 0};
+    std::map<std::string, uint64_t> spaces{{"first-fs", 128 * mib}, {"second-fs", 128 * mib}};
+    auto write_cfg = configuration(); write_cfg.capacity_bytes = 128 * mib; write_cfg.memory_limit_bytes = 512 * mib;
+    for (auto const& directory : directories)
+    { fs::create_directory(directory); direct(group_path(directory, 0), input.subspan(0, 2), write_cfg); }
+    auto const first_path = group_path(directories[0], 0), second_path = group_path(directories[1], 0);
+    auto const first_bytes = contents(first_path), second_bytes = contents(second_path);
+    Arguments args; args.max_ram = 512 * mib; args.window = 65536; args.checkpoint_bytes = mib;
+    args.workers = 2; args.max_groups = 4; args.max_total_members = 8; args.headroom = 0;
+    auto fixture = [&]
+    {
+        FarmingRun run; run.state = farming_format_fixture(5); run.state.capacity_fill = false;
+        run.metadata = 2 * mib; run.memory_limit = args.max_ram; run.metadata_workers = 2;
+        run.lanes.resize(directories.size()); run.available.assign(directories.size(), 1);
+        for (size_t lane = 0; lane < directories.size(); ++lane)
+        {
+            auto& d = run.state.directories[lane]; d.directory = directories[lane].string(); d.capacity_bytes = 128 * mib;
+            d.layout.files = 1; d.layout.total_members = d.layout.group_members = 2;
+            run.lanes[lane].outputs.push_back(snapshot(group_path(directories[lane], 0), 0));
+        }
+        return run;
+    };
+    require(!Engine::pending(first_path.string()) && Engine::pending((root / "missing-audit").string()),
+        "ordinary audit probe did not distinguish a complete file from an ambiguous path");
+    auto parallel = fixture();
+    std::array<std::promise<void>, 2> started;
+    auto first = started[0].get_future(), second = started[1].get_future();
+    std::promise<void> release; auto released = release.get_future().share();
+    FarmingStageSubmit submit = [&](size_t lane, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, lane, operation = std::move(operation)]
+        { started[lane].set_value(); released.wait(); operation(); });
+    };
+    auto auditing = std::async(std::launch::async, [&]
+    { parallel.audit_outputs(args, nullptr, directories, devices, physical, spaces, directories.size(), submit); });
+    bool const overlap = first.wait_for(std::chrono::seconds(10)) == std::future_status::ready &&
+        second.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    release.set_value(); auditing.get();
+    require(overlap && parallel.planning_peak <= args.max_ram && parallel.audited.read_bytes &&
+        parallel.lanes[0].completed_members == 2 && parallel.lanes[1].completed_members == 2,
+        "bounded independent-drive audits lost overlap, results or RAM accounting");
+    size_t submissions = 0;
+    FarmingStageSubmit counted = [&](size_t, std::function<void()> operation)
+    { ++submissions; return std::async(std::launch::async, std::move(operation)); };
+    auto serial = fixture(); serial.audit_outputs(args, nullptr, directories, devices, shared, spaces, directories.size(), counted);
+    require(!submissions && serial.audited.read_bytes == parallel.audited.read_bytes,
+        "shared physical storage launched parallel audits or changed complete index coverage");
+    auto small = args; small.max_ram = 96 * mib; small.window = 32 * mib;
+    auto bounded = fixture(); bounded.audit_outputs(small, nullptr, directories, devices, physical, spaces, directories.size(), counted);
+    require(!submissions && bounded.lanes[0].completed_members == 2 && bounded.lanes[1].completed_members == 2,
+        "tight RAM rejected the original serial audit envelope or launched unadmitted peers");
+    auto restore = [](fs::path const& path, std::vector<uint8_t> const& bytes)
+    { std::ofstream out(path, std::ios::binary | std::ios::trunc); out.write(reinterpret_cast<char const*>(bytes.data()), bytes.size()); };
+    { std::ofstream out(first_path, std::ios::binary | std::ios::app); out.put('!'); }
+    require(!Engine::pending(first_path.string()), "orphan-tail fixture unexpectedly has a durable checkpoint");
+    auto orphan = fixture(); orphan.audit_outputs(args, nullptr, directories, devices, physical, spaces, directories.size());
+    require(orphan.lanes[0].outputs[0].pending && orphan.lanes[0].reserved_members == 2 &&
+        fs::file_size(first_path) == first_bytes.size() + 1 && orphan.lanes[1].completed_members == 2,
+        "parallel ordinary discovery rejected or changed an orphan initialization tail");
+    restore(first_path, first_bytes);
+    auto set_byte = [](fs::path const& path, size_t offset, uint8_t value)
+    { std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out); out.seekp(offset); out.put(char(value)); };
+    set_byte(first_path, offsetof(Header, version), 0xf1);
+    require(Engine::pending(first_path.string()), "finalizing marker was admitted as a complete ordinary audit");
+    auto finalizing = fixture(); finalizing.audit_outputs(args, nullptr, directories, devices, physical, spaces, directories.size(), counted);
+    require(!submissions && finalizing.lanes[0].outputs[0].pending,
+        "finalizing recovery lost its serial admission or pending identity");
+    restore(first_path, first_bytes);
+    auto const child = ::fork(); require(child >= 0, "pending audit fixture fork failed");
+    if (!child)
+    {
+        ::setenv("XCHPLOT2_GROW_FAILPOINT", "initialized", 1);
+        Engine output(first_path.string(), write_cfg, true); output.confirm_identity();
+        (void)output.append(input.subspan(2, 4)); std::_Exit(0);
+    }
+    int status = 0;
+    require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86 &&
+        Engine::pending(first_path.string()), "ordinary checkpoint footer escaped the conservative audit probe");
+    auto const pending_bytes = contents(first_path);
+    auto pending = fixture(); pending.state.directories[0].layout.total_members = pending.state.directories[0].layout.group_members = 6;
+    pending.audit_outputs(args, nullptr, directories, devices, physical, spaces, directories.size(), counted);
+    require(!submissions && pending.lanes[0].outputs[0].pending && pending.lanes[0].reserved_members == 6 &&
+        contents(first_path) == pending_bytes, "pending batch audit lost its full original memory envelope or changed recovery bytes");
+    restore(first_path, first_bytes);
+    set_byte(first_path, offsetof(Header, version), 0xfe);
+    auto corrupt = fixture(); bool rejected = false;
+    try { corrupt.audit_outputs(args, nullptr, directories, devices, physical, spaces, directories.size(), counted); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected && !submissions, "corrupt private marker bypassed serial protocol validation");
+    restore(first_path, first_bytes);
+    auto failing = fixture();
+    std::promise<void> failed, finish_peer;
+    auto failure = failed.get_future(); auto peer = finish_peer.get_future().share();
+    std::atomic<bool> joined = false;
+    FarmingStageSubmit fail = [&](size_t lane, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, lane, operation = std::move(operation)]
+        {
+            if (!lane) { peer.wait(); operation(); joined = true; return; }
+            set_byte(second_path, offsetof(Header, k), 28);
+            try { operation(); } catch (...) { failed.set_value(); throw; }
+        });
+    };
+    auto failed_audit = std::async(std::launch::async, [&]
+    {
+        try { failing.audit_outputs(args, nullptr, directories, devices, physical, spaces, directories.size(), fail); }
+        catch (std::runtime_error const& error) { return std::string(error.what()); }
+        return std::string{};
+    });
+    bool const observed_failure = failure.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    bool const draining = failed_audit.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+    finish_peer.set_value(); auto const error = failed_audit.get();
+    require(observed_failure && draining && joined && error == "group index/windows/codec exceed the memory budget",
+        "changed-header audit exceeded its actual-k memory bound or escaped before its peer joined");
+    restore(second_path, second_bytes);
+
+    // Live audits share the admitted codec pool, and keep inactive external
+    // parsers at their serial full-envelope boundary after every lane joins.
+    auto live_fixture = [&]
+    { auto run = fixture(); run.staging_resources = physical; return run; };
+    auto live = live_fixture();
+    std::array<std::promise<void>, 2> live_started;
+    auto live_first = live_started[0].get_future(), live_second = live_started[1].get_future();
+    std::promise<void> live_release; auto live_released = live_release.get_future().share();
+    FarmingStageSubmit live_submit = [&](size_t lane, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, lane, operation = std::move(operation)]
+        { live_started[lane].set_value(); live_released.wait(); operation(); });
+    };
+    auto live_audit = std::async(std::launch::async, [&] { live.check({}, live.metadata, live_submit); });
+    bool const live_overlap = live_first.wait_for(std::chrono::seconds(10)) == std::future_status::ready &&
+        live_second.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    live_release.set_value(); live_audit.get();
+    require(live_overlap && live.planning_peak > live.metadata && live.planning_peak <= live.memory_limit,
+        "live independent-lane audits lost overlap or their runtime memory admission");
+    auto scheduler = std::make_shared<CodecScheduler>(2);
+    std::promise<void> encoding_started, encoding_release;
+    auto encoding_ready = encoding_started.get_future(); auto encoding_released = encoding_release.get_future().share();
+    auto encoding = scheduler->submit([&]
+    {
+        ChunkCodec codec(18, write_cfg.codec_bytes, scheduler);
+        auto const raw = input[0].raw();
+        auto const end = std::lower_bound(raw.begin(), raw.end(), 1ull << (18 + PlotGroupFile::PROOFS_PER_CHUNK_BITS));
+        std::array<FragmentRegion, 1> regions{input[0].region(0, 0, size_t(end - raw.begin()))};
+        codec.prepare(ChunkCodec::estimate_work(18, 0, regions[0].size()));
+        (void)codec.encode(0, {}, 0, regions);
+        encoding_started.set_value(); encoding_released.wait();
+    });
+    require(encoding_ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+        "live audit encoder fixture did not acquire its real shared CPU permit");
+    auto shared_cpu = live_fixture();
+    auto shared_audit = std::async(std::launch::async, [&]
+    {
+        shared_cpu.check({}, shared_cpu.metadata, [&](size_t, std::function<void()> operation)
+        { return scheduler->submit(std::move(operation)); });
+    });
+    bool const shared_progress = shared_audit.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    encoding_release.set_value(); encoding.get(); shared_audit.get();
+    require(shared_progress, "live audit deadlocked with outstanding work on the real shared codec scheduler");
+    submissions = 0;
+    auto live_shared = live_fixture(); live_shared.staging_resources = shared;
+    live_shared.check({}, live_shared.metadata, counted);
+    auto live_tight = live_fixture(); live_tight.check({}, live_tight.memory_limit, counted);
+    require(!submissions, "shared-storage or tight-RAM live audit launched unadmitted work");
+    auto changed = live_fixture(); auto const directory_time = fs::last_write_time(directories[0]);
+    set_byte(first_path, sizeof(Header), uint8_t(first_bytes[sizeof(Header)] ^ 1));
+    rejected = false;
+    try { changed.check({}, changed.metadata, counted); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected && fs::last_write_time(directories[0]) == directory_time,
+        "live audit missed an in-place output change with an unchanged directory mtime");
+    restore(first_path, first_bytes);
+    auto inactive = live_fixture(); fs::create_directory(first_path.string() + ".external");
+    rejected = false;
+    try { inactive.check({}, inactive.metadata, counted); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "parallel live audit skipped an inactive external parser failure");
+    fs::remove(first_path.string() + ".external");
+    auto malformed = live_fixture();
+    auto const invalid = second_path.string() + ".external.retired-invalid"; fs::create_directory(invalid);
+    std::promise<void> live_failed, live_finish_peer;
+    auto live_failure = live_failed.get_future(); auto live_peer = live_finish_peer.get_future().share(); joined = false;
+    FarmingStageSubmit live_fail = [&](size_t lane, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, lane, operation = std::move(operation)]
+        {
+            if (!lane) { live_peer.wait(); operation(); joined = true; return; }
+            try { operation(); } catch (...) { live_failed.set_value(); throw; }
+        });
+    };
+    auto failed_live = std::async(std::launch::async, [&]
+    {
+        try { malformed.check({}, malformed.metadata, live_fail); }
+        catch (std::runtime_error const& error) { return std::string(error.what()); }
+        return std::string{};
+    });
+    bool const live_failed_ready = live_failure.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    bool const live_draining = failed_live.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+    live_finish_peer.set_value(); auto const live_error = failed_live.get();
+    require(live_failed_ready && live_draining && joined && live_error == "ambiguous rollover output name",
+        "malformed live metadata escaped without joining its independent peer");
+    fs::remove(invalid);
+}
+
+void farming_replica_staging(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto state = farming_format_fixture(5);
+    state.directories.push_back(state.directories.back());
+    std::vector<size_t> const physical{0, 0, 1};
+    std::vector<uint8_t> const selected{1, 1, 1};
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+    {
+        auto const directory = root / ("replica-stage-" + std::to_string(lane));
+        fs::create_directory(directory); state.directories[lane].directory = directory.string();
+    }
+    auto body = farming_state_text(state); body += stream_state::digest(body) + '\n';
+    std::vector<std::optional<stream_state::Stamp>> stamps(selected.size());
+    std::promise<void> failed_submission, release;
+    auto failed = failed_submission.get_future(); auto released = release.get_future().share();
+    std::atomic<bool> joined = false;
+    FarmingStageSubmit fail_submit = [&](size_t first, std::function<void()> operation) -> std::future<void>
+    {
+        if (first)
+        {
+            failed_submission.set_value();
+            throw std::runtime_error("injected replica submission failure");
+        }
+        return std::async(std::launch::async, [&, operation = std::move(operation)]
+        { released.wait(); operation(); joined.store(true, std::memory_order_release); });
+    };
+    auto worker = std::async(std::launch::async, [&]
+    {
+        try { stage_farming_replicas(state, physical, body, selected, stamps, 2, fail_submit); }
+        catch (std::runtime_error const& error) { return std::string(error.what()); }
+        return std::string{};
+    });
+    bool const reached = failed.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    bool const waiting = worker.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
+    release.set_value(); auto const error = worker.get();
+    require(reached && waiting && joined.load(std::memory_order_acquire) &&
+        error == "injected replica submission failure", "replica staging escaped without joining submitted work");
+    require(stamps[0] && stamps[1] && !stamps[2],
+        "replica submission failure skipped its shared-resource chain or fabricated an unstaged stamp");
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+    {
+        auto const directory = file_io::native_path(state.directories[lane].directory);
+        require(!fs::exists(directory / ".xchplot2" / "grow-farm.plan"), "replica staging published before its all-staged barrier");
+        if (lane < 2)
+        {
+            auto const bytes = contents(directory / ".xchplot2" / "grow-farm.plan.next");
+            require(bytes == std::vector<uint8_t>(body.begin(), body.end()),
+                "replica staging failure left an incomplete private copy");
+            fs::remove(directory / ".xchplot2" / "grow-farm.plan.next");
+        }
+    }
+    std::vector<size_t> submissions;
+    std::array<std::promise<void>, 2> started;
+    auto first_started = started[0].get_future(), second_started = started[1].get_future();
+    std::promise<void> run_chains; auto chains_released = run_chains.get_future().share();
+    std::atomic<unsigned> active{0};
+    FarmingStageSubmit submit = [&](size_t first, std::function<void()> operation)
+    {
+        submissions.push_back(first);
+        return std::async(std::launch::async, [&, first, operation = std::move(operation)]
+        {
+            active.fetch_add(1, std::memory_order_acq_rel); started[first ? 1 : 0].set_value();
+            chains_released.wait(); operation(); active.fetch_sub(1, std::memory_order_acq_rel);
+        });
+    };
+    auto staging = std::async(std::launch::async, [&]
+    { stage_farming_replicas(state, physical, body, selected, stamps, 2, submit); });
+    bool const overlap = first_started.wait_for(std::chrono::seconds(10)) == std::future_status::ready &&
+        second_started.wait_for(std::chrono::seconds(10)) == std::future_status::ready && active.load(std::memory_order_acquire) == 2;
+    run_chains.set_value(); staging.get();
+    require(overlap && submissions == std::vector<size_t>{0, 2},
+        "replica staging created parallel operations for the same physical resource");
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+    {
+        auto const path = file_io::native_path(state.directories[lane].directory) / ".xchplot2" / "grow-farm.plan.next";
+        require(stamps[lane] && stream_state::stamp(path) == *stamps[lane] &&
+            contents(path) == std::vector<uint8_t>(body.begin(), body.end()),
+            "replica all-staged barrier omitted a complete durable copy");
+    }
+    for (size_t lane : {0u, 1u})
+        fs::remove(file_io::native_path(state.directories[lane].directory) / ".xchplot2" / "grow-farm.plan.next");
+    std::promise<void> operation_failed, finish_peer;
+    auto operation_failure = operation_failed.get_future(); auto peer_finished = finish_peer.get_future().share();
+    joined = false;
+    FarmingStageSubmit fail_operation = [&](size_t first, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, first, operation = std::move(operation)]
+        {
+            if (!first) { peer_finished.wait(); operation(); joined = true; return; }
+            try { operation(); }
+            catch (...) { operation_failed.set_value(); throw; }
+        });
+    };
+    auto failing = std::async(std::launch::async, [&]
+    {
+        try { stage_farming_replicas(state, physical, body, selected, stamps, 2, fail_operation); }
+        catch (std::runtime_error const& error) { return std::string(error.what()); }
+        return std::string{};
+    });
+    bool const failed_operation = operation_failure.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    bool const joined_before_return = failing.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
+    finish_peer.set_value(); auto const operation_error = failing.get();
+    require(failed_operation && joined_before_return && joined &&
+        operation_error.find("pending farming revision must be recovered") != std::string::npos,
+        "replica worker failure escaped before another physical resource finished staging");
+
+    auto capped = farming_format_fixture(5);
+    auto const common = capped.directories.front(); capped.directories.resize(5, common);
+    std::vector<size_t> const independent{0, 1, 2, 3, 4};
+    std::vector<uint8_t> const all(independent.size(), 1);
+    std::vector<std::optional<stream_state::Stamp>> capped_stamps(independent.size());
+    for (size_t lane = 0; lane < capped.directories.size(); ++lane)
+    {
+        auto const directory = root / ("replica-capped-" + std::to_string(lane)); fs::create_directory(directory);
+        auto& d = capped.directories[lane]; d.directory = directory.string(); d.resource = d.storage.resource = lane;
+        d.identity_resources = independent.size(); d.identity_resource = lane;
+    }
+    auto capped_body = farming_state_text(capped); capped_body += stream_state::digest(capped_body) + '\n';
+    std::array<std::promise<void>, 2> admitted;
+    auto admitted_first = admitted[0].get_future(), admitted_second = admitted[1].get_future();
+    std::promise<void> unblock, excess; auto unblocked = unblock.get_future().share(), excessive = excess.get_future().share();
+    std::atomic<unsigned> running{0}, maximum{0}; std::atomic<bool> signaled{false};
+    FarmingStageSubmit bounded = [&](size_t first, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, first, operation = std::move(operation)]
+        {
+            auto const count = running.fetch_add(1, std::memory_order_acq_rel) + 1;
+            auto observed = maximum.load(std::memory_order_relaxed);
+            while (observed < count && !maximum.compare_exchange_weak(observed, count, std::memory_order_relaxed)) {}
+            if (first < admitted.size()) admitted[first].set_value();
+            if (count > 2 && !signaled.exchange(true)) excess.set_value();
+            unblocked.wait(); operation(); running.fetch_sub(1, std::memory_order_acq_rel);
+        });
+    };
+    auto capped_work = std::async(std::launch::async, [&]
+    { stage_farming_replicas(capped, independent, capped_body, all, capped_stamps, 2, bounded); });
+    bool const both_admitted = admitted_first.wait_for(std::chrono::seconds(10)) == std::future_status::ready &&
+        admitted_second.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    bool const over_limit = excessive.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready;
+    unblock.set_value(); capped_work.get();
+    require(both_admitted && !over_limit && maximum.load() == 2 && !running.load(),
+        "injected replica submission exceeded its worker cap or lost independent-disk overlap");
+    require(std::all_of(capped_stamps.begin(), capped_stamps.end(), [](auto const& stamp) { return stamp.has_value(); }),
+        "bounded replica staging omitted a later resource chain");
+    for (auto const& directory : capped.directories)
+        fs::remove(file_io::native_path(directory.directory) / ".xchplot2" / "grow-farm.plan.next");
+    std::promise<void> slow_started, later_started, release_slow;
+    auto slow = slow_started.get_future(), later = later_started.get_future();
+    auto slow_release = release_slow.get_future().share();
+    FarmingStageSubmit unbalanced = [&](size_t first, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, first, operation = std::move(operation)]
+        {
+            if (!first) { slow_started.set_value(); slow_release.wait(); }
+            if (first == 2) later_started.set_value();
+            operation();
+        });
+    };
+    auto rolling = std::async(std::launch::async, [&]
+    { stage_farming_replicas(capped, independent, capped_body, all, capped_stamps, 2, unbalanced); });
+    bool const refilled = slow.wait_for(std::chrono::seconds(10)) == std::future_status::ready &&
+        later.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    bool const still_staging = rolling.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+    release_slow.set_value(); rolling.get();
+    require(refilled && still_staging,
+        "replica staging left an admitted resource slot idle behind a slower independent drive");
+    std::vector<size_t> attempted;
+    FarmingStageSubmit conflicting = [&](size_t first, std::function<void()> operation)
+    { attempted.push_back(first); return std::async(std::launch::async, std::move(operation)); };
+    bool stopped = false;
+    try { stage_farming_replicas(capped, independent, capped_body, all, capped_stamps, 2, conflicting); }
+    catch (std::runtime_error const& error)
+    { stopped = std::string(error.what()).find("pending farming revision must be recovered") != std::string::npos; }
+    require(stopped && (attempted == std::vector<size_t>{0} || attempted == std::vector<size_t>{0, 1}),
+        "failed bounded replica staging admitted a later resource after observing failure");
+}
+
+void farming_preview_handoff(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "saved-preview-handoff";
+    auto const a = directory / "disk a", b = directory / "disk b", path = directory / "review.plan";
+    fs::create_directories(a); fs::create_directory(b);
+    Arguments options; options.command = "plan"; options.directory_farm = options.plan_only = true;
+    options.target = a; options.destinations.push_back(b); options.save_plan = path;
+    options.k = 18; options.group_members = 1; options.max_groups = options.max_total_members = 1;
+    options.farming_max_eligible_groups = 4; options.max_ram = 512 * mib;
+    options.capacity = 64 * mib;
+    options.seed = std::string(64, 'a'); options.farmer = std::string(96, 'b'); options.pool_pk = std::string(96, 'c');
+    auto job = farming_arguments(options);
+    {
+        auto reserved = options; reserved.save_plan = a / "grow-farm.plan";
+        bool refused = false;
+        try { (void)farming_run(reserved, nullptr, job); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("filename is reserved") != std::string::npos; }
+        require(refused && fs::is_empty(a), "saved preview claimed the private job recovery filename");
+    }
+    {
+        FarmingMetadataDirectory metadata(a); metadata.create();
+        auto reserved = options; reserved.save_plan = metadata.path / "preview.plan";
+        bool refused = false;
+        try { (void)farming_run(reserved, nullptr, job); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("reserved .xchplot2") != std::string::npos; }
+        require(refused && fs::is_empty(metadata.path), "reserved preview output wrote private recovery bookkeeping");
+        fs::remove(metadata.path);
+    }
+    {
+        FarmingProfile public_profile;
+        public_profile.assumptions.assign(64, std::string(4096, 'x'));
+        std::ostringstream json; write_farming_profile_json(json, public_profile);
+        std::istringstream input(json.str());
+        auto profile = std::make_shared<FarmingProfile const>(read_farming_profile(input));
+        for (bool preview : {false, true})
+        {
+            auto oversized = options; oversized.command = preview ? "plan" : "fill";
+            oversized.plan_only = preview; oversized.save_plan.clear(); oversized.farming_profile = profile;
+            auto source = farming_arguments(oversized);
+            bool refused = false;
+            try { (void)farming_run(oversized, nullptr, source); }
+            catch (std::exception const& error) { refused = std::string(error.what()).find("profile metadata exceeds its bound") != std::string::npos; }
+            require(refused && fs::is_empty(a) && fs::is_empty(b),
+                "oversized aggregate profile metadata reached farming publication");
+        }
+
+        public_profile.assumptions.resize(14);
+        Arguments memory = options; memory.save_plan.clear(); memory.target.clear(); memory.destinations.clear();
+        memory.farming_profile = std::make_shared<FarmingProfile const>(public_profile);
+        for (unsigned i = 0; i < 16; ++i)
+        {
+            auto const destination = directory / ("serialization-memory-" + std::to_string(i));
+            fs::create_directory(destination);
+            if (!i) memory.target = destination;
+            else memory.destinations.push_back(destination);
+        }
+        auto source = farming_arguments(memory);
+        auto reference = farming_run(memory, nullptr, source);
+        auto const text = farming_state_text(reference->state);
+        // This leaves room for the search and retained inputs, but not the
+        // serialization buffers that must coexist while sizing private copies.
+        uint64_t progress_memory = 0;
+        for (size_t lane = 0; lane < reference->state.directories.size(); ++lane)
+            progress_memory = sum(progress_memory, farming_progress_memory_bound(reference->state, lane));
+        if (reference->state.version >= 9)
+        {
+            progress_memory = sum(progress_memory, farming_control_memory_bound(reference->state));
+            for (auto const& directory : source.directories)
+                progress_memory = sum(progress_memory, farming_owner_memory_bound(directory));
+        }
+        memory.max_ram = sum(reference->metadata - progress_memory, product(text.size(), 3));
+        bool refused = false;
+        try { (void)farming_run(memory, nullptr, source); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("reservation serialization exceeds --max-ram") != std::string::npos; }
+        require(refused && fs::is_empty(memory.target), "private planning omitted its serialization working memory");
+    }
+    auto planned = farming_run(options, nullptr, job);
+    require(planned->feasible() && fs::is_empty(a) && fs::is_empty(b), "saving preparation wrote destination files");
+    {
+        // A saved partition can have a smaller request mailbox than the
+        // current planner would choose. Continuing within that grant must
+        // neither resize it nor consume its space for the next policy copy.
+        uint64_t const alignment = 4096;
+        auto before = planned->state;
+        before.revision = before.policy_revision = 2;
+        before.parent_digest.assign(64, 'a');
+        farming_record_parent(before, 1, before.parent_digest);
+        detach_farming_member(before, 1);
+        before.update_reserved_bytes = sum(farming_control_reservation(before, alignment),
+            farming_update_reservation(alignment, alignment));
+        auto const auxiliary = sum(sum(before.update_reserved_bytes, before.progress_reserved_bytes), before.owner_reserved_bytes);
+        before.manifest_reserved_bytes = sum(auxiliary, product(farming_update_aligned(
+            sum(farming_state_text(before).size(), 65 + 1024), alignment), 2));
+        FarmingJob saved = job; saved.saved = before; saved.digest = stream_state::digest(farming_state_text(before));
+        FarmingRun continued; continued.state = before; ++continued.state.revision;
+        continued.state.parent_digest = saved.digest;
+        continued.available = {1, 0}; continued.lanes.resize(2); continued.metadata = planned->metadata;
+        revise_farming_policy(options, saved, continued, {}, {}, {}, {}, alignment, {});
+        require(continued.state.manifest_reserved_bytes == before.manifest_reserved_bytes &&
+            continued.state.update_reserved_bytes == before.update_reserved_bytes &&
+            continued.state.progress_reserved_bytes == before.progress_reserved_bytes &&
+            continued.state.owner_reserved_bytes == before.owner_reserved_bytes &&
+            farming_revision_fits(continued.state, sum(farming_state_text(continued.state).size(), 65)),
+            "independent policy continuation changed a saved metadata grant");
+
+        // Keep the refusal when the policy itself consumes the saved margin.
+        continued.state = before; ++continued.state.revision;
+        continued.state.parent_digest = saved.digest;
+        continued.state.manifest_reserved_bytes = auxiliary;
+        bool refused = false;
+        try { revise_farming_policy(options, saved, continued, {}, {}, {}, {}, alignment, {}); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("detached writer's saved grant") != std::string::npos; }
+        require(refused && fs::is_empty(a) && fs::is_empty(b), "oversized independent policy reached publication");
+    }
+    {
+        auto shared = options; shared.destination_temp = "on"; shared.save_plan = directory / "scratch-review.plan";
+        auto source = farming_arguments(shared);
+        auto with_scratch = farming_run(shared, nullptr, source);
+        require(with_scratch->state.shared_scratch_possible, "new job did not retain its destination scratch authorization");
+        save_farming_review(shared, source, *with_scratch);
+        Arguments restored; restored.from_plan = shared.save_plan; restored.command = "plan";
+        restored.directory_farm = restored.plan_only = true; restored.max_ram = options.max_ram; restored.destination_temp = "on";
+        auto preview = farming_arguments(restored);
+        require(restored.destination_temp == "on" && farming_run(restored, nullptr, preview)->feasible(),
+            "saved preview lost its authorized destination scratch default");
+    }
+    {
+        // An independent maximum-identity serialization places the metadata
+        // exactly at an allocation boundary, then crosses it with one byte.
+        // Key form and escaped owner/parent fields must never move that edge.
+        uint64_t const alignment = 4096;
+        auto boundary = planned->state; boundary.version = 4;
+        boundary.pool.assign(96, '0'); boundary.seed_owner.assign(128, '"');
+        boundary.parent_digest.assign(64, '0'); boundary.revision = 2;
+        uint64_t const extra = sum(65, std::max(uint64_t(1024), farming_revision_margin(boundary)));
+        auto const initial = farming_state_text(boundary);
+        uint64_t const padding = (alignment - sum(initial.size(), extra) % alignment) % alignment;
+        boundary.profile_json.append(size_t(padding), ' ');
+        uint64_t const expected = product(sum(farming_state_text(boundary).size(), extra), 2);
+        for (bool crossed : {false, true})
+            for (bool public_key : {false, true})
+                for (bool parent : {false, true})
+                    for (auto const& owner : {std::string{}, std::string("owner"), std::string(128, 'x'),
+                        std::string(128, '\\'), std::string(128, '"')})
+                    {
+                        auto state = boundary;
+                        state.pool.assign(public_key ? 96 : 64, 'a'); state.pool_public_key = public_key;
+                        state.seed_owner = owner; state.parent_digest = parent ? std::string(64, 'b') : "";
+                        state.revision = parent ? 2 : 1;
+                        if (crossed) state.profile_json.push_back(' ');
+                        auto const text = farming_state_text(state);
+                        uint64_t const reserved = farming_manifest_reservation(state, text.size(), alignment);
+                        require(reserved == (crossed ? sum(expected, product(alignment, 2)) : expected),
+                            "farming reservation changed at an allocation boundary with its key or escaped owner form");
+                        state.manifest_reserved_bytes = reserved;
+                        require(farming_revision_fits(state, sum(farming_state_text(state).size(), 65)),
+                            "maximum escaped owner consumed the reserved revision margin");
+                    }
+    }
+    save_farming_review(options, job, *planned);
+    auto const original = contents(path);
+    std::string const encoded(original.begin(), original.end());
+    require(encoded.find(*options.seed) == std::string::npos && encoded.find(*options.farmer) == std::string::npos &&
+        encoded.find(*options.pool_pk) == std::string::npos, "saved farming preview leaked supplied identity fields");
+    auto const saved = load_farming_preview(path, options.max_ram);
+    require(saved.preview.state.seed == std::string(64, '0') && saved.preview.state.seed_owner.empty() &&
+        saved.preview.state.capacity_fill, "saved preview lost its keyless capacity policy");
+    bool refused = false;
+    try { save_farming_review(options, job, *planned); }
+    catch (std::exception const&) { refused = true; }
+    require(refused && contents(path) == original, "saving a farming preview replaced an existing file");
+
+    auto inspect = [&]
+    {
+        Arguments args; args.command = "fill"; args.directory_farm = args.plan_only = true;
+        args.from_plan = path; args.max_ram = options.max_ram; args.destination_temp = "on";
+        auto source = farming_arguments(args);
+        require(args.destination_temp == "off", "new scratch default widened a saved preview");
+        return farming_run(args, nullptr, source);
+    };
+    auto reviewed = inspect();
+    require(reviewed->feasible() && reviewed->admission && fs::is_empty(a) && fs::is_empty(b),
+        "saved preview inspection skipped frozen assessment or wrote destination files");
+    for (size_t i = 0; i < planned->state.directories.size(); ++i)
+        require(reviewed->state.directories[i].layout == planned->state.directories[i].layout &&
+            reviewed->state.directories[i].capacity_bytes == planned->state.directories[i].capacity_bytes &&
+            reviewed->state.directories[i].extents == planned->state.directories[i].extents,
+            "saved preview inspection reoptimized reviewed assignments");
+    {
+        Arguments changed; changed.command = "fill"; changed.directory_farm = changed.plan_only = true;
+        changed.from_plan = path; changed.max_ram = options.max_ram;
+        auto source = farming_arguments(changed);
+        ++source.preview->preview.state.directories.front().layout.schedule;
+        refused = false;
+        try { (void)farming_run(changed, nullptr, source); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("initial assignment differs") != std::string::npos; }
+        require(refused && fs::is_empty(a) && fs::is_empty(b), "inconsistent reviewed identity schedule reached publication");
+    }
+    {
+        Arguments changed; changed.command = "fill"; changed.directory_farm = true;
+        changed.from_plan = path; changed.max_ram = options.max_ram;
+        auto source = farming_arguments(changed);
+        auto& state = source.preview->preview.state; state.manifest_reserved_bytes = 0;
+        for (auto& destination : state.directories) destination.storage.capacity_bytes = destination.capacity_bytes;
+        refused = false;
+        try { (void)farming_run(changed, nullptr, source); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("exceeds its reserved metadata") != std::string::npos; }
+        require(refused && fs::is_empty(a) && fs::is_empty(b), "insufficient reviewed metadata reservation reached private publication");
+    }
+
+    auto const unrelated = directory / "unrelated allocation";
+    {
+        auto bytes = std::string(2 * mib, '\0');
+        pos2gpu::read_random_bytes(reinterpret_cast<uint8_t*>(bytes.data()), bytes.size());
+        stream_state::atomic_save(unrelated, bytes, false);
+    }
+    refused = false;
+    std::string capacity_error;
+    try
+    {
+        Arguments changed; changed.command = "fill"; changed.directory_farm = changed.plan_only = true;
+        changed.from_plan = path; changed.max_ram = options.max_ram;
+        auto source = farming_arguments(changed);
+        // Anchor this reviewed quota to the observed unrelated allocation,
+        // independently of other tests creating/removing files on this disk.
+        file_io::Space space{}; file_io::Stat allocation{};
+        require(!file_io::space_path(a.c_str(), &space) && !file_io::inspect_link(unrelated.c_str(), &allocation),
+            "cannot inspect unrelated capacity change");
+        uint64_t const available = product(space.f_bavail, space.f_frsize);
+        uint64_t const occupied = std::max(uint64_t(allocation.st_size), product(uint64_t(allocation.st_blocks), 512));
+        auto& state = source.preview->preview.state;
+        // This case deliberately checks changed physical free space rather
+        // than the handoff fixture's fixed, concurrency-independent cap.
+        changed.capacity = state.capacity = 0;
+        uint64_t const quota = (sum(available, occupied) - state.headroom) / state.directories.size();
+        for (auto& destination : state.directories)
+        {
+            destination.capacity_bytes = quota;
+            destination.storage.capacity_bytes = quota - state.manifest_reserved_bytes;
+        }
+        (void)farming_run(changed, nullptr, source);
+    }
+    catch (std::exception const& error) { capacity_error = error.what(); refused = capacity_error.find("capacity is no longer available") != std::string::npos; }
+    require(refused && fs::is_empty(a) && fs::is_empty(b), "unrelated storage growth bypassed saved-preview capacity freshness: " + capacity_error);
+    fs::remove(unrelated);
+
+    auto const previous = directory / "old disk a";
+    fs::rename(a, previous); fs::create_directory(a);
+    refused = false;
+    try { (void)inspect(); }
+    catch (std::exception const& error) { refused = std::string(error.what()).find("storage identity or topology changed") != std::string::npos; }
+    require(refused && fs::is_empty(a) && fs::is_empty(b), "replaced destination bypassed saved-preview identity freshness");
+    fs::remove(a); fs::rename(previous, a);
+
+    Arguments executing; executing.command = "fill"; executing.directory_farm = true;
+    executing.from_plan = path; executing.max_ram = options.max_ram;
+    auto admitted = farming_arguments(executing);
+    auto published = farming_run(executing, nullptr, admitted);
+    require(published->feasible() && fs::exists(farming_metadata_path(a, "grow-farm.plan", false)) && fs::exists(farming_metadata_path(b, "grow-farm.plan", false)),
+        "saved-preview execution did not use ordinary replicated publication");
+    published.reset();
+    refused = false;
+    try { (void)inspect(); }
+    catch (std::exception const& error)
+    { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
+    require(refused, "fresh-job preview accepted a subsequently published job");
+
+    auto source_options = options; source_options.save_plan = directory / "saved-job-review.plan"; source_options.destination_temp = "on";
+    auto source_job = farming_arguments(source_options);
+    require(source_options.destination_temp == "off", "new scratch default widened a saved job");
+    {
+        auto explicit_policy = options; explicit_policy.destination_temp = "on"; explicit_policy.destination_temp_set = true;
+        explicit_policy.save_plan.clear();
+        auto source = farming_arguments(explicit_policy);
+        require(explicit_policy.destination_temp == "on", "saved job discarded an explicit scratch policy");
+        bool rejected = false;
+        try { (void)farming_run(explicit_policy, nullptr, source); }
+        catch (std::runtime_error const& error)
+        { rejected = std::string(error.what()).find("temporary scratch was not authorized") != std::string::npos; }
+        require(rejected, "explicit scratch bypassed the saved job's existing update requirement");
+    }
+    auto source_run = farming_run(source_options, nullptr, source_job);
+    save_farming_review(source_options, source_job, *source_run);
+    Arguments source_inspection; source_inspection.command = "fill";
+    source_inspection.directory_farm = source_inspection.plan_only = true;
+    source_inspection.from_plan = source_options.save_plan; source_inspection.max_ram = options.max_ram;
+    auto source_review = farming_arguments(source_inspection);
+    auto source_checked = farming_run(source_inspection, nullptr, source_review);
+    require(source_checked->feasible() && source_checked->admission,
+        "saved-job preview lost its own allocation allowance or frozen assessment");
+    auto const source_bytes = contents(source_options.save_plan);
+    stream_state::atomic_save(source_options.save_plan, std::string(source_bytes.begin(), source_bytes.end()));
+    refused = false;
+    try { source_review.check(); }
+    catch (std::exception const& error) { refused = std::string(error.what()).find("preview changed") != std::string::npos; }
+    require(refused, "changed preview stamp bypassed source admission");
+
+    auto revised = *source_job.saved;
+    ++revised.revision; revised.parent_digest = source_job.digest;
+    if (revised.version >= 9) farming_record_parent(revised, revised.revision - 1, revised.parent_digest);
+    auto revision = farming_state_text(revised); revision += stream_state::digest(revision) + '\n';
+    stream_state::atomic_save(farming_metadata_path(a, "grow-farm.plan", false), revision);
+    stream_state::atomic_save(farming_metadata_path(b, "grow-farm.plan", false), revision);
+    source_inspection.target.clear(); source_inspection.destinations.clear(); source_inspection.manifest.clear();
+    source_inspection.extend = false;
+    auto progressed = farming_arguments(source_inspection);
+    require(progressed.preview_rebased &&
+        contents(farming_metadata_path(a, "grow-farm.plan", false)) == std::vector<uint8_t>(revision.begin(), revision.end()),
+        "progress-only revision invalidated its compatible preview or changed saved work");
+    auto legacy_preview = load_farming_preview(source_options.save_plan, options.max_ram).preview;
+    legacy_preview.version = 1; legacy_preview.source_policy.clear();
+    auto legacy_text = farming_preview_text(legacy_preview);
+    auto const legacy_path = directory / "legacy-job-review.plan";
+    stream_state::atomic_save(legacy_path, legacy_text + stream_state::digest(legacy_text) + '\n', false);
+    Arguments legacy_inspection; legacy_inspection.command = "plan"; legacy_inspection.plan_only = legacy_inspection.directory_farm = true;
+    legacy_inspection.from_plan = legacy_path; legacy_inspection.max_ram = options.max_ram;
+    refused = false;
+    try { (void)farming_arguments(legacy_inspection); }
+    catch (std::exception const& error)
+    { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
+    require(refused, "legacy preview lost its exact source-revision requirement");
+    revised.parent_digest = stream_state::digest(farming_state_text(revised)); ++revised.revision;
+    if (revised.version >= 9) farming_record_parent(revised, revised.revision - 1, revised.parent_digest);
+    revised.policy_revision = revised.revision; ++revised.max_groups;
+    revision = farming_state_text(revised); revision += stream_state::digest(revision) + '\n';
+    stream_state::atomic_save(farming_metadata_path(a, "grow-farm.plan", false), revision);
+    stream_state::atomic_save(farming_metadata_path(b, "grow-farm.plan", false), revision);
+    source_inspection.target.clear(); source_inspection.destinations.clear(); source_inspection.manifest.clear();
+    source_inspection.extend = false;
+    refused = false;
+    try { (void)farming_arguments(source_inspection); }
+    catch (std::exception const& error)
+    { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
+    require(refused && contents(farming_metadata_path(a, "grow-farm.plan", false)) == std::vector<uint8_t>(revision.begin(), revision.end()),
+        "changed source policy was accepted or rewritten by a saved preview");
+
+    auto text = farming_preview_text(saved.preview) + "unexpected\n";
+    refused = false;
+    try { (void)parse_farming_preview(text); }
+    catch (std::exception const& error) { refused = std::string(error.what()).find("unexpected") != std::string::npos; }
+    require(refused, "saved preview parser accepted trailing data");
+}
+
+void farming_capacity_extents(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "capacity-extents"; fs::create_directory(directory);
+    FarmingRun farm; farm.memory_limit = 512 * mib; farm.metadata = 2 * mib;
+    auto& state = farm.state; state.fixed_extent = state.capacity_fill = true;
+    state.config.k = 18; state.capacity = 5110000; state.headroom = 0; state.manifest_reserved_bytes = 8192;
+    state.job_id = state.fingerprint = state.seed = state.pool = std::string(64, '0');
+    state.farmer = std::string(96, '0');
+    FarmingDestination storage; storage.capacity_bytes = state.capacity - state.manifest_reserved_bytes;
+    storage.resource = 0; storage.known_device = storage.nonrotating = true;
+    state.estimate = farming_plan(state.config, {storage});
+    FarmingDirectory assignment; assignment.directory = directory.string(); assignment.filesystem = "test";
+    assignment.capacity_bytes = state.capacity; assignment.storage = storage;
+    assignment.layout = state.estimate.destinations[0]; assignment.directory_identity = "test:capacity";
+    state.directories.push_back(assignment); initialize_farming_extents(state);
+    farm.metadata += farming_extent_memory(state); farm.lanes.resize(1); farm.available = {1};
+    auto const manifest = directory / "grow-farm.plan";
+    auto text = farming_state_text(state); stream_state::atomic_save(manifest, text + stream_state::digest(text) + '\n');
+    farm.manifests.emplace_back(manifest, stream_state::stamp(manifest));
+    farm.lanes[0].manifest_charge = farm.lanes[0].completed_charge = snapshot(manifest, 0).charge();
+    auto const original = state;
+    require(state.directories[0].extents == std::vector<uint16_t>{7}, "capacity fixture forecast differs");
+    require(farm.reserve_extent(0, 0, 8, farm.metadata), "feasible capacity member was not admitted");
+    auto admitted = load_farming_state(manifest, farm.memory_limit);
+    require(admitted.directories[0].extents == std::vector<uint16_t>{8} &&
+        admitted.directories[0].layout == original.directories[0].layout &&
+        valid_farming_extent_revision(original, admitted), "capacity admission changed the original assignment");
+    auto child = ::fork(); require(child >= 0, "capacity revision fork failed");
+    if (!child)
+    {
+        ::setenv("XCHPLOT2_GROW_FAILPOINT", "farm-extent-all-staged", 1);
+        (void)farm.reserve_extent(0, 0, 9, farm.metadata); ::_exit(0);
+    }
+    int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+        "capacity revision interruption did not reach its durable fence");
+    require(load_farming_state(manifest, farm.memory_limit).directories[0].extents == std::vector<uint16_t>{8} &&
+        load_farming_state(directory / "grow-farm.plan.next", farm.memory_limit).directories[0].extents == std::vector<uint16_t>{9},
+        "unpublished capacity intent replaced the previous exact extent");
+    auto const pending = load_farming_state(directory / "grow-farm.plan.next", farm.memory_limit);
+    require(valid_farming_extent_revision(admitted, pending), "staged capacity intent is not recoverable");
+    require(!file_io::unlink_file(directory / "grow-farm.plan.next"), "cannot retire test capacity intent");
+    farm.seal_extent(0, 0, 7, "capacity", farm.metadata);
+    auto sealed = load_farming_state(manifest, farm.memory_limit);
+    require(sealed.directories[0].sealed_files == 1 && sealed.directories[0].fill_stop == "capacity" &&
+        sealed.directories[0].extents == std::vector<uint16_t>{7} && valid_farming_extent_revision(admitted, sealed),
+        "rejected provisional member was not durably sealed at its actual extent");
+    auto changed = sealed; changed.directories[0].extents[0] = 8;
+    require(!valid_farming_extent_revision(sealed, changed), "sealed capacity membership was mutable");
+
+    FarmingRun repeated; repeated.state = original; repeated.state.version = 4; repeated.memory_limit = farm.memory_limit;
+    repeated.metadata = 2 * mib; repeated.lanes.resize(1); repeated.available = {1};
+    repeated.metadata += farming_extent_memory(repeated.state);
+    auto const compact = root / "compact-extents"; fs::create_directory(compact);
+    repeated.state.directories[0].directory = compact.string();
+    auto const compact_manifest = compact / "grow-farm.plan";
+    auto save_compact = [&]
+    {
+        auto const body = farming_state_text(repeated.state);
+        stream_state::atomic_save(compact_manifest, body + stream_state::digest(body) + '\n');
+        repeated.manifests = {{compact_manifest, stream_state::stamp(compact_manifest)}};
+        repeated.lanes[0].manifest_charge = repeated.lanes[0].completed_charge = snapshot(compact_manifest, 0).charge();
+    };
+    save_compact(); auto const initial_bytes = farming_state_text(repeated.state).size();
+    repeated.seal_extent(0, 0, 7, "", repeated.metadata);
+    for (size_t file = 1; file <= 200; ++file)
+    {
+        repeated.lanes[0].ordinal = file;
+        require(repeated.reserve_extent(0, file, 1, repeated.metadata), "repeated small suffix exhausted compact metadata");
+        repeated.seal_extent(0, file, 1, "", repeated.metadata);
+        repeated.lanes[0].reserved_members = 0;
+    }
+    auto const compact_body = farming_state_text(repeated.state);
+    require(compact_body.size() < initial_bytes + 128 &&
+        parse_farming_state(compact_body).directories[0].extents == repeated.state.directories[0].extents,
+        "equal suffix extents were not compactly preserved");
+    bool memory_rejected = false;
+    try { (void)parse_farming_state(compact_body, compact_body.size() * 4 + sizeof(FarmingState) + sizeof(FarmingDirectory) + 1); }
+    catch (std::exception const&) { memory_rejected = true; }
+    require(memory_rejected, "compact extent expansion bypassed its parsing memory budget");
+    repeated.lanes[0].ordinal = repeated.state.directories[0].extents.size();
+    auto const old_memory = farming_extent_memory(repeated.state);
+    FarmingProfile profile; profile.config = repeated.state.config;
+    std::ostringstream profile_text; write_farming_profile_json(profile_text, profile);
+    repeated.state.profile_json = profile_text.str();
+    auto const required = farming_state_text(repeated.state).size() + 65 + farming_revision_margin(repeated.state);
+    require(required < repeated.state.manifest_reserved_bytes / 2, "metadata edge fixture has no padding room");
+    repeated.state.profile_json.append(repeated.state.manifest_reserved_bytes / 2 - required + 1, ' ');
+    repeated.metadata = repeated.metadata - old_memory + farming_extent_memory(repeated.state);
+    save_compact(); bool metadata_rejected = false;
+    auto const before_stop = repeated.state.directories[0].extents;
+    require(!repeated.reserve_extent(0, repeated.lanes[0].ordinal, 1, repeated.metadata, &metadata_rejected) &&
+        metadata_rejected && repeated.state.directories[0].extents == before_stop,
+        "metadata capacity admission modified a rejected suffix");
+    repeated.stop_filling(0, "metadata-capacity", repeated.metadata);
+    auto const terminal = load_farming_state(compact_manifest, repeated.memory_limit);
+    require(terminal.directories[0].fill_stop == "metadata-capacity" && terminal.directories[0].extents == before_stop,
+        "metadata capacity stop did not retain a recoverable exact extent");
+
+    FarmingRun partial; partial.memory_limit = farm.memory_limit; partial.metadata = 2 * mib;
+    partial.state = original; auto shared = original.directories[0].storage;
+    partial.state.estimate = farming_plan(partial.state.config, {shared, shared});
+    partial.state.directories.push_back(partial.state.directories[0]);
+    for (size_t lane = 0; lane < partial.state.directories.size(); ++lane)
+        partial.state.directories[lane].layout = partial.state.estimate.destinations[lane];
+    initialize_farming_extents(partial.state);
+    partial.state.directories[1].extents[0] = 8;
+    partial.metadata += farming_extent_memory(partial.state);
+    partial.lanes.resize(2); partial.available = {0, 1}; partial.certify(partial.metadata);
+    require(partial.admission && partial.admission->feasible, "full-job missing-member fixture was not admitted");
+    auto const full_assessment = *partial.admission;
+    partial.select_available();
+    require(!partial.all_replicas && partial.covered(), "missing-member selection lost its full-job certificate");
+    partial.certify(partial.metadata);
+    require(partial.admission->dynamic_work_seconds_per_sp == full_assessment.dynamic_work_seconds_per_sp &&
+        partial.admission->response_bound_seconds == full_assessment.response_bound_seconds,
+        "missing-member recovery replaced the full-job assessment with a subset");
+    partial.lanes[0].reserved_members = 9;
+    bool new_admission_rejected = false;
+    try { partial.certify(partial.metadata); }
+    catch (std::exception const&) { new_admission_rejected = true; }
+    require(new_admission_rejected, "missing-member recovery admitted an unreviewed larger extent");
+
+    FarmingRun hard; hard.state = original; hard.memory_limit = farm.memory_limit; hard.metadata = 2 * mib;
+    hard.state.config.group_members_override = 1;
+    hard.state.config.max_eligible_families_per_resource = farming_detail::maximum_files;
+    auto hard_storage = shared; hard_storage.capacity_bytes = uint64_t(1) << 50;
+    hard_storage.max_groups = hard_storage.max_total_members = farming_detail::maximum_files;
+    hard.state.estimate = farming_plan(hard.state.config, {hard_storage});
+    require(hard.state.estimate.feasible && hard.state.estimate.destinations[0].files == farming_detail::maximum_files,
+        "hard extent-count fixture did not reach its file bound");
+    hard.state.directories[0].layout = hard.state.estimate.destinations[0];
+    hard.state.directories[0].storage = hard_storage;
+    initialize_farming_extents(hard.state); hard.lanes.resize(1); hard.available = {1};
+    hard.state.directories[0].sealed_files = hard.lanes[0].ordinal = farming_detail::maximum_files;
+    auto const hard_size = hard.state.directories[0].extents.size(); metadata_rejected = false;
+    require(!hard.reserve_extent(0, hard.lanes[0].ordinal, 1, hard.metadata, &metadata_rejected) && !metadata_rejected &&
+        hard.state.directories[0].extents.size() == hard_size && hard.state.revision == original.revision,
+        "hard file-count exhaustion mutated or repeatedly admitted a suffix");
+
+    auto input = members(2); auto cfg = configuration();
+    auto const window_path = root / "capacity-window.gplot"; direct(window_path, Members(input).subspan(0, 1), cfg);
+    auto const source_bytes = contents(window_path);
+    auto small = cfg;
+    {
+        Engine inspect(window_path.string(), cfg, true, identity()); inspect.confirm_identity();
+        small.window_bytes = inspect.largest_chunk();
+    }
+    {
+        Construction engine(window_path.string(), small, true, identity(), "incremental"); engine.confirm_identity();
+        auto const rejected = engine.append(Members(input).subspan(1), nullptr, true);
+        require(!rejected.accepted && rejected.reason.find("source-window") != std::string::npos &&
+            !engine.identity().pending && contents(window_path) == source_bytes,
+            "new top-up window rejection started or changed a durable transaction");
+        bool ordinary_rejected = false;
+        try { (void)engine.append(Members(input).subspan(1)); }
+        catch (WindowBudgetError const&) { ordinary_rejected = true; }
+        require(ordinary_rejected && contents(window_path) == source_bytes,
+            "top-up window handling changed ordinary initial-work rejection");
+    }
+    auto const pending_path = root / "capacity-window-pending.gplot";
+    direct(pending_path, Members(input).subspan(0, 1), cfg);
+    child = ::fork(); require(child >= 0, "pending window fixture fork failed");
+    if (!child)
+    {
+        ::setenv("XCHPLOT2_GROW_FAILPOINT", "marked", 1);
+        Engine output(pending_path.string(), cfg, true, identity()); output.confirm_identity();
+        (void)output.append(Members(input).subspan(1)); ::_exit(0);
+    }
+    require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+        "pending window fixture did not create its durable transaction");
+    auto const pending_bytes = contents(pending_path);
+    ConstructionInspectionLimits inspection_limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+    require(!::chmod(pending_path.c_str(), 0400), "cannot make ordinary checkpoint read-only");
+    auto const inspected_pending = Engine::inspect(pending_path.string(), cfg, inspection_limits);
+    auto const inspected_again = Engine::inspect(pending_path.string(), cfg, inspection_limits);
+    require(inspected_pending.checkpoint && inspected_pending.identity.pending && inspected_pending.committed_members == 1 &&
+        inspected_pending.authority_digest == inspected_again.authority_digest && contents(pending_path) == pending_bytes,
+        "read-only ordinary inspection changed or did not bind its checkpoint");
+    for (unsigned failure = 0; failure < 3; ++failure)
+    {
+        auto denied = inspection_limits; std::atomic<bool> cancelled{failure == 2}; bool refused = false;
+        if (failure == 0) denied.memory_bytes = 1;
+        if (failure == 1) denied.deadline = std::chrono::steady_clock::now();
+        if (failure == 2) denied.cancelled = [&] { return cancelled.load(); };
+        try { (void)Engine::inspect(pending_path.string(), cfg, denied); } catch (std::runtime_error const&) { refused = true; }
+        require(refused && contents(pending_path) == pending_bytes, "ordinary inspection ignored its audit limits or mutated the checkpoint");
+    }
+    require(!::chmod(pending_path.c_str(), 0600), "cannot restore ordinary checkpoint permissions");
+    {
+        Engine output(pending_path.string(), cfg, true, identity()); output.confirm_identity();
+        bool pending_rejected = false;
+        try { (void)output.append(Members(input).subspan(1), nullptr, true); }
+        catch (std::exception const&) { pending_rejected = true; }
+        require(pending_rejected && output.identity().pending && contents(pending_path) == pending_bytes,
+            "optional candidate rejection abandoned pending construction");
+        (void)output.resume(Members(input).subspan(1));
+    }
+    auto const window_reference = root / "capacity-window-reference.gplot"; direct(window_reference, input, cfg);
+    require(contents(pending_path) == contents(window_reference), "pending window fixture lost ordinary recovery parity");
+}
+
+void farming_extent_admission(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto make_farm = [&](char const* name, uint64_t files, uint64_t family_limit)
+    {
+        FarmingRun farm; farm.memory_limit = 512 * mib; farm.metadata = 2 * mib;
+        auto& config = farm.state.config; config.k = 18; config.group_members_override = 1;
+        config.fixed_meta = true; config.max_eligible_families_per_resource = family_limit;
+        farm.state.fingerprint = std::string(64, '0'); farm.state.manifest_reserved_bytes = 4096;
+        farm.state.job_id = farm.state.seed = farm.state.pool = std::string(64, '0');
+        farm.state.farmer = std::string(96, '0');
+        std::vector<FarmingDestination> destinations(2);
+        std::vector<FarmingDrivePlan> layouts(2);
+        for (size_t lane = 0; lane < layouts.size(); ++lane)
+        {
+            auto& storage = destinations[lane]; storage.capacity_bytes = 128 * mib;
+            storage.resource = 0; storage.known_device = storage.nonrotating = true;
+            auto& layout = layouts[lane]; layout.files = layout.total_members = files;
+            layout.group_members = layout.meta_slots = 1; layout.fixed_members = true;
+            layout.resource_rank = uint16_t(lane); layout.resource_lanes = 2;
+            layout.families = layout.family(files - 1) + 1;
+            auto const directory = root / (std::string(name) + "-" + std::to_string(lane));
+            fs::create_directory(directory);
+            farm.state.directories.push_back({directory.string(), "test", storage.capacity_bytes, 0, layout, storage});
+            farm.state.directories.back().directory_identity = farming_directory_identity(directory);
+        }
+        auto const initial = farming_assess(config, destinations, layouts,
+            std::vector<std::vector<uint16_t>>(2, std::vector<uint16_t>(size_t(files), 1)));
+        require(initial.feasible, "frozen farming admission fixture is infeasible");
+        static_cast<FarmingAssessment&>(farm.state.estimate) = initial;
+        farm.state.estimate.destinations = layouts; farm.lanes.resize(2);
+        return farm;
+    };
+    auto bounded = make_farm("bounded", 2, 4);
+    bounded.state.fixed_extent = true;
+    auto& terminal = bounded.state.directories[0].layout;
+    terminal.group_members = 2; terminal.total_members = 3;
+    bounded.lanes[0].ordinal = 1; bounded.lanes[0].completed_members = 2;
+    Arguments options;
+    require(bounded.maximum(options, 0) == 1 && bounded.file_maximum(0, 2) == 0,
+        "managed recovery enlarged a partial terminal file or added an unplanned file");
+    bounded.lanes[0].ordinal = 2;
+    require(!bounded.maximum(options, 0), "managed recovery exceeded its saved extent");
+
+    auto promised = make_farm("promised", 2, 4);
+    promised.lanes[0].outputs.resize(2);
+    for (auto& output : promised.lanes[0].outputs) output.members = 1;
+    promised.lanes[0].ordinal = 2; promised.lanes[0].reserved_members = 1;
+    promised.certify(promised.metadata);
+    require(!promised.feasible() && promised.admission &&
+        promised.admission->max_eligible_families_per_resource == 5,
+        "fast-lane extension spent another lane's unbuilt forecast budget");
+
+    auto joint = make_farm("joint", 1, 3);
+    for (auto& lane : joint.lanes)
+    { lane.outputs.resize(1); lane.outputs[0].members = 1; lane.ordinal = 1; }
+    joint.lanes[0].reserved_members = 1; joint.certify(joint.metadata);
+    require(joint.feasible() && joint.covered(), "safe first farming extension was not certified");
+    auto const memory = joint.certificate_memory();
+    joint.certify(joint.metadata);
+    require(joint.covered() && joint.certificate_memory() == memory,
+        "covered farming extent lost its reusable global certificate");
+    joint.lanes[0].reserved_members = 0; joint.lanes[1].reserved_members = 1;
+    joint.certify(joint.metadata);
+    require(joint.feasible(), "safe alternate farming extension was not certified");
+    joint.lanes[0].reserved_members = 1;
+    require(!joint.covered(), "independent farming certificates were combined without a joint assessment");
+    joint.certify(joint.metadata);
+    require(!joint.feasible() && joint.admission->max_eligible_families_per_resource == 4,
+        "joint farming reservations exceeded their frozen family constraint");
+
+    auto saved_capacity = [&](char const* name, uint64_t limit, bool first_active = false)
+    {
+        auto farm = make_farm(name, 1, limit);
+        farm.state.fixed_extent = farm.state.capacity_fill = true;
+        farm.state.manifest_reserved_bytes = 8192;
+        initialize_farming_extents(farm.state);
+        farm.metadata += farming_extent_memory(farm.state);
+        for (size_t lane = 0; lane < farm.lanes.size(); ++lane)
+        {
+            auto& current = farm.lanes[lane];
+            current.outputs.resize(1); current.outputs[0].members = 1;
+            bool const active = first_active && !lane;
+            current.ordinal = current.completed_members = active ? 0 : 1;
+            current.reserved_members = active ? 1 : 0;
+            farm.state.directories[lane].sealed_files = active ? 0 : 1;
+        }
+        auto body = farming_state_text(farm.state); body += stream_state::digest(body) + '\n';
+        for (size_t lane = 0; lane < farm.lanes.size(); ++lane)
+        {
+            auto const manifest = file_io::native_path(farm.state.directories[lane].directory) / "grow-farm.plan";
+            stream_state::atomic_save(manifest, body);
+            farm.manifests.emplace_back(manifest, stream_state::stamp(manifest));
+            farm.lanes[lane].manifest_charge = farm.lanes[lane].completed_charge = snapshot(manifest, 0).charge();
+        }
+        return farm;
+    };
+    using Change = FarmingRun::ExtentChange;
+    using Kind = Change::Kind;
+    auto batched = saved_capacity("coalesced-compatible", 4);
+    auto const before_batch = batched.state;
+    std::vector<Change> additions{{Kind::reserve, 0, 1, 1}, {Kind::reserve, 1, 1, 1}};
+    batched.revise_extents(additions, batched.metadata);
+    require(additions[0].accepted && additions[1].accepted && batched.state.revision == before_batch.revision + 1 &&
+        batched.state.parent_digest == stream_state::digest(farming_state_text(before_batch)) &&
+        valid_farming_extent_revision(before_batch, batched.state) && batched.covered() && batched.feasible(),
+        "compatible independent-lane farming additions did not commit one jointly admitted revision");
+    for (size_t lane = 0; lane < batched.lanes.size(); ++lane)
+    {
+        auto const manifest = file_io::native_path(batched.state.directories[lane].directory) / "grow-farm.plan";
+        auto const restored = load_farming_state(manifest, batched.memory_limit);
+        require(restored.directories[lane].extents == std::vector<uint16_t>{1, 1} &&
+            restored.directories[lane].layout == before_batch.directories[lane].layout &&
+            farming_state_text(restored) == farming_state_text(batched.state),
+            "coalesced farming publication omitted an addition or changed a frozen identity");
+    }
+    auto constrained = saved_capacity("coalesced-constrained", 3);
+    auto const constrained_before = constrained.state;
+    additions = {{Kind::reserve, 0, 1, 1}, {Kind::reserve, 1, 1, 1}};
+    constrained.revise_extents(additions, constrained.metadata);
+    require(additions[0].accepted && !additions[1].accepted && constrained.feasible() && constrained.covered() &&
+        constrained.state.revision == constrained_before.revision + 1 &&
+        constrained.state.directories[0].extents == std::vector<uint16_t>{1, 1} &&
+        constrained.state.directories[1].extents == std::vector<uint16_t>{1} &&
+        constrained.admission->max_eligible_families_per_resource == 3 &&
+        valid_farming_extent_revision(constrained_before, constrained.state),
+        "joint batch rejection lost a fitting first admission or combined incompatible certificates");
+    auto const stable = farming_state_text(constrained.state);
+    auto const stamps = constrained.manifests;
+    for (auto changes : {std::vector<Change>{{Kind::seal, 0, 1, 1}, {Kind::reserve, 0, 2, 1}},
+                         std::vector<Change>{{Kind::reserve, 0, 1, 1}, {Kind::reserve, 1, 9, 1}}})
+    {
+        bool refused = false;
+        try { constrained.revise_extents(changes, constrained.metadata); }
+        catch (std::runtime_error const&) { refused = true; }
+        require(refused && farming_state_text(constrained.state) == stable && constrained.manifests == stamps,
+            "duplicate or invalid coalesced transition changed a valid saved farming revision");
+    }
+    additions = {{Kind::reserve, 1, 1, 1}};
+    bool memory_refused = false;
+    try { constrained.revise_extents(additions, constrained.memory_limit); }
+    catch (FarmingResourceError const& error) { memory_refused = error.memory_budget; }
+    require(memory_refused && !additions[0].accepted && farming_state_text(constrained.state) == stable &&
+        constrained.manifests == stamps && constrained.feasible() && constrained.covered(),
+        "coalesced assessment memory failure retained a provisional admission or changed the saved revision");
+    auto mixed = saved_capacity("coalesced-seal-reserve", 3, true);
+    auto const mixed_before = mixed.state;
+    std::vector<Change> seal_and_add{{Kind::seal, 0, 0, 1, "total-member-limit"}, {Kind::reserve, 1, 1, 1}};
+    mixed.revise_extents(seal_and_add, mixed.metadata);
+    require(seal_and_add[1].accepted && mixed.state.revision == mixed_before.revision + 1 &&
+        mixed.state.directories[0].sealed_files == 1 && mixed.state.directories[0].fill_stop == "total-member-limit" &&
+        mixed.state.directories[1].extents == std::vector<uint16_t>{1, 1} && mixed.feasible() && mixed.covered() &&
+        mixed.admission->max_eligible_families_per_resource == 3 && valid_farming_extent_revision(mixed_before, mixed.state),
+        "mixed completion and reservation lost the sealed lane's promised demand or joint admission");
+    for (auto const& reason : {std::string("group-limit"), std::string("total-member-limit"), std::string{}})
+    {
+        auto limited = saved_capacity(("coalesced-metadata-" + (reason.empty() ? "capacity" : reason)).c_str(), 4);
+        limited.state.manifest_reserved_bytes = 2 * (farming_state_text(limited.state).size() + 65 +
+            farming_revision_margin(limited.state) - 1);
+        auto body = farming_state_text(limited.state); body += stream_state::digest(body) + '\n';
+        for (size_t lane = 0; lane < limited.manifests.size(); ++lane)
+        {
+            auto& copy = limited.manifests[lane]; stream_state::atomic_save(copy.first, body);
+            copy.second = stream_state::stamp(copy.first);
+            limited.lanes[lane].manifest_charge = limited.lanes[lane].completed_charge = snapshot(copy.first, 0).charge();
+        }
+        std::vector<Change> stop{{Kind::reserve, 0, 1, 1, reason}}; stop[0].rejected = Kind::stop;
+        limited.revise_extents(stop, limited.metadata);
+        require(!stop[0].accepted && stop[0].metadata_rejected &&
+            limited.state.directories[0].fill_stop == (reason.empty() ? "metadata-capacity" : reason),
+            "metadata fallback changed explicit terminal-limit reason precedence");
+    }
+
+    // Compact plan extents must not hide growth of the destination journal.
+    auto progress_limited = make_farm("progress-bound-admission", 1, 1000000);
+    progress_limited.state.version = 8; progress_limited.state.policy_revision = 1;
+    progress_limited.state.identity_k = 18; progress_limited.state.headroom = 0;
+    progress_limited.state.fixed_extent = progress_limited.state.capacity_fill = true;
+    progress_limited.state.config.deadline_seconds = progress_limited.state.config.challenge_seconds = 1000000;
+    progress_limited.state.manifest_reserved_bytes = mib;
+    uint64_t alignment = 1;
+    for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+    {
+        auto& directory = progress_limited.state.directories[lane]; directory.extents = {1}; directory.sealed_files = 1;
+        directory.capacity_bytes = directory.storage.capacity_bytes = 512 * mib;
+        auto const path = file_io::native_path(directory.directory);
+        progress_limited.locks.push_back(std::make_unique<DirectoryLock>(path));
+        auto metadata = std::make_shared<FarmingMetadataDirectory>(path, false); metadata->create();
+        progress_limited.metadata_directories.push_back(std::move(metadata));
+        file_io::Space space{}; require(!file_io::space_path(path, &space), "cannot inspect progress-bound admission fixture");
+        alignment = std::max({alignment, uint64_t(space.f_bsize), uint64_t(space.f_frsize)});
+    }
+    auto progress_bound = [&]
+    {
+        uint64_t bytes = 0;
+        for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+            bytes = sum(bytes, farming_progress_memory_bound(progress_limited.state, lane));
+        return bytes;
+    };
+    auto& progress_directory = progress_limited.state.directories[0];
+    progress_limited.state.progress_reserved_bytes = product(farming_update_aligned(
+        farming_progress_size_bound(progress_limited.state, 0), alignment), 2);
+    while (true)
+    {
+        progress_directory.extents.push_back(1);
+        if (product(farming_update_aligned(farming_progress_size_bound(progress_limited.state, 0), alignment), 2) >
+            progress_limited.state.progress_reserved_bytes) { progress_directory.extents.pop_back(); break; }
+        require(progress_directory.extents.size() < farming_detail::maximum_files - 1,
+            "progress-bound fixture exhausted the permanent file limit");
+    }
+    progress_directory.extents.reserve(progress_directory.extents.size() + 1);
+    for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+    {
+        auto& directory = progress_limited.state.directories[lane]; directory.sealed_files = directory.extents.size();
+        progress_limited.lanes[lane].ordinal = progress_limited.lanes[lane].completed_members = directory.sealed_files;
+    }
+    progress_limited.metadata = sum(progress_limited.metadata,
+        sum(farming_extent_memory(progress_limited.state), progress_bound()));
+    auto save_progress_parent = [&]
+    {
+        auto body = farming_state_text(progress_limited.state); body += stream_state::digest(body) + '\n';
+        progress_limited.manifests.clear(); progress_limited.manifest_charge = 0;
+        for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+        {
+            auto const manifest = progress_limited.metadata_directories[lane]->path / "grow-farm.plan";
+            stream_state::atomic_save(manifest, body);
+            progress_limited.manifests.emplace_back(manifest, stream_state::stamp(manifest));
+            auto& current = progress_limited.lanes[lane];
+            current.manifest_charge = current.completed_charge = snapshot(manifest, 0).charge();
+            progress_limited.manifest_charge = sum(progress_limited.manifest_charge, current.manifest_charge);
+        }
+    };
+    save_progress_parent();
+    auto const progress_parent = farming_state_text(progress_limited.state);
+    auto const progress_stamps = progress_limited.manifests;
+    auto const metadata_before_rejection = progress_limited.metadata;
+    auto const next_ordinal = progress_directory.extents.size();
+    std::vector<Change> progress_add{{Kind::reserve, 0, next_ordinal, 1}};
+    progress_limited.revise_extents(progress_add, progress_limited.metadata);
+    require(!progress_add[0].accepted && progress_add[0].metadata_rejected &&
+        farming_state_text(progress_limited.state) == progress_parent && progress_limited.manifests == progress_stamps &&
+        progress_limited.metadata == metadata_before_rejection &&
+        !fs::exists(progress_limited.metadata_directories[0]->path / "grow-farm.progress"),
+        "future grant bypassed progress bytes or retained provisional journal memory before publication");
+    progress_directory.extents.push_back(1);
+    progress_limited.state.progress_reserved_bytes = product(farming_update_aligned(
+        farming_progress_size_bound(progress_limited.state, 0), alignment), 2);
+    progress_directory.extents.pop_back(); save_progress_parent();
+    auto const before_progress_memory = progress_bound();
+    auto const before_progress_extents = farming_extent_memory(progress_limited.state);
+    auto const before_progress_certificate = progress_limited.certificate_memory();
+    auto const before_progress_metadata = progress_limited.metadata;
+    progress_add = {{Kind::reserve, 0, next_ordinal, 1}};
+    progress_limited.revise_extents(progress_add, progress_limited.metadata);
+    require(progress_add[0].accepted && progress_limited.metadata ==
+        before_progress_metadata + (progress_bound() - before_progress_memory) +
+        (farming_extent_memory(progress_limited.state) - before_progress_extents) +
+        (progress_limited.certificate_memory() - before_progress_certificate),
+        "admitted future grant did not retain its larger journal and certificate memory allowance");
+
+    auto saved = make_farm("saved", 1, 3);
+    saved.state.version = 5; // Retain strict legacy replica-build coverage.
+    auto const manifest = root / "farming-admission.plan";
+    auto const text = farming_state_text(saved.state);
+    stream_state::atomic_save(manifest, text + stream_state::digest(text) + '\n');
+    FarmingRun resumed; resumed.state = load_farming_state(manifest, saved.memory_limit);
+    resumed.memory_limit = saved.memory_limit; resumed.metadata = saved.metadata; resumed.lanes.resize(2);
+    for (size_t lane = 0; lane < resumed.lanes.size(); ++lane)
+    {
+        require(resumed.state.directories[lane].storage.resource == 0,
+            "saved farming storage lost its shared physical-resource assignment");
+        resumed.lanes[lane].outputs.resize(1); resumed.lanes[lane].outputs[0].members = 1;
+        resumed.lanes[lane].ordinal = 1;
+    }
+    resumed.lanes[0].reserved_members = 1; resumed.certify(resumed.metadata);
+    require(resumed.feasible() && resumed.admission && resumed.admission->max_eligible_families_per_resource == 3,
+        "resumed shared-resource farming extension was not assessed beyond its forecast");
+
+    auto const replica = file_io::native_path(saved.state.directories.back().directory) / "grow-farm.plan";
+    auto const locator = file_io::native_path(saved.state.directories.front().directory) / "grow-farm.plan";
+    auto const digest = stream_state::digest(text);
+    stream_state::atomic_save(locator, text + digest + '\n');
+    stream_state::atomic_save(replica, text + digest + '\n');
+    auto const original_replica = contents(locator);
+    auto discover = [&]
+    {
+        Arguments args; args.plan_only = true; args.target = locator.parent_path(); args.max_ram = saved.memory_limit;
+        return farming_arguments(args);
+    };
+    auto duplicates = discover();
+    require(duplicates.saved && duplicates.digest == digest && duplicates.directories.size() == saved.state.directories.size(),
+        "identical farming replicas changed the discovered job");
+    auto const formatted = text + '\n';
+    stream_state::atomic_save(replica, formatted + stream_state::digest(formatted) + '\n');
+    auto noncanonical = discover();
+    require(noncanonical.saved && noncanonical.digest == digest && !noncanonical.pending,
+        "equivalent noncanonical farming replica changed the canonical revision");
+    for (auto const& copy : noncanonical.copies) if (copy.stamp)
+        require(copy.digest == digest, "noncanonical farming replica retained its raw checksum as revision identity");
+    stream_state::atomic_save(replica, text + std::string(64, '0') + '\n');
+    bool corrupt_replica = false;
+    try { (void)discover(); }
+    catch (std::runtime_error const& error)
+    { corrupt_replica = std::string(error.what()).find("checksum mismatch") != std::string::npos; }
+    require(corrupt_replica && contents(locator) == original_replica,
+        "later farming replica bypassed its checksum check");
+    auto foreign_build = text;
+    auto const build = std::string(GROW_IDENTITY);
+    foreign_build.replace(foreign_build.find(build), build.size(), "different grow build");
+    stream_state::atomic_save(replica, foreign_build + stream_state::digest(foreign_build) + '\n');
+    bool foreign_replica = false;
+    try { (void)discover(); }
+    catch (std::runtime_error const& error)
+    { foreign_replica = std::string(error.what()).find("original grow build") != std::string::npos; }
+    require(foreign_replica && contents(locator) == original_replica,
+        "later farming replica bypassed its saved-build validation");
+
+    auto const exclusive_directory = root / "exclusive-farming-publication";
+    fs::create_directory(exclusive_directory);
+    auto const exclusive_path = exclusive_directory / "grow-farm.plan";
+    FarmingJob::Copy exclusive_copy{exclusive_path, {}, {}, false};
+    exclusive_copy.check();
+    auto const exclusive_pending = stage_farming_state(exclusive_path, saved.state);
+    auto const prepared = contents(exclusive_pending);
+    bool exclusive_rejected = false;
+    try { stream_state::atomic_save(exclusive_pending, "conflicting pending revision\n", false); }
+    catch (std::exception const&) { exclusive_rejected = true; }
+    require(exclusive_rejected && contents(exclusive_pending) == prepared,
+        "exclusive farming staging replaced an existing pending revision");
+    // A competing file appears after the controller validated its absence.
+    std::string const competing = "concurrently saved job\n";
+    stream_state::atomic_save(exclusive_path, competing);
+    exclusive_rejected = false;
+    try { publish_farming_state(exclusive_pending, exclusive_path, exclusive_copy.stamp.has_value()); }
+    catch (std::runtime_error const&) { exclusive_rejected = true; }
+    require(exclusive_rejected && contents(exclusive_pending) == prepared &&
+        contents(exclusive_path) == std::vector<uint8_t>(competing.begin(), competing.end()),
+        "exclusive farming publication replaced a concurrently appearing job");
+    for (auto const& entry : fs::directory_iterator(exclusive_directory))
+        require(entry.path() == exclusive_path || entry.path() == exclusive_pending,
+            "failed exclusive farming publication retained a private temporary file");
+    publish_farming_state(exclusive_pending, exclusive_path, true);
+    require(contents(exclusive_path) == prepared && !fs::exists(exclusive_pending),
+        "validated farming-parent replacement failed");
+
+    auto partial = make_farm("partial-topology", 1, 3);
+    for (auto& directory : partial.state.directories)
+    {
+        directory.directory_identity = farming_directory_identity(directory.directory);
+        directory.resource = directory.storage.resource = 1;
+        directory.layout.schedule = 1;
+        directory.identity_resources = 2; directory.identity_resource = 1;
+    }
+    partial.state.estimate.destinations.clear();
+    for (auto const& directory : partial.state.directories)
+        partial.state.estimate.destinations.push_back(directory.layout);
+    auto absent = partial.state.directories.front();
+    absent.directory = (root / "offline-topology").string(); absent.directory_identity = "offline";
+    absent.resource = absent.storage.resource = 0;
+    absent.layout.schedule = 0; absent.layout.resource_rank = 0; absent.layout.resource_lanes = 1;
+    absent.identity_resource = 0;
+    absent.layout.files = absent.layout.total_members = absent.layout.families = 0;
+    partial.state.directories.push_back(absent);
+    partial.state.estimate.destinations.push_back(absent.layout);
+    partial.state.fixed_extent = true;
+    FarmingJob job; job.saved = partial.state;
+    for (auto const& directory : partial.state.directories) job.directories.push_back(directory.directory);
+    Arguments preview; preview.plan_only = true; preview.max_ram = 512 * mib;
+    auto available = farming_run(preview, nullptr, job);
+    require(available->available[0] && available->available[1] && !available->available[2],
+        "partial topology compared renumbered resource IDs instead of available resource relationships");
+    job.saved->directories[1].resource = job.saved->directories[1].storage.resource = 0;
+    bool changed_topology = false;
+    try { (void)farming_run(preview, nullptr, job); }
+    catch (std::runtime_error const& error)
+    { changed_topology = std::string(error.what()).find("storage topology changed") != std::string::npos; }
+    require(changed_topology, "offline destination bypassed changed storage topology among available members");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    for (bool pending_source : {true, false})
+    {
+        auto const directory = root / (pending_source ? "changed-pending" : "appeared-parent");
+        auto const left = directory / "a", right = directory / "b";
+        fs::create_directories(left); fs::create_directory(right);
+        Arguments options; options.command = "fill"; options.directory_farm = true;
+        options.target = left; options.destinations.push_back(right);
+        options.k = 18; options.group_members = 1; options.meta = 0;
+        options.farming_max_eligible_groups = 4;
+        options.capacity = 64 * mib; options.headroom = 0; options.max_ram = 512 * mib;
+        options.max_groups = options.max_total_members = 1;
+        auto job = farming_arguments(options);
+        auto const pending = farming_metadata_path(right, "grow-farm.plan.next", false), published = farming_metadata_path(left, "grow-farm.plan", false);
+        std::promise<void> started, release;
+        auto ready = started.get_future();
+        producer_thread = std::this_thread::get_id();
+        background_write_started = &started; background_write_release = release.get_future().share();
+        background_check_target = pending.string();
+        background_write_timed_out = false; background_check_after = true; hold_background_check = true;
+        auto writer = std::async(std::launch::async, [&]
+        {
+            try
+            {
+                auto run = farming_run(options, nullptr, job);
+                if (!run->feasible()) return run->infeasibility_reason();
+            }
+            catch (std::runtime_error const& error) { return std::string(error.what()); }
+            return std::string{};
+        });
+        bool const paused = ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        auto const changed = pending_source ? pending : published;
+        std::string const replacement = "unrelated replacement\n";
+        if (paused) stream_state::atomic_save(changed, replacement);
+        release.set_value();
+        auto const error = writer.get();
+        hold_background_check = false; background_check_after = false; background_check_target.clear();
+        background_write_started = nullptr;
+        require(paused && !background_write_timed_out &&
+            error.find(pending_source ? "pending farming revision changed" : "farming job appeared") != std::string::npos,
+            "concurrent farming metadata change bypassed its publication audit: " + error);
+        require(!fs::exists(farming_metadata_path(right, "grow-farm.plan", false)) && (!pending_source || !fs::exists(published)),
+            "farming metadata conflict published part of the job before rejection");
+        require(contents(changed) == std::vector<uint8_t>(replacement.begin(), replacement.end()),
+            "farming publication overwrote concurrently replaced metadata");
+    }
+#endif
+}
+
+void output_reservations(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "output-reservations", scratch = root / "output-reservation-scratch";
+    fs::create_directory(directory); fs::create_directory(scratch);
+    auto const path = directory / "external.gplot";
+    cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    ExternalConfig external; external.scratch.push_back({scratch.string(), 128 * mib});
+    external.segment_bytes = mib;
+    Construction engine(path.string(), cfg, false, identity(), "external", external);
+    engine.confirm_identity();
+    require(engine.append(input.subspan(0, 1)).accepted, "output reservation contribution did not fit");
+    auto const inspected = ExternalEngine::inspect(path.string(), cfg.memory_limit_bytes);
+    require(inspected.metadata_reserved_bytes >= inspected.metadata_occupied_bytes,
+        "output reservation fixture exceeded its metadata envelope");
+    auto output = snapshot(path, 0); output.reservation = UINT64_MAX;
+    require(output_auxiliary(path, output, cfg.memory_limit_bytes).has_value(),
+        "active output reservation was not discovered");
+    require(output.charge() == inspected.peak_bytes,
+        "active external metadata was omitted or counted twice in aggregate capacity");
+    (void)output_auxiliary(path, output, cfg.memory_limit_bytes);
+    require(output.charge() == inspected.peak_bytes, "repeated active inspection accumulated a reservation");
+
+    // Keep an unrelated file in the owned namespace so ordinary handoff must
+    // authenticate and retain its retired metadata, as for changed scratch.
+    std::optional<fs::path> owned;
+    for (auto const& entry : fs::directory_iterator(scratch))
+        if (entry.is_directory()) { owned = entry.path(); break; }
+    require(owned.has_value(), "output reservation fixture has no scratch namespace");
+    { std::ofstream file(*owned / "preserved"); file.put('!'); }
+    (void)engine.finish(); engine.release_external();
+    require(!engine.scratch_cleanup_complete, "changed scratch did not retain retired metadata");
+    auto const completed = snapshot(path, 0);
+    output.bytes = completed.bytes; output.allocated = completed.allocated;
+    std::optional<fs::path> holder;
+    for (auto const& entry : fs::directory_iterator(directory))
+        if (entry.path().filename().string().starts_with(path.filename().string() + ".external.retired-"))
+        { holder = entry.path(); break; }
+    require(holder.has_value(), "completed output has no authenticated retired holder");
+    auto const retired = ExternalEngine::inspect_retired(path.string(), holder->string(), cfg.memory_limit_bytes);
+    require(!output_auxiliary(path, output, cfg.memory_limit_bytes) && !output.reservation &&
+        output.auxiliary == retired.metadata_reserved_bytes && output.retired == retired.metadata_reserved_bytes &&
+        output.charge() == grow_add(std::max(completed.bytes, completed.allocated), retired.metadata_reserved_bytes),
+        "retired metadata retained the old target peak or changed ordinary output accounting");
+
+    auto const ordinary = directory / "ordinary.gplot";
+    complete(ordinary, input.subspan(0, 1), false, cfg);
+    auto plain = snapshot(ordinary, 0); plain.reservation = UINT64_MAX;
+    require(!output_auxiliary(ordinary, plain, cfg.memory_limit_bytes) && !plain.reservation && !plain.auxiliary &&
+        plain.charge() == std::max(plain.bytes, plain.allocated),
+        "ordinary output inspection retained an unrelated reservation or metadata charge");
+}
+
+void published_retired_external_layout(fs::path const& root, Members input, Config cfg, bool legacy)
+{
+    using namespace grow_controller_test;
+    auto const scratch = root / "published-retired-scratch"; fs::create_directory(scratch);
+    auto state = farming_format_fixture(6); state.capacity_fill = false;
+#ifndef GROW_TEST_WRAP_PWRITE
+    state.directories.resize(1);
+#else
+    auto const probe_path = root / "retired-receipt-xattr-probe";
+    int const probe = ::open(probe_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    require(probe >= 0, "cannot create retired receipt capability probe");
+    bool const native_receipt = !::fsetxattr(probe, "user.xchplot2.retired-test", "", 0, 0);
+    require(!::close(probe) && !::unlink(probe_path.c_str()), "cannot remove retired receipt capability probe");
+    if (native_receipt) state.directories.push_back(state.directories.back());
+#endif
+    state.seed = std::string(64, 'a'); state.seed_owner.clear(); state.pool = std::string(64, '4');
+    state.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Arguments args; args.seed = state.seed; args.farmer = state.farmer; args.pool_ph = state.pool;
+    args.k = state.config.k; args.strength = state.config.strength; Keys keys(args);
+    std::vector<fs::path> directories;
+    std::vector<fs::path> holders;
+    std::vector<fs::path> runtime_roots(state.directories.size());
+    std::vector<ConstructionPathBinding> root_bindings;
+    cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+    {
+        auto directory = root / ("published-retired-" + std::to_string(lane)); fs::create_directory(directory); directories.push_back(directory);
+        auto& saved = state.directories[lane]; saved.directory = file_io::path_text(directory);
+        saved.directory_identity = farming_directory_identity(directory);
+        saved.identity_resources = state.directories.size(); saved.identity_resource = lane;
+        saved.layout.files = saved.layout.total_members = saved.layout.group_members = 1;
+        FarmingReplotDirectory metadata(directory, state.job_id, true, legacy);
+        auto const target = migration_stage_path(directory, state.job_id, lane, legacy);
+        ExternalConfig external; external.scratch.push_back({scratch.string(), 128 * mib}); external.segment_bytes = mib;
+        auto construct = [&]
+        {
+            auto requested = initial_identity(farming_identity(keys, saved, 0));
+            Construction engine(target.string(), cfg, false, requested, "external", external); engine.confirm_identity();
+            require(engine.append(input.subspan(0, 1)).accepted, "published-retired fixture did not admit its member");
+            if (!lane)
+            {
+                for (auto const& entry : fs::directory_iterator(scratch)) if (entry.is_directory())
+                { std::ofstream file(entry.path() / "preserved"); file.put('!'); break; }
+            }
+#ifdef GROW_TEST_WRAP_PWRITE
+            fail_retired_xattr = lane == 1;
+#endif
+            (void)engine.finish(); engine.release_external();
+#ifdef GROW_TEST_WRAP_PWRITE
+            fail_retired_xattr = false;
+            require(engine.scratch_cleanup_complete == bool(lane), "clean and changed retired fixtures lost their distinct cleanup state");
+#endif
+        };
+#ifdef GROW_TEST_WRAP_PWRITE
+        if (lane == 2)
+        {
+            auto const child = ::fork(); require(child >= 0, "cannot fork retired publication receipt fixture");
+            if (!child)
+            { ::setenv("XCHPLOT2_GROW_FAILPOINT", "external-handoff-checkpoint-removed", 1); construct(); std::_Exit(1); }
+            int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+                "retired publication did not stop after its inode receipt was durable");
+        }
+        else
+#endif
+            construct();
+        for (auto const& entry : fs::directory_iterator(target.parent_path()))
+            if (file_io::path_text(entry.path().filename()).starts_with(file_io::path_text(target.filename()) + ".external.retired-"))
+                holders.push_back(entry.path());
+        require(holders.size() == lane + 1, "published fixture lost its retained terminal record");
+        if (lane == 2) require(!fs::exists(holders.back() / "checkpoint"), "inode receipt fixture retained its ordinary checkpoint");
+        else require(fs::exists(holders.back() / "checkpoint"), "checkpoint publication fixture lost its terminal checkpoint");
+        auto const published = group_path(directory, 0, state.job_id);
+        require(!file_io::rename_file(target, published, false), "cannot publish external alias fixture");
+        auto alias = retired_farming_publication(state, target, &keys, {}, nullptr, legacy);
+        require(alias.has_value(), "fixed saved assignment lost its terminal publication alias");
+        auto inspected = ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *alias, cfg.memory_limit_bytes);
+        require(inspected.complete && inspected.members == 1 && (lane == 2 || inspected.metadata_occupied_bytes),
+            "published terminal ownership lost its metadata allocation");
+        auto output = snapshot(published, 0);
+        auto resolve = [&](fs::path const& original, fs::path const& requested) { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy); };
+        require(!output_auxiliary(published, output, cfg.memory_limit_bytes, resolve, legacy) &&
+            output.retired == inspected.metadata_occupied_bytes && output.auxiliary_allocated == inspected.metadata_occupied_bytes,
+            "ordinary fixed-farm accounting omitted published stage metadata");
+        auto rejects = [&](auto operation)
+        { bool rejected = false; try { operation(); } catch (std::runtime_error const&) { rejected = true; }
+          require(rejected, "unreviewed terminal publication alias was accepted"); };
+        require(alias->parent.has_value() != legacy, "migration alias did not retain its explicit publication parent authority");
+        auto const misplaced = scratch / holders.back().filename(); fs::rename(holders.back(), misplaced);
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), misplaced.string(), *alias); });
+        fs::rename(misplaced, holders.back());
+        if (!legacy)
+        {
+            auto missing = *alias; missing.parent.reset();
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), missing); });
+            auto wrong = *alias; wrong.parent->file.inode ^= UINT64_C(1);
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), wrong); });
+            wrong = *alias; wrong.path = file_io::path_text(scratch / "unreviewed.plot2");
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), wrong); });
+            auto const expected_root = saved.directory_identity; saved.directory_identity = "unreviewed destination";
+            rejects([&] { (void)retired_farming_publication(state, target, &keys, {}, nullptr, legacy); });
+            saved.directory_identity = expected_root;
+            auto const original_parent = target.parent_path(), retained_parent = original_parent.parent_path() / "retained-stage-parent";
+            fs::rename(original_parent, retained_parent); fs::create_directory(original_parent);
+            fs::permissions(original_parent, fs::perms::owner_all);
+            fs::rename(retained_parent / holders.back().filename(), holders.back());
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *alias); });
+            fs::rename(holders.back(), retained_parent / holders.back().filename()); fs::remove(original_parent);
+            fs::rename(retained_parent, original_parent);
+        }
+        auto bad = *alias; ++bad.stamp.bytes;
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), bad); });
+        bad = *alias; ++bad.identity.header.group_size;
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), bad); });
+        { std::ofstream file(target); file << "reappeared original"; }
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *alias); });
+        fs::remove(target);
+        auto const retained = directory / "original-publication"; fs::rename(published, retained);
+        fs::copy_file(retained, published);
+        auto substitute = retired_farming_publication(state, target, &keys, {}, nullptr, legacy);
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *substitute); });
+        fs::remove(published); fs::rename(retained, published);
+        auto const current = root / ("published-retired-current-" + std::to_string(lane));
+        auto const relative_holder = holders.back().lexically_relative(directory);
+        fs::rename(directory, current); fs::create_directory(directory); directories[lane] = runtime_roots[lane] = current;
+        holders.back() = current / relative_holder;
+        root_bindings.push_back({directory.string(), current.string(), saved.directory_identity});
+        auto const current_stage = migration_stage_path(current, state.job_id, lane, legacy);
+        auto const current_published = group_path(current, 0, state.job_id);
+        auto rebound = retired_farming_publication(state, current_stage, &keys, {}, nullptr, legacy, runtime_roots);
+        require(rebound && saved.directory == directory.string(), "retired migration runtime alias changed its immutable saved assignment");
+        auto rebound_inspection = ExternalEngine::inspect_retired_published(current_stage.string(), holders.back().string(), *rebound,
+            cfg.memory_limit_bytes, root_bindings);
+        auto current_output = snapshot(current_published, 0);
+        auto current_resolve = [&](fs::path const& original, fs::path const& requested)
+        { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy, runtime_roots); };
+        require(!output_auxiliary(current_published, current_output, cfg.memory_limit_bytes, current_resolve, legacy, root_bindings) &&
+            current_output.retired == rebound_inspection.metadata_occupied_bytes,
+            "moved retired migration alias lost its checked native metadata reservation");
+        auto wrong_roots = runtime_roots; wrong_roots[lane] = scratch;
+        rejects([&] { (void)retired_farming_publication(state, migration_stage_path(scratch, state.job_id, lane, legacy),
+            &keys, {}, nullptr, legacy, wrong_roots); });
+    }
+    PublishedRetirements publications{directories, [&](fs::path const& original, fs::path const& requested)
+        { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy, runtime_roots); }, state.job_id, legacy};
+    ScratchPool pool(std::vector<fs::path>{scratch}, 0, 1);
+    preserve_published_retired(pool, publications, cfg.memory_limit_bytes, {}, root_bindings);
+    bool rejected = false; try { pool.seal_recovery(); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "another destination's preserved scratch bypassed the shared temporary cap");
+}
+void published_retired_external(fs::path const& root, Members input, Config cfg)
+{
+    for (bool legacy : {true, false})
+    {
+        auto const directory = root / (legacy ? "legacy-retired-publications" : "private-retired-publications");
+        fs::create_directory(directory); published_retired_external_layout(directory, input, cfg, legacy);
+    }
+}
+
+void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t memory)
+{
+    using namespace grow_controller_test;
+    require(!farming_update_allocation(root / "absent-update-metadata"), "read-only destination preview required private mailbox creation");
+    auto const first = root / "update-first", second = root / "update-second";
+    fs::create_directory(first); fs::create_directory(second);
+    state.version = 8; state.applied_update.clear(); state.request_floor = 0;
+    state.directories = {state.directories.front(), state.directories.front()};
+    for (size_t i = 0; i < state.directories.size(); ++i)
+    {
+        auto& directory = state.directories[i]; auto const path = i ? second : first;
+        directory.directory = file_io::path_text(path); directory.directory_identity = farming_directory_identity(path);
+        FarmingMetadataDirectory metadata(path, false); metadata.create();
+    }
+    state.update_reserved_bytes = farming_update_reservation(farming_update_text(farming_update_snapshot(state)).size() + 4096, 4096);
+    state.manifest_reserved_bytes = 2 * mib;
+    auto save = [&]
+    {
+        auto body = farming_state_text(state); body += stream_state::digest(body) + '\n';
+        for (auto const& directory : state.directories)
+            stream_state::atomic_save(farming_metadata_path(file_io::native_path(directory.directory), "grow-farm.plan", false), body);
+    };
+    save();
+    auto propose = [&](uint64_t capacity, uint64_t headroom)
+    {
+        auto update = farming_update_snapshot(state); update.capacity = capacity; update.headroom = headroom;
+        farming_update_preconditions(update, state); return update;
+    };
+    auto changed = propose(state.capacity + mib, state.headroom);
+    auto legacy = changed; legacy.version = 2; legacy.id = std::string(64, 'f');
+    auto legacy_body = farming_update_text(legacy); legacy_body += stream_state::digest(legacy_body) + '\n';
+    auto const legacy_path = farming_metadata_path(first, "grow-farm.update", false);
+    stream_state::atomic_save(legacy_path, legacy_body, false);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        auto pending = mailbox.next(state);
+        require(pending && pending->update.version == 2 && pending->update.id == legacy.id,
+            "existing legacy waiting request was not imported");
+    }
+    std::ostringstream old_error;
+    old_error << "ordinary-group-farming-update-error-v1\n" << std::quoted(legacy.id) << ' ' << std::quoted("legacy refusal") << '\n';
+    auto error_body = old_error.str(); error_body += stream_state::digest(error_body) + '\n';
+    stream_state::atomic_save(farming_metadata_path(first, "grow-farm.update.error", false), error_body, false);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(mailbox.receipt(legacy.id)->status == "refused" && mailbox.receipt(legacy.id)->reason == "legacy refusal",
+            "legacy terminal refusal was lost during import");
+        mailbox.compact();
+        require(!fs::exists(legacy_path) && mailbox.records().empty(), "acknowledged legacy request retained authority");
+    }
+    auto advance_policy = [&](FarmingState& after, FarmingState const& before)
+    {
+        after.revision = before.revision + 1; after.policy_revision = after.revision;
+        after.parent_digest = stream_state::digest(farming_state_text(before));
+        if (after.version >= 9) farming_record_parent(after, before.revision, after.parent_digest);
+    };
+    auto unrelated = state; ++unrelated.headroom; unrelated.request_floor = 7;
+    advance_policy(unrelated, state);
+    require(farming_policy_digest(state) == farming_policy_digest([&] { auto copy = state; copy.request_floor = 7; return copy; }()),
+        "history compaction invalidated policy identity");
+    auto rebased = farming_update_rebase(changed, unrelated);
+    require(rebased.capacity == changed.capacity && rebased.headroom == unrelated.headroom,
+        "disjoint queued fields did not rebase");
+    unrelated.capacity += 2 * mib;
+    bool conflict = false;
+    try { (void)farming_update_rebase(changed, unrelated); }
+    catch (std::runtime_error const& error) { conflict = std::string(error.what()).find("capacity-bytes") != std::string::npos; }
+    require(conflict, "queued scalar conflict lacked its exact field");
+    std::string replay_body, replay_id;
+    auto const interrupted = farming_metadata_path(first, "grow-farm.update.floor.partial.Ab12Cd", false);
+    { std::ofstream out(interrupted); out << "interrupted private replacement"; }
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(!fs::exists(interrupted), "interrupted atomic-save allocation was not reclaimed under its request lock");
+        require(mailbox.locked() && mailbox.complete(), "complete update replicas were not locked");
+        auto const first_id = mailbox.submit(changed);
+        require(mailbox.submit(changed) == first_id && mailbox.receipt(first_id)->status == "accepted",
+            "duplicate request changed identity or lost its durable acceptance");
+        auto independent = propose(state.capacity, state.headroom + mib);
+        auto const merged_id = mailbox.submit(independent);
+        require(merged_id != first_id && mailbox.receipt(first_id)->status == "superseded" && mailbox.submit(independent) == merged_id,
+            "compatible queued edits did not converge to one idempotent replacement");
+        auto next = mailbox.next(state);
+        require(next && next->update.id == merged_id && next->update.capacity == changed.capacity && next->update.headroom == independent.headroom,
+            "queued replacement discarded an earlier compatible field");
+        auto reset = propose(state.capacity, state.headroom);
+        farming_update_preconditions(reset, state, {"capacity-bytes"});
+        auto const reset_id = mailbox.submit(reset);
+        next = mailbox.next(state);
+        require(next && next->update.id == reset_id && next->update.capacity == state.capacity && next->update.headroom == independent.headroom,
+            "explicit queued reset discarded an unrelated waiting field");
+        for (auto const& record : mailbox.records()) if (record.file.update.id == reset_id)
+        { replay_body = record.body; replay_id = reset_id; }
+        require(mailbox.cancel() && mailbox.receipt(reset_id)->status == "cancelled" && !mailbox.actionable(),
+            "cancelled requests retained actionable policy authority");
+        mailbox.compact();
+        require(mailbox.records().empty() && mailbox.floor(), "acknowledged terminal history did not compact");
+        auto pause = farming_update_snapshot(state); pause.capacity = changed.capacity; pause.action = "pause";
+        farming_update_preconditions(pause, state, {"control"});
+        auto const pause_id = mailbox.submit(pause);
+        auto const resume_id = mailbox.submit_control("resume");
+        next = mailbox.next(state);
+        auto const effective = farming_control_view(state, mailbox.records(), mailbox.control_state());
+        require(next && next->update.id == pause_id && next->update.action == "pause" && next->update.capacity == changed.capacity &&
+            effective.control == "active" && !resume_id.empty() && mailbox.receipt(pause_id)->status == "accepted",
+            "local resume changed a separate pending policy request or lost its effective control");
+        mailbox.cancel(); mailbox.compact();
+        auto control = [&](std::string action, std::vector<std::string> targets)
+        {
+            auto update = farming_update_snapshot(state); update.action = std::move(action); update.action_destinations = std::move(targets);
+            std::set<std::string> fields;
+            if (update.action_destinations.empty()) fields.insert("control");
+            else for (auto const& id : update.action_destinations) fields.insert("control:" + id);
+            farming_update_preconditions(update, state, fields); return update;
+        };
+        auto const a = state.directories.front().directory_identity, b = state.directories.back().directory_identity;
+        (void)mailbox.submit(control("pause", {a}));
+        (void)mailbox.submit(control("drain", {b}));
+        (void)mailbox.submit(control("retire", {}));
+        auto resume_both = control("resume", {a, b});
+        auto const full_id = mailbox.submit(resume_both);
+        require(mailbox.pending().size() == farming_update_slots && mailbox.submit(resume_both) == full_id,
+            "idempotent request was refused at the unresolved queue bound");
+        auto paused = state; advance_policy(paused, state);
+        paused.directories.front().control = "paused"; paused.directories.back().control = "draining";
+        for (auto const& record : mailbox.records()) if (record.file.update.id == full_id)
+            require(farming_update_rebase(record.file.update, paused).action == "resume",
+                "overlapping queued controls lost their reviewed predecessor field values");
+        mailbox.cancel(); mailbox.compact();
+    }
+    auto const offline_first = root / "update-first-offline", offline_second = root / "update-second-offline";
+    fs::rename(first, offline_first); fs::create_directory(first);
+    std::string pause_id, headroom_id;
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(mailbox.locked() && !mailbox.complete() && mailbox.manifest().parent_path().parent_path() == second,
+            "missing original destination prevented another matching member from accepting intent");
+        auto pause = farming_update_snapshot(state); pause.action = "pause";
+        pause.action_destinations = {state.directories.front().directory_identity};
+        farming_update_preconditions(pause, state);
+        pause_id = mailbox.submit(pause);
+        require(!mailbox.actionable() && mailbox.pending().size() == 1, "offline policy request repeatedly interrupted local progress");
+    }
+    fs::remove(first); fs::rename(offline_first, first); fs::rename(second, offline_second);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        headroom_id = mailbox.submit(propose(state.capacity, state.headroom + mib));
+    }
+    fs::rename(offline_second, second);
+    auto commit = [&](FarmingUpdate const& update)
+    {
+        auto const before = state;
+        state.config = update.config; state.profile_metadata = update.profile;
+        state.capacity = update.capacity; state.headroom = update.headroom;
+        state.max_groups = update.max_groups; state.max_total_members = update.max_total_members;
+        if (!update.action.empty())
+        {
+            if (update.action_destinations.empty()) state.control = farming_update_control(update.action);
+            else for (auto& directory : state.directories)
+                if (std::find(update.action_destinations.begin(), update.action_destinations.end(), directory.directory_identity) != update.action_destinations.end())
+                    directory.control = farming_update_control(update.action);
+        }
+        advance_policy(state, before); state.applied_update = update.id; save();
+    };
+    {
+        DirectoryLock first_writer(first), second_writer(second);
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(mailbox.records().size() == 2 && mailbox.actionable(), "partitioned requests were lost on convergence");
+        std::set<std::string> waiting{pause_id, headroom_id};
+        while (!waiting.empty())
+        {
+            auto next = mailbox.next(state); require(next.has_value(), "disjoint partitioned request was not replayable");
+            require(waiting.erase(next->update.id) == 1, "partitioned request was applied twice");
+            commit(next->update); mailbox.finish(next->update.id, "applied");
+        }
+        require(state.headroom == mib && state.directories.front().control == "paused" && !mailbox.next(state) &&
+            mailbox.receipt(pause_id)->status == "applied" && mailbox.receipt(headroom_id)->status == "applied",
+            "partitioned disjoint edits did not apply exactly once");
+        mailbox.compact();
+    }
+    std::string conflict_first, conflict_second;
+    fs::rename(first, offline_first);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        conflict_first = mailbox.submit(propose(state.capacity + mib, state.headroom));
+    }
+    fs::rename(offline_first, first); fs::rename(second, offline_second);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        conflict_second = mailbox.submit(propose(state.capacity + 2 * mib, state.headroom));
+    }
+    fs::rename(offline_second, second);
+    {
+        DirectoryLock first_writer(first), second_writer(second);
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        auto selected = mailbox.next(state);
+        require(selected && selected->update.id == std::min(conflict_first, conflict_second),
+            "conflicting partitions did not choose a deterministic request order");
+        auto const winner = selected->update.id;
+        commit(selected->update); mailbox.finish(winner, "applied");
+        require(!mailbox.next(state), "conflicting partitioned changes were both applied");
+        auto const loser = winner == conflict_first ? conflict_second : conflict_first;
+        require(mailbox.receipt(loser)->status == "refused" && mailbox.receipt(loser)->reason.find("capacity-bytes") != std::string::npos,
+            "partitioned conflict did not retain its field-specific refusal");
+        mailbox.compact();
+        auto contents = replay_body; contents += stream_state::digest(contents) + '\n';
+        stream_state::atomic_save(farming_metadata_path(first, "grow-farm.update-" + replay_id + ".request", false), contents, false);
+        require(!mailbox.next(state) && mailbox.receipt(replay_id)->status == "refused",
+            "request below the acknowledged floor regained policy authority");
+    }
+    auto const crash_request = farming_metadata_path(first, "grow-farm.update-" + replay_id + ".request", false);
+    auto const crash_partial = fs::path(file_io::path_text(crash_request) + ".partial.Ab12Cd");
+    fs::create_hard_link(crash_request, crash_partial);
+    auto tight = state; tight.update_reserved_bytes = 1;
+    if (tight.version >= 9) advance_policy(tight, state);
+    state = tight; save();
+    bool bounded = false;
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(!fs::exists(crash_partial) && fs::exists(crash_request), "interrupted immutable hard-link publication was not recoverable");
+        try { (void)mailbox.submit(propose(state.capacity + mib, state.headroom)); }
+        catch (FarmingUpdateSpaceError const& error) { bounded = error.required > error.available; }
+    }
+    require(bounded, "update mailbox bypassed its dedicated allocation allowance");
+}
+
+void farming_path_rebinding(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const first = root / "native-rebind-first", second = root / "native-rebind-second";
+    auto const current = root / "native-rebind-current", offline = root / "native-rebind-offline";
+    fs::create_directory(first); fs::create_directory(second); fs::create_directory(first / "scratch");
+    Arguments args; args.command = "fill"; args.directory_farm = true; args.target = first; args.destinations = {second};
+    args.max_ram = 512 * mib; args.headroom = 0; args.capacity = 128 * mib;
+    args.k = 18; args.strength = 2; args.group_members = 2; args.max_groups = 2; args.max_total_members = 4;
+    args.farming_max_eligible_groups = 8; args.backend = "cpu"; args.workers = args.batch = 1;
+    args.window = 65536; args.checkpoint_bytes = 65536;
+    args.seed = std::string(64, 'a'); args.pool_ph = std::string(64, 'b');
+    args.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Keys keys(args); auto source = farming_arguments(args); auto initial = farming_run(args, &keys, source);
+    require(initial->feasible(), "native rebind fixture was infeasible");
+    auto const state = initial->state; auto const text = farming_state_text(state);
+    auto const digest = stream_state::digest(text); auto const requested = initial_identity(initial->identity(keys, 0, 0));
+    auto const first_plan = contents(farming_metadata_path(first, "grow-farm.plan", false));
+    auto const second_plan = contents(farming_metadata_path(second, "grow-farm.plan", false)); initial.reset();
+    cfg.capacity_bytes = 64 * mib; cfg.memory_limit_bytes = args.max_ram;
+    auto const target = group_path(first, 0); auto const child = ::fork(); require(child >= 0, "cannot fork native rebind construction");
+    if (!child)
+    {
+        ::setenv("XCHPLOT2_GROW_FAILPOINT", "external-run-after-checkpoint", 1);
+        ExternalConfig ext; ext.segment_bytes = 65536; ext.fan_in = 2; ext.scratch.push_back({(first / "scratch").string(), 16 * mib});
+        Construction output(target.string(), cfg, false, requested, "external", ext); output.confirm_identity();
+        require(output.append(input.subspan(0, 1)).accepted, "native rebind contribution was rejected"); std::_Exit(0);
+    }
+    int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+        "native rebind construction did not stop at its checkpoint");
+    fs::rename(first, current); fs::create_directory(first); fs::rename(second, offline);
+    auto resumed = args; resumed.target.clear(); resumed.destinations.clear(); resumed.resume = resumed.allow_missing = true;
+    resumed.manifest = farming_metadata_path(current, "grow-farm.plan", false);
+    auto bound = farming_arguments(resumed);
+    require(bound.rebound == std::set<size_t>{0} && !bound.changed && bound.directories.front() == current &&
+        bound.digest == digest && farming_state_text(*bound.saved) == text,
+        "persistent native identity rebinding changed the saved policy or inferred another root");
+    auto partial = farming_run(resumed, &keys, bound);
+    require(partial->available == std::vector<uint8_t>{1, 0} && partial->directory_path(0) == current &&
+        partial->state.directories.front().directory == first.string() && partial->state.revision == state.revision &&
+        partial->feasible(), "available native rebound root could not independently recover its saved grant");
+    auto rebound_cfg = cfg; rebound_cfg.path_bindings = partial->construction_bindings(0);
+    auto const moved = group_path(current, 0);
+    { Construction output(moved.string(), rebound_cfg, true, requested, "external"); output.confirm_identity(); output.finish(); }
+    auto const reference = root / "native-rebind-reference.gplot";
+    { Engine output(reference.string(), cfg, false, requested); output.confirm_identity();
+      require(output.append(input.subspan(0, 1)).accepted, "native rebind reference rejected"); }
+    require(contents(moved) == contents(reference) && contents(resumed.manifest) == first_plan &&
+        contents(farming_metadata_path(offline, "grow-farm.plan", false)) == second_plan && fs::is_empty(first),
+        "native rebind rewrote a global replica, followed the replacement mountpoint or changed canonical bytes");
+    partial.reset(); fs::rename(offline, second);
+    auto returning = farming_arguments(resumed); auto recovered = farming_run(resumed, &keys, returning);
+    require(returning.rebound.contains(0) && returning.digest == digest && recovered->available == std::vector<uint8_t>{1, 1} &&
+        contents(resumed.manifest) == first_plan && contents(farming_metadata_path(second, "grow-farm.plan", false)) == second_plan,
+        "returning peer conflicted with immutable policy after native directory rebinding");
+    recovered.reset();
+    auto foreign_farm = [&](fs::path const& directory, char seed)
+    {
+        auto foreign = args; foreign.target = directory; foreign.destinations.clear(); foreign.manifest.clear();
+        foreign.seed = std::string(64, seed); Keys owner(foreign);
+        auto selected = farming_arguments(foreign); auto run = farming_run(foreign, &owner, selected);
+        require(run->feasible() && run->state.job_id != state.job_id, "foreign continuation fixture did not create an independent job");
+    };
+    foreign_farm(first, 'c'); auto const foreign_first = contents(farming_metadata_path(first, "grow-farm.plan", false));
+    auto const lost_alias = root / "native-rebind-lost-alias"; fs::rename(current, lost_alias); fs::create_directory(current);
+    foreign_farm(current, 'd'); auto const foreign_alias = contents(farming_metadata_path(current, "grow-farm.plan", false));
+    std::array<fs::path, 2> prior_paths{current, second};
+    auto strict = resumed; strict.manifest.clear(); strict.target = current; strict.destinations = {second}; bool refused = false;
+    try { (void)farming_arguments(strict); } catch (std::runtime_error const&) { refused = true; }
+    require(refused, "explicit user selection silently combined different farming jobs");
+    auto continuation = farming_resume_arguments(resumed, state, resumed.manifest, prior_paths);
+    continuation.allow_missing = true;
+    auto rebound_job = farming_reload_arguments(continuation, state, prior_paths);
+    require(continuation.target == second && continuation.manifest.empty() && rebound_job.directories[0] == current &&
+        rebound_job.rebound.contains(0) && rebound_job.digest == digest && farming_state_text(*rebound_job.saved) == text,
+        "internal continuation adopted a foreign locator or forgot its unavailable checked alias");
+    auto healthy = farming_run(continuation, &keys, rebound_job);
+    require(healthy->available == std::vector<uint8_t>{0, 1} && healthy->feasible(), "foreign former locator blocked the healthy peer's grant");
+    healthy.reset();
+    auto const foreign_alias_root = root / "native-rebind-foreign-alias"; fs::rename(current, foreign_alias_root);
+    auto absent = farming_reload_arguments(continuation, state, prior_paths); auto absent_run = farming_run(continuation, &keys, absent);
+    require(absent.directories[0] == current && absent_run->available == std::vector<uint8_t>{0, 1},
+        "an absent runtime alias was replaced by the historical mount path");
+    absent_run.reset(); fs::rename(lost_alias, current);
+    auto restored = farming_reload_arguments(continuation, state, prior_paths); auto restored_run = farming_run(continuation, &keys, restored);
+    require(restored.directories[0] == current && restored_run->available == std::vector<uint8_t>{1, 1} &&
+        contents(farming_metadata_path(current, "grow-farm.plan", false)) == first_plan &&
+        contents(farming_metadata_path(second, "grow-farm.plan", false)) == second_plan &&
+        contents(farming_metadata_path(first, "grow-farm.plan", false)) == foreign_first &&
+        contents(farming_metadata_path(foreign_alias_root, "grow-farm.plan", false)) == foreign_alias,
+        "native continuation convergence changed its source policy or a foreign job");
+    restored_run.reset();
+    auto const scope = root / "native-rebind-discovery", other_scope = root / "native-rebind-other-scope";
+    auto const nested = scope / "rack", returned_first = nested / "first", returned_second = nested / "second";
+    auto const unrelated = scope / "unrelated";
+    fs::create_directories(nested); fs::create_directory(other_scope); fs::create_directory(unrelated);
+    std::array<fs::path, 1> scopes{scope}; size_t scans = 0;
+    auto discover = [&](fs::path const& requested_scope)
+    {
+        require(requested_scope == scope || requested_scope == other_scope, "live rediscovery escaped its original scopes");
+        ++scans; FarmingDestinationDiscovery found;
+        found.selected = {unrelated, first, returned_first, returned_second}; return found;
+    };
+    require(farming_runtime_bindings(state, prior_paths, scopes, {}, discover) ==
+        std::vector<fs::path>(prior_paths.begin(), prior_paths.end()) && !scans,
+        "live rediscovery scanned while every known native member was available");
+    fs::rename(current, returned_first); fs::rename(foreign_alias_root, current);
+    auto const unchanged_paths = std::vector<fs::path>(prior_paths.begin(), prior_paths.end());
+    std::array<fs::path, 1> outside{other_scope};
+    require(farming_runtime_bindings(state, prior_paths, outside, {}, discover) == unchanged_paths,
+        "live rediscovery accepted a native identity outside an authorized scope");
+    auto const partial_return = farming_runtime_bindings(state, prior_paths, scopes, {}, discover);
+    require(partial_return == std::vector<fs::path>{returned_first, second} &&
+        std::vector<fs::path>(prior_paths.begin(), prior_paths.end()) == unchanged_paths &&
+        farming_state_text(state) == text && fs::is_empty(unrelated),
+        "live rediscovery changed policy, an immutable binding input or an unrelated directory");
+    fs::rename(second, returned_second); fs::create_directory(second);
+    bool cancel_scan = false;
+    auto cancelled_discovery = [&](fs::path const& requested_scope)
+    { auto found = discover(requested_scope); cancel_scan = true; return found; };
+    require(farming_runtime_bindings(state, prior_paths, scopes, [&] { return cancel_scan; }, cancelled_discovery) == unchanged_paths,
+        "cancelled rediscovery applied a partially observed binding");
+    auto const all_returned = farming_runtime_bindings(state, prior_paths, scopes, {}, discover);
+    require(all_returned == std::vector<fs::path>{returned_first, returned_second},
+        "live rediscovery could not recover known identities when every former path was absent or replaced");
+    auto const before_no_scan = scans;
+    std::array<fs::path, 1> absent_scope{scope / "absent"};
+    require(farming_runtime_bindings(state, prior_paths, absent_scope, {}, discover) == unchanged_paths &&
+        farming_runtime_bindings(state, all_returned, scopes, {}, discover) == all_returned && scans == before_no_scan,
+        "live rediscovery enumerated an absent scope or rescanned healthy returned members");
+    auto live_resume = resumed; live_resume.mounts_under.assign(scopes.begin(), scopes.end());
+    auto const original_scopes = live_resume.mounts_under;
+    live_resume = farming_resume_arguments(live_resume, state, resumed.manifest, all_returned);
+    require(live_resume.mounts_under.empty() && original_scopes == std::vector<fs::path>(scopes.begin(), scopes.end()),
+        "internal resume changed the retained discovery scopes");
+    auto live_job = farming_reload_arguments(live_resume, state, all_returned);
+    auto live_run = farming_run(live_resume, &keys, live_job);
+    require(live_run->available == std::vector<uint8_t>{1, 1} && live_job.directories == all_returned &&
+        live_job.digest == digest && farming_state_text(*live_job.saved) == text &&
+        contents(farming_metadata_path(returned_first, "grow-farm.plan", false)) == first_plan &&
+        contents(farming_metadata_path(returned_second, "grow-farm.plan", false)) == second_plan &&
+        contents(farming_metadata_path(first, "grow-farm.plan", false)) == foreign_first &&
+        contents(farming_metadata_path(current, "grow-farm.plan", false)) == foreign_alias &&
+        fs::is_empty(second) && fs::is_empty(unrelated),
+        "live rediscovery rewrote a global replica, adopted a foreign job or lost a returned native member");
+    live_run.reset();
+    auto const copied = root / "native-rebind-copy"; fs::create_directory(copied);
+    FarmingJob copy; copy.saved = state; for (auto const& directory : state.directories) copy.directories.push_back(file_io::native_path(directory.directory));
+    std::array<fs::path, 1> candidates{copied}; rebind_farming_directories(copy, candidates);
+    require(copy.rebound.empty(), "another directory acquired a saved native identity without explicit relocation");
+}
+
+void farming_evolution(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    farming_path_rebinding(root, input, cfg);
+    std::istringstream mounts("1 0 8:1 / /mnt/farm rw - ext4 /dev/a rw\n"
+        "2 1 8:2 / /mnt/farm/rack/deep\\040disk rw,nosuid - xfs /dev/b rw\n"
+        "3 1 8:3 / /mnt/farm/read-only ro - ext4 /dev/c ro\n");
+    auto const paths = farming_mount_paths(mounts);
+    require(paths == std::vector<fs::path>{"/mnt/farm", "/mnt/farm/rack/deep disk"} &&
+        farming_mount_within(paths[0], "/mnt/farm") && farming_mount_within(paths[1], "/mnt/farm") &&
+        !farming_mount_within("/mnt/farm-other/disk", "/mnt/farm") && !farming_mount_within("/mnt", "/mnt/farm"),
+        "mount selection lost escaped or nested paths, or crossed a directory boundary");
+
+    auto const directory = root / "evolving-farm", added = root / "evolving-added";
+    fs::create_directory(directory); fs::create_directory(added);
+    Arguments args; args.command = "fill"; args.directory_farm = true; args.target = directory;
+    args.max_ram = 512 * mib; args.headroom = 0; args.capacity = 64 * mib;
+    args.k = 18; args.strength = 2; args.group_members = 2; args.max_groups = 3; args.max_total_members = 6;
+    args.farming_max_eligible_groups = 8; args.backend = "cpu"; args.workers = args.batch = 1;
+    args.seed = std::string(64, 'a'); args.pool_ph = std::string(64, 'b');
+    args.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Keys keys(args);
+    auto job = farming_arguments(args);
+    auto initial = farming_run(args, &keys, job);
+    require(initial->feasible(), "evolving farm fixture was infeasible");
+    farming_update_protocol(root, initial->state, args.max_ram);
+    cfg.capacity_bytes = 64 * mib; cfg.memory_limit_bytes = args.max_ram;
+    auto const empty = group_path(directory, 0);
+    { std::ofstream placeholder(empty); }
+    auto const empty_stamp = stream_state::stamp(empty);
+    initial->observe_progress(0, "ready");
+    auto const observation = initial->progress.front()->progress.sequence;
+    initial.reset();
+    auto recover = args; recover.resume = true;
+    auto saved_job = farming_arguments(recover);
+    auto read_only = recover; read_only.plan_only = true; read_only.command = "plan";
+    require(farming_run(read_only, nullptr, saved_job)->lanes.front().outputs.front().members == 0 &&
+        stream_state::stamp(empty) == empty_stamp, "read-only preview changed an empty reserved output");
+    initial = farming_run(recover, &keys, saved_job);
+    require(initial->lanes.front().outputs.front().members == 0 && stream_state::stamp(empty) == empty_stamp,
+        "saved job could not audit its pre-header output without changing it");
+    require(initial->progress.front()->progress.sequence > observation,
+        "unchanged global grant rewound its local observation sequence");
+    for (size_t file = 0; file < 2; ++file)
+    {
+        Construction output(group_path(directory, file).string(), cfg, !file, initial_identity(initial->identity(keys, 0, file)), "incremental");
+        output.confirm_identity();
+        require(output.append(input.subspan(0, file ? 1 : 2)).accepted, "evolving farm prefix did not fit");
+    }
+    initial->seal_extent(0, 0, 2, "", initial->metadata);
+    auto const before = initial->state; initial.reset();
+    auto const manifest = farming_metadata_path(directory, "grow-farm.plan", false);
+    auto const original = contents(manifest), first_bytes = contents(group_path(directory, 0)), second_bytes = contents(group_path(directory, 1));
+    auto inspect = [&](Arguments proposed)
+    {
+        proposed.command = "plan"; proposed.plan_only = true;
+        auto source = farming_arguments(proposed);
+        return farming_run(proposed, &keys, source);
+    };
+    auto unchanged = args; unchanged.resume = true;
+    unchanged.save_plan = root / "unchanged-evolution.plan";
+    {
+        unchanged.plan_only = true; unchanged.command = "plan";
+        auto source = farming_arguments(unchanged); auto planned = farming_run(unchanged, &keys, source);
+        save_farming_review(unchanged, source, *planned);
+    }
+    Arguments from; from.command = "plan"; from.plan_only = from.directory_farm = true;
+    from.from_plan = unchanged.save_plan; from.max_ram = args.max_ram;
+    auto source = farming_arguments(from);
+    require(!source.changed && farming_run(from, &keys, source)->state.revision == before.revision,
+        "unchanged saved preview invented a policy revision");
+    {
+        auto current = args; current.target = root / "evolution-progress-review"; fs::create_directory(current.target);
+        auto source = farming_arguments(current); auto writer = farming_run(current, &keys, source);
+        require(writer->state.version == 9, "new progress review fixture did not use independent grants");
+        auto complete_file = [&](FarmingRun& run, uint64_t ordinal)
+        {
+            Construction output(group_path(current.target, ordinal).string(), cfg, false,
+                initial_identity(run.identity(keys, 0, ordinal)), "incremental");
+            output.confirm_identity(); require(output.append(input.subspan(0, 2)).accepted, "progress review fixture member did not fit");
+            run.seal_extent(0, ordinal, 2, "", run.metadata);
+        };
+        complete_file(*writer, 0); writer.reset();
+        auto review = current; review.command = "plan"; review.plan_only = review.resume = true;
+        review.save_plan = root / "evolution-current-progress.plan";
+        auto reviewed_job = farming_arguments(review); auto planned = farming_run(review, &keys, reviewed_job);
+        require(planned->state.directories.front().sealed_files == 1, "review omitted authenticated local progress");
+        save_farming_review(review, reviewed_job, *planned); auto const policy_revision = planned->state.policy_revision;
+        planned.reset();
+        auto continued = current; continued.resume = true;
+        auto continued_job = farming_arguments(continued); writer = farming_run(continued, &keys, continued_job);
+        complete_file(*writer, 1); auto const latest = writer->state.directories.front(); auto const revision = writer->state.revision; writer.reset();
+        std::vector<std::pair<fs::path, std::vector<uint8_t>>> preserved;
+        for (auto const* name : {"grow-farm.plan", "grow-farm.progress", "grow-farm.owner", "grow-farm.heartbeat"})
+        {
+            auto const path = farming_metadata_path(current.target, name, false);
+            if (fs::exists(path)) preserved.emplace_back(path, contents(path));
+        }
+        for (uint64_t file = 0; file < 2; ++file) preserved.emplace_back(group_path(current.target, file), contents(group_path(current.target, file)));
+        auto unchanged_files = [&]
+        {
+            for (auto const& [path, bytes] : preserved) require(contents(path) == bytes, "review execution changed protected metadata or payload bytes");
+        };
+        Arguments inspect_review; inspect_review.command = "plan"; inspect_review.plan_only = inspect_review.directory_farm = true;
+        inspect_review.from_plan = review.save_plan; inspect_review.max_ram = current.max_ram;
+        auto loaded = farming_arguments(inspect_review); auto accepted = farming_run(inspect_review, &keys, loaded);
+        require(!loaded.policy_changed && accepted->state.revision == revision && accepted->state.policy_revision == policy_revision &&
+            accepted->state.directories.front().sealed_files == latest.sealed_files && accepted->state.directories.front().extents == latest.extents,
+            "stale unchanged review rewound authenticated local progress or invented a policy revision");
+        accepted.reset(); unchanged_files();
+        auto const saved_review = load_farming_preview(review.save_plan, current.max_ram);
+        for (unsigned alteration = 0; alteration < 4; ++alteration)
+        {
+            auto forged = saved_review.preview; auto& destination = forged.state.directories.front();
+            if (!alteration) destination.sealed_files = destination.extents.size();
+            else if (alteration == 1) destination.extents.back() = 1;
+            else if (alteration == 2) { destination.extents.back() = 1; destination.grant_extents.back() = 1; }
+            else ++forged.state.owner_reserved_bytes;
+            auto const path = root / ("evolution-forged-progress-" + std::to_string(alteration) + ".plan");
+            auto body = farming_preview_text(forged); stream_state::atomic_save(path, body + stream_state::digest(body) + '\n');
+            Arguments execute; execute.command = "fill"; execute.directory_farm = true; execute.from_plan = path;
+            execute.max_ram = current.max_ram; execute.backend = "cpu"; execute.workers = execute.batch = 1;
+            bool refused = false;
+            try { auto source = farming_arguments(execute); (void)farming_run(execute, &keys, source); }
+            catch (std::runtime_error const&) { refused = true; }
+            require(refused, "unchanged review accepted fabricated progress or altered independent grants");
+            unchanged_files();
+        }
+    }
+
+    auto proposed = args; proposed.update = proposed.resume = true;
+    proposed.capacity = 96 * mib; proposed.capacity_set = true;
+    proposed.max_groups = 4; proposed.max_groups_set = true;
+    proposed.max_total_members = 10; proposed.max_total_members_set = true;
+    proposed.group_members = 3; proposed.strength = 3;
+    std::unique_ptr<FarmingRun> revised;
+    {
+        DirectoryLock writer(directory);
+        Construction held(group_path(directory, 0).string(), cfg, true);
+        revised = inspect(proposed);
+    }
+    auto const& after = revised->state; auto const& d = after.directories.front();
+    require(revised->feasible() && after.version == 9 && d.layout_first == 2 && d.policy_files == 2 && d.cohorts.size() == 1 &&
+        d.extents == std::vector<uint16_t>{2, 2, 3, 3} && d.sealed_files == 1 && valid_farming_policy_revision(before, after),
+        "future policy failed to preserve completed and active reservations");
+    require(after.estimate.max_eligible_families_per_resource == 2 && after.estimate.index_bytes && after.estimate.cpu_utilization > 0,
+        "mixed cohorts were not assessed together or lost their reported model");
+    for (uint64_t file = 0; file < 2; ++file)
+        same_identity(farming_identity(keys, before, before.directories.front(), file), revised->identity(keys, 0, file));
+    require(revised->identity(keys, 0, 2).params.get_strength() == 3 &&
+        revised->identity(keys, 0, 2).params.get_plot_group_id() != revised->identity(keys, 0, 0).params.get_plot_group_id(),
+        "new parameter cohort reused an existing group identity");
+    auto const text = farming_state_text(after);
+    require(farming_state_text(parse_farming_state(text, args.max_ram)) == text,
+        "cohort policy changed during canonical reload");
+    auto progress = after; ++progress.revision; ++progress.directories.front().sealed_files;
+    require(!valid_farming_policy_revision(after, progress) && valid_farming_extent_revision(after, progress),
+        "ordinary cohort progress was mistaken for authority to revise policy");
+    auto insufficient = after; insufficient.config.max_eligible_families_per_resource = 1;
+    require(!farming_assess_state(insufficient, {d.extents}, args.max_ram).feasible,
+        "independently feasible cohorts bypassed the joint eligible-group budget");
+    auto altered = after; ++altered.directories.front().cohorts.front().identity_epoch;
+    require(!valid_farming_policy_revision(before, altered), "policy revision changed a protected identity");
+    for (unsigned limit = 0; limit < 3; ++limit)
+    {
+        auto small = proposed;
+        if (!limit) small.capacity = 1;
+        else if (limit == 1) small.max_groups = 1;
+        else small.max_total_members = 3;
+        bool refused = false;
+        try
+        {
+            auto reduced = inspect(small);
+            require(limit && reduced->state.directories.front().extents == std::vector<uint16_t>{2, 2} &&
+                reduced->state.directories.front().sealed_files == 1 && valid_farming_policy_revision(before, reduced->state),
+                "lower future target changed committed reservations");
+        }
+        catch (std::runtime_error const&) { refused = true; }
+        require(refused == !limit, "future targets and hard storage limits were not handled separately");
+    }
+    require(contents(manifest) == original && contents(group_path(directory, 0)) == first_bytes &&
+        contents(group_path(directory, 1)) == second_bytes, "read-only policy review changed durable work");
+
+    proposed.destinations = {added};
+    auto pending_job = farming_arguments(proposed);
+    auto const id = queue_farming_update(proposed, pending_job);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(before, false, true, args.max_ram);
+        auto requests = mailbox.pending(); require(requests.size() == 1, "queued update was lost or duplicated");
+        auto const& request = requests.front().file;
+        require(request.update.id == id && request.update.directory_identities.size() == 2 &&
+            request.update.directory_identities[1] == farming_directory_identity(added),
+            "queued addition lost its native directory binding");
+        auto advanced = before; ++advanced.revision; advanced.directories.front().sealed_files = 2;
+        require(farming_policy_digest(advanced) == request.update.source_policy,
+            "ordinary progress invalidated a queued policy request");
+        auto relocated = root / "evolving-added-old"; fs::rename(added, relocated); fs::create_directory(added);
+        pending_job.requested_identities = request.update.directory_identities;
+        auto check = proposed; check.plan_only = true;
+        bool refused = false;
+        try { (void)farming_run(check, &keys, pending_job); } catch (std::runtime_error const& error)
+        { refused = std::string(error.what()).find("queued destination") != std::string::npos; }
+        require(refused, "queued update adopted a substituted mount directory");
+        mailbox.finish(id, "refused", "replacement destination");
+        require(mailbox.receipt(id)->reason == "replacement destination", "queued refusal was not retained");
+        mailbox.compact();
+        require(mailbox.pending().empty() && mailbox.records().empty(), "compacted request retained stale policy authority");
+    }
+}
+
+void farming_active_audit(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "farming-active-audit", scratch = root / "farming-active-scratch";
+    fs::create_directory(directory); fs::create_directory(scratch);
+    auto const previous = group_path(directory, 0), current = group_path(directory, 1);
+    cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    complete(previous, input.subspan(0, 1), false, cfg);
+    ExternalConfig external; external.scratch.push_back({scratch.string(), 128 * mib});
+    external.segment_bytes = mib;
+    {
+        Construction engine(current.string(), cfg, false, identity(), "external", external);
+        engine.confirm_identity();
+        require(engine.append(input.subspan(0, 1)).accepted, "farming audit contribution did not fit");
+    }
+    FarmingRun farm; farm.memory_limit = cfg.memory_limit_bytes;
+    farm.state.directories.push_back({directory.string()}); farm.lanes.resize(1);
+    auto& lane = farm.lanes.front(); lane.ordinal = 1;
+    lane.outputs = {snapshot(previous, 0), snapshot(current, 1)};
+    farm.check();
+    std::array<uint8_t, 1> const active{1};
+
+    // An inspector can load an earlier checkpoint immediately before the
+    // writer durably advances it and deletes a consumed segment. Recreate
+    // that reader view without depending on thread or disk timing.
+    std::optional<fs::path> segment;
+    for (auto const& entry : fs::recursive_directory_iterator(scratch))
+        if (entry.path().filename().string().starts_with("run-")) { segment = entry.path(); break; }
+    require(segment && fs::remove(*segment), "farming audit fixture has no external segment");
+    farm.check(active);
+    bool rejected = false;
+    try { farm.check(); }
+    catch (std::runtime_error const& error)
+    { rejected = std::string_view(error.what()) == "required external segment is missing"; }
+    require(rejected, "inactive farming audit skipped a missing required segment");
+
+    auto rejects = [&](char const* message)
+    {
+        bool rejected = false;
+        try { farm.check(active); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected, message);
+    };
+    auto const previous_work = previous.string() + ".external";
+    fs::create_directory(previous_work);
+    rejects("active lane skipped another group's external metadata audit");
+    fs::remove(previous_work);
+    auto const unexpected = current.string() + ".external.unrecognized";
+    fs::create_directory(unexpected);
+    rejects("active farming audit accepted an unrecognized output suffix");
+    fs::remove(unexpected);
+    auto const malformed = current.string() + ".external.retired-invalid";
+    fs::create_directory(malformed);
+    rejects("active farming audit accepted a malformed retired holder name");
+    fs::remove(malformed);
+    auto const unplanned = group_path(directory, 2);
+    { std::ofstream output(unplanned); output.put('!'); }
+    rejects("active farming audit accepted an unplanned ordinary output"); fs::remove(unplanned);
+
+    auto const retired = current.string() + ".external.retired-" + std::string(64, 'f');
+    fs::rename(current.string() + ".external", retired);
+    fs::remove(fs::path(retired) / "checkpoint");
+    farm.check(active);
+    rejected = false;
+    try { farm.check(); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "inactive farming audit skipped unauthenticated retired metadata");
+    { std::ofstream output(previous, std::ios::app); output.put('!'); }
+    rejects("active farming audit skipped a changed completed output");
+}
+
+void prepared_producer(fs::path const& root, Members input)
+{
+    using namespace grow_controller_test;
+    auto const requested = identity_from(identity());
+    Fixtures fixture{requested, {}, 0};
+    for (uint16_t index = 0; index < 4; ++index)
+    {
+        auto const path = root / ("prepared-producer-member-" + std::to_string(index));
+        PlotData data; data.t3_proof_fragments.assign(input[index].raw().begin(), input[index].raw().end());
+        fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, requested.params, index, requested.memo));
+        fixture.paths.push_back(path);
+    }
+    auto const scratch = root / "prepared-producer-scratch"; fs::create_directory(scratch);
+    ExternalConfig ext{{{scratch.string(), 128 * mib}}, mib, 2};
+    Arguments args; args.backend = "cpu"; args.max_ram = 512 * mib; args.batch = args.max_members = 4;
+    args.window = 65536; args.workers = 2; args.checkpoint_bytes = mib;
+    auto scheduler = std::make_shared<CodecScheduler>(unsigned(args.workers));
+    uint64_t const metadata = sum(fixture.bytes, sum(mib, CodecScheduler::memory_bytes(unsigned(args.workers))));
+    auto cfg = grow_controller_test::configuration(args, 128 * mib, metadata); cfg.cpu_scheduler = scheduler;
+    auto reference_cfg = cfg; reference_cfg.private_output = false;
+    auto const path = root / "prepared-producer.gplot", reference = root / "prepared-producer-reference.gplot";
+    { Engine engine(reference.string(), reference_cfg, false, identity()); engine.confirm_identity();
+      require(engine.append(input.subspan(0, 4)).accepted, "prepared producer reference rejected"); }
+    Construction construction(path.string(), cfg, false, identity(), "external", ext); construction.confirm_identity();
+    auto const fixed = sum(metadata, sum(construction.memory_bytes(4, true), ExternalEngine::input_memory_bytes(cfg, 4)));
+    Backend backend; Producer producer{requested, &fixture, backend, args, args.max_ram, fixed, fixed};
+    auto prepared = construction.external->prepare_input(4, fragment_bound(requested.params) / sizeof(uint64_t));
+    require(bool(prepared), "prepared producer reservation rejected");
+    producer.fill_input(*prepared, 0, 0, "test bounded fixture member ");
+    require(prepared->sealed() && backend.generated_members == 4 && producer.peak <= args.max_ram,
+        "prepared fixture producer lost completion or admission");
+    OrderedWriter worker([] {}); auto ready = worker.submit([&]
+    { require(construction.append(*prepared, 4).accepted, "prepared Construction append rejected"); });
+    ready.get(); require(construction.staged_batches == 1 && !construction.shape_recorded,
+        "prepared Construction append bypassed accounting");
+    prepared.reset(); construction.finish();
+    require(!fs::exists(path) && fs::is_regular_file(path.string() + ".partial"),
+        "prepared producer exposed its output before publication");
+    construction.release_external(); construction.publish();
+    require(contents(path) == contents(reference), "prepared fixture producer changed canonical group bytes");
+    auto const prefix_path = root / "prepared-producer-prefix.gplot", prefix_reference = root / "prepared-producer-prefix-reference.gplot";
+    { Engine engine(prefix_reference.string(), reference_cfg, false, identity()); engine.confirm_identity();
+      require(engine.append(input.subspan(0, 2)).accepted, "prepared producer prefix reference rejected"); }
+    Construction prefix(prefix_path.string(), cfg, false, identity(), "external", ext); prefix.confirm_identity();
+    Producer prefix_producer{requested, &fixture, backend, args, args.max_ram, fixed, fixed};
+    auto prefix_input = prefix.external->prepare_input(4, fragment_bound(requested.params) / sizeof(uint64_t));
+    require(bool(prefix_input), "prepared producer prefix reservation rejected"); size_t polls = 0;
+    auto const generated = prefix_producer.fill_input(*prefix_input, 0, 0, "test bounded prefix member ", [&] { return ++polls == 2; });
+    require(generated == 2 && prefix_input->size() == 2 && prefix_input->sealed() &&
+        prefix_producer.fill_stop == Producer::FillStop::requested, "prepared producer did not seal its completed stop prefix");
+    auto prefix_ready = worker.submit([&]
+    { require(prefix.append(*prefix_input, 2).accepted, "prepared Construction prefix append rejected"); });
+    prefix_ready.get(); prefix_input.reset(); prefix.finish();
+    require(!fs::exists(prefix_path) && fs::is_regular_file(prefix_path.string() + ".partial"),
+        "stopped prepared producer exposed its prefix before publication");
+    prefix.release_external(); prefix.publish();
+    require(contents(prefix_path) == contents(prefix_reference), "stopped prepared producer changed prefix bytes");
+
+}
+
+int main(int argc, char** argv) try
+{
+    require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--prefetch-only" ||
+        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--farming-membership-only" || std::string(argv[1]) == "--farming-controls-only" || std::string(argv[1]) == "--farming-rebinding-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--cancellation-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--farming-membership-only|--farming-controls-only|--farming-rebinding-only|--replot-capacity-only|--prepared-input-only|--cancellation-only]");
+    bool const prefetch_only = argc == 2 && std::string(argv[1]) == "--prefetch-only";
+    bool const farming_audit_only = argc == 2 && std::string(argv[1]) == "--farming-audit-only";
+    test_producer_options();
+    native_cpu_budget();
+    controller_wakeups();
+    test_destination_temporary();
+    metadata_options();
+    external_batch_selection();
+    phase_worker_demand();
+    replot_diagnostics();
+    require(filesystem_file_bound(0xef53, 4096) == uint64_t(UINT32_MAX) * 4096 &&
+        filesystem_file_bound(0x9123683e, 4096) == uint64_t(INT64_MAX), "filesystem file-size admission differs");
+    auto name = (fs::temp_directory_path() / "xchplot2-merge-XXXXXX").string();
+    require(::mkdtemp(name.data()), "cannot create merge test directory");
+    fs::path root(name); struct Cleanup { fs::path root; ~Cleanup() { fs::remove_all(root); } } cleanup{root};
+    auto input = members(); auto cfg = configuration();
+    if (argc == 2 && std::string(argv[1]) == "--farming-controls-only")
+    {
+        group_farm_control_test::run(root); return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--farming-membership-only")
+    {
+        group_farm_membership_test::run(root); return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--farming-rebinding-only")
+    {
+        auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
+        auto name = (parent / "farming-rebinding-XXXXXX").string();
+        require(::mkdtemp(name.data()), "cannot create farming rebinding test directory"); Cleanup bound_cleanup{fs::path(name)};
+        farming_path_rebinding(bound_cleanup.root, input, cfg);
+        published_retired_external(bound_cleanup.root, input, cfg);
+        std::cout << "persistent farming root rebinding and external recovery checks passed\n"; return 0;
+    }
+    if (argc == 1 || std::string(argv[1]) == "--cancellation-only")
+    {
+        auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
+        auto cancellation_name = (parent / "construction-cancellation-XXXXXX").string();
+        require(::mkdtemp(cancellation_name.data()), "cannot create construction cancellation fixture");
+        Cleanup cancellation_cleanup{fs::path(cancellation_name)};
+        construction_cancellation(cancellation_cleanup.root, input, cfg);
+        if (argc != 1) { std::cout << "construction cancellation and byte-identical recovery checks passed\n"; return 0; }
+    }
+    replot_source_selection(root);
+    replot_predelete_selection();
+    replot_review_options(root);
+    replot_source_mapping();
+    replot_actionable_ranking();
+    replot_preview_models(root, identity());
+    replot_save_diagnostics(root);
+    if (argc == 1) { replot_legacy_destination_metadata(root); replot_execution_resource_bindings(root); }
+    if (argc == 2 && std::string(argv[1]) == "--replot-capacity-only")
+    {
+        temporary_admission(root, identity()); replot_external_projection(root, identity()); replot_capacity_prefix();
+        replot_status_protocol(root);
+        construction_inspection_recovery(root, input, cfg);
+        replot_bootstrap_inspection(root, input, cfg);
+        replot_output_native_owners(root, input, cfg);
+        replot_legacy_destination_metadata(root); replot_execution_resource_bindings(root);
+        std::cout << "projected migration output/scratch admission checks passed\n"; return 0;
+    }
+    joined_worker_cpu(input);
+    if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--prepared-input-only"))
+    {
+        auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
+        auto name = (parent / "prepared-producer-XXXXXX").string();
+        require(::mkdtemp(name.data()), "cannot create prepared producer test directory");
+        Cleanup external_cleanup{fs::path(name)}; prepared_producer(external_cleanup.root, input);
+        if (argc != 1) { std::cout << "bounded fixture producer and Construction checks passed\n"; return 0; }
+    }
+    if (farming_audit_only)
+    {
+        auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
+        auto name = (parent / "farming-audit-XXXXXX").string();
+        require(::mkdtemp(name.data()), "cannot create farming audit test directory");
+        Cleanup external_cleanup{fs::path(name)};
+        bounded_saved_reads(external_cleanup.root);
+        farming_saved_reads(external_cleanup.root);
+        replot_journal_protocol(external_cleanup.root);
+        replot_status_protocol(external_cleanup.root);
+        replot_capacity_prefix();
+        replot_destination_namespace(external_cleanup.root);
+        replot_retirement_protocol(external_cleanup.root);
+        replot_publication_names(external_cleanup.root, input);
+        farming_compatibility_format(external_cleanup.root);
+        farming_joint_forecasts(external_cleanup.root);
+        farming_reader_scope();
+        farming_legacy_format();
+        farming_compact_format();
+        farming_replica_staging(external_cleanup.root);
+        farming_parallel_audits(external_cleanup.root, input);
+        farming_capacity_extents(external_cleanup.root);
+        farming_extent_admission(external_cleanup.root);
+        farming_preview_handoff(external_cleanup.root);
+        group_farm_progress_test::run(external_cleanup.root);
+        group_farm_control_test::run(external_cleanup.root);
+        group_farm_membership_test::run(external_cleanup.root);
+        group_farm_progress_test::relocation(external_cleanup.root, input, cfg);
+        farming_evolution(external_cleanup.root, input, cfg);
+        farming_active_audit(external_cleanup.root, input, cfg);
+        output_reservations(external_cleanup.root, input, cfg);
+        published_retired_external(external_cleanup.root, input, cfg);
+        successor_staging(external_cleanup.root, input, cfg);
+        external_finish_grants(external_cleanup.root, input, cfg);
+        std::cout << "farming extent admission, ownership and inactive metadata audit checks passed\n"; return 0;
+    }
+    writers(root); group_prefetch(root, input); destination_admission(); execution_planning();
+    if (prefetch_only) { std::cout << "next-group prefetch and receiver admission checks passed\n"; return 0; }
+    construction_selection(); construction_histories(); cache_frontiers(root, cfg); temporary_admission(root, identity()); replot_external_projection(root, identity());
+    {
+        // External scratch needs physical allocation, while the existing
+        // same-file cases may keep using a RAM-backed temporary directory.
+        auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
+        auto name = (parent / "external-observation-XXXXXX").string();
+        require(::mkdtemp(name.data()), "cannot create external observation test directory");
+        Cleanup external_cleanup{fs::path(name)};
+        successor_staging(external_cleanup.root, input, cfg);
+        external_finish_grants(external_cleanup.root, input, cfg);
+        external_batch_observations(external_cleanup.root, input, cfg);
+        replot_journal_protocol(external_cleanup.root);
+        replot_status_protocol(external_cleanup.root);
+        replot_capacity_prefix();
+        replot_destination_namespace(external_cleanup.root);
+        replot_retirement_protocol(external_cleanup.root);
+        replot_publication_names(external_cleanup.root, input);
+        bounded_saved_reads(external_cleanup.root);
+        farming_saved_reads(external_cleanup.root);
+        farming_compatibility_format(external_cleanup.root);
+        farming_joint_forecasts(external_cleanup.root);
+        farming_reader_scope();
+        farming_legacy_format();
+        farming_compact_format();
+        farming_replica_staging(external_cleanup.root);
+        farming_parallel_audits(external_cleanup.root, input);
+        farming_capacity_extents(external_cleanup.root);
+        farming_extent_admission(external_cleanup.root);
+        farming_preview_handoff(external_cleanup.root);
+        group_farm_progress_test::run(external_cleanup.root);
+        group_farm_control_test::run(external_cleanup.root);
+        group_farm_membership_test::run(external_cleanup.root);
+        group_farm_progress_test::relocation(external_cleanup.root, input, cfg);
+        farming_evolution(external_cleanup.root, input, cfg);
+        farming_active_audit(external_cleanup.root, input, cfg);
+        output_reservations(external_cleanup.root, input, cfg);
+        published_retired_external(external_cleanup.root, input, cfg);
+    }
+    test_construction_history(root, input, identity(), cfg); parity(root, input, cfg);
+    retuning(root, input, cfg); worker_grants(root, input, cfg); placement_costs(); placement(root, cfg); packing_windows(root, cfg); packing_reads(root, cfg);
+    placement_recovery(root, cfg); placement_bounds(root, cfg); layout(root, input, cfg); checkpoint_geometry(root, input, cfg);
+    single_pass(root, input, cfg);
+    contribution_consumption(root, input, cfg);
+    contribution_pipeline(root, cfg);
+    ordinary_prefix(root, cfg); balanced_traffic(root, cfg);
+    admission(root, input, cfg); recovery(root, input, cfg); construction_inspection_recovery(root, input, cfg); replot_bootstrap_inspection(root, input, cfg); replot_output_native_owners(root, input, cfg);
+    auto four = root / "four-inputs"; fs::create_directory(four); cfg.merge_inputs = 4;
+    cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, 16);
+    parity(four, input, cfg); admission(four, input, cfg); recovery(four, input, cfg);
+    auto overlap = root / "overlap"; fs::create_directory(overlap);
+    cfg.io_overlap = true; cfg.window_bytes = 65536; cfg.checkpoint_bytes = 1024 * 1024;
+    cfg.capacity_bytes = 12 * 1024 * 1024;
+    cfg.memory_limit_bytes = std::max(Engine::memory_bytes(18, cfg, 16), MergeEngine::memory_bytes(18, cfg, 16));
+    parity(overlap, input, cfg);
+    capacity_pressure(overlap, input, cfg);
+    for (auto const* point : {"merge-pack-committed:2", "merge-layout-partial", "merge-layout-move-committed:2"})
+        interruption(overlap, input, cfg, point);
+    std::cout << "same-file balanced merge parity, recycling and recovery checks passed\n";
+}
+catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }

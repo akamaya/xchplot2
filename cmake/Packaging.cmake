@@ -44,7 +44,7 @@ file(WRITE "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
     "xchplot2 ${PROJECT_VERSION}\n"
     "Backend: SYCL/AdaptiveCpp (${XCHPLOT2_PACKAGE_GPU})\n"
     "Source: ${_release_revision}\n"
-    "pos2-chip: ${POS2_CHIP_GIT_TAG} (contrib/pos2-solver-candidates.patch applied)\n"
+    "pos2-chip: ${POS2_CHIP_GIT_TAG} (contrib/pos2-solver-candidates.patch and contrib/pos2-solver-thread-limit.patch applied)\n"
     "System: ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}\n"
     "C++: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
     "SYCL targets: ${ACPP_TARGETS}\n"
@@ -68,7 +68,10 @@ else()
     install(DIRECTORY "${XCHPLOT2_RUNTIME_DIR}/" DESTINATION lib USE_SOURCE_PERMISSIONS)
     install(FILES ci/release/README.txt DESTINATION .)
 endif()
-install(FILES LICENSE DESTINATION licenses)
+install(FILES LICENSE NOTICE DESTINATION licenses)
+if(TARGET pos2_pr118_grow_network)
+    install(FILES "${XCHPLOT2_MDNS_DIR}/LICENSE" DESTINATION licenses RENAME mdns.txt)
+endif()
 install(DIRECTORY "${XCHPLOT2_LICENSE_DIR}/" DESTINATION licenses)
 install(FILES "${POS2_CHIP_DIR}/LICENSE" DESTINATION licenses RENAME pos2-chip.txt)
 install(FILES "${POS2_CHIP_DIR}/lib/fse/LICENSE" DESTINATION licenses RENAME fse.txt)

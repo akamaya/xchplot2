@@ -1,4 +1,4 @@
-# PoS2 1.0 compatibility and grouped jobs
+# PoS2 1.0 compatibility and reference tools
 
 Normal builds and this separate reference build pin
 [pos2-chip 1.0.0, `ff89d3e`](https://github.com/Chia-Network/pos2-chip/commit/ff89d3e61f4315311a7f975409a6433e67f699ff).
@@ -7,17 +7,20 @@ the incompatible Feistel cipher ([#119](https://github.com/Chia-Network/pos2-chi
 and corrected decompression buffer sizing ([#120](https://github.com/Chia-Network/pos2-chip/pull/120)).
 The directory/tool names retain `pr118` for existing scripts.
 
-`plot`, `bench`, and `test` now write official version 2 `.gplot` files with
-one member at index zero. The experimental runner below assembles multiple
-members. Files starting at nonzero indices still use the 0x82 extension;
-normal xchplot2 and upstream readers reject that extension.
+Normal Linux and experimental native Windows builds include multi-member
+construction, planning, growth and shared compute. Use the installed commands
+described in the [command reference](../../REFERENCE.md#grouped-plotting-and-drive-filling)
+and [compute setup](../../REFERENCE.md#shared-compute).
 
-The companion [chia-rs PR #1517](https://github.com/Chia-Network/chia_rs/pull/1517)
-and [chia-blockchain PR #21396](https://github.com/Chia-Network/chia-blockchain/pull/21396)
-remain drafts as of 2026-10-08. Key generation implements the V2 taproot change
-in [chia-blockchain PR #21484](https://github.com/Chia-Network/chia-blockchain/pull/21484),
-including its independent public-key test vector. These checks establish
-format/proof interoperability, not released farmer compatibility.
+This directory retains the independent reference tools and experimental
+nonzero-index reader extension. Files starting at nonzero indices use the
+0x82 extension; normal xchplot2 and upstream readers reject that extension.
+
+Farming requires a farmer that supports the PoS2 1.0 group format. Upstream
+[farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21566)
+merged on 2026-10-28. Confirm support in your farmer release and network
+activation before plotting for production. Key generation includes the V2 taproot change from
+[chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500).
 
 ## Run the compatibility check
 
@@ -61,49 +64,6 @@ Fixtures are written directly as raw-v2 members; no legacy header conversion
 is performed. Files are removed when the test exits. Synthetic IDs are not
 farming keys; the Rust shim separately checks key and memo derivation.
 
-### PoS2 1.0 validation
-
-Checked on 2026-10-08 against `ff89d3e` on Linux x86-64 with an RTX 4090
-and NVIDIA driver 610.57.04:
-
-- Main: 39 CTest checks, a separate 11-test host-only build, and seven Rust
-  key tests passed. Native CUDA: all 18 CTest checks passed. Cargo release
-  builds linked successfully for both branches.
-- Main passed all four upstream fixtures on CPU and GPU at k=18. Both
-  branches passed all four GPU fixtures at k=22, and main also passed all
-  four at k=28. These included exact raw fragments, native single-member
-  group bytes, and full proofs.
-- The correctness suite passed CPU byte parity and positive full-proof
-  samples for the k=28 group and both k=18 raw boundary vectors. Main used
-  all five tiers and four spill variants; native CUDA used its four tiers
-  and Compact/Minimal spill variants. The host budget was 14 GiB, with
-  explicit spill cases using `min`.
-- Grouped-job regressions passed on main CPU/GPU and native CUDA GPU,
-  including 64-member k=18 groups, multiple files, private saved jobs,
-  partial resume, identity mismatches, corruption, and RAM-budget rejection.
-- Official two-member groups at k=22 and k=28 passed full-proof validation
-  in both production executables, using the assembler's 512 MiB modeled
-  buffer cap.
-
-These were correctness checks on a shared desktop GPU. They do not qualify
-isolated VRAM limits or physical small cards. AMD, Intel, ARM64, and Windows
-were not exercised for this migration.
-
-### Historical validation
-
-The historical results below used earlier formats and ciphers. They are not
-PoS2 1.0 qualifications.
-
-Verified on 2026-09-09 with GCC 15.3: CPU and GPU runs passed for both
-branches, with 129 validated full group proofs per run (516 total). GPU
-runs used an NVIDIA GeForce RTX 4090 with driver 610.57.04. These results
-cover k=18 single-plot test groups and the Plain GPU tier; production group
-sizes, other tiers, AMD, and Intel hardware remain outside this check.
-
-Refreshed on 2026-09-30 with GCC 16.2: CPU and RTX 4090 Plain GPU runs passed
-all four fixtures and 129 full proofs each. The production dependency pin
-remains unchanged.
-
 ## Experimental grouped jobs
 
 The separate build also produces `pos2_pr118_group` and builds the existing
@@ -119,7 +79,7 @@ python3 contrib/pos2-pr118/group.py \
 
 `--pool-pk` is supported instead of `--pool-ph`. The default device is CPU;
 GPU selection is explicit and never falls back to CPU. Key generation uses
-released chia-protocol/chia-bls 0.50 for BLS and identity hashing, with
+released chia-protocol/chia-bls 0.52 for BLS and identity hashing, with
 the V2 taproot hash SHA-256 of `(local_pk + farmer_pk) || farmer_pk` for both
 pool-public-key and pool-contract modes. It generates one seed and memo per group, exposes the group
 hash, and derives each member ID as SHA-256 of the group ID, big-endian u16
@@ -184,9 +144,12 @@ the reference source identity rejects resume instead of attributing a local
 override to the default dependency pin.
 
 `--max-group-ram MIB` limits modeled assembly and reader buffers, not process
-RSS or plotting RAM. The model reserves 24 bytes per grouped chunk for indexes
-(96 MiB at k=28), each member's raw index and one decoded raw chunk, transient
-raw decode arrays, group compression buffers, and bounded reader buffers.
+RSS or plotting RAM. Assembly validates raw indexes sequentially and writes
+the group size index through a private temporary file on the output filesystem.
+It retains one decoded raw chunk per member, transient raw decode arrays,
+group compression buffers and bounded index buffers. The runner also verifies
+its output, so its model still reserves 24 bytes per grouped chunk for reader
+indexes (96 MiB at k=28), plus bounded reader buffers.
 It checks file-controlled lengths/counts before allocating. Groups that exceed
 the budget are rejected. Full-proof solver/chainer allocations, standard
 library overhead, and OS caches are outside this modeled cap. Solver work
@@ -207,39 +170,189 @@ python3 contrib/pos2-pr118/group-test.py \
 cargo test --manifest-path keygen-rs/Cargo.toml --locked
 ```
 
-The C++ `identity`, `prepare`, `check-raw`, `assemble`, and `verify` commands are internal
-parts of this runner. Direct `assemble` writes its supplied temporary path;
-the Python runner owns cleanup, durability and publication.
+The C++ `identity`, `prepare`, `check-raw`, `assemble`, `assemble-only`, and `verify`
+commands are internal parts of this runner. `assemble` constructs and verifies
+the file; `assemble-only` skips verification and its index-memory reserve for
+separate measurement. Both write the supplied temporary path; the Python runner
+owns cleanup, durability and publication. The private index spool is removed
+on close or process exit. Direct assembly still keeps decoded chunks for every
+member and does not provide the streaming prototype's checkpoints or reclamation.
 
-Historical (pre-1.0), 2026-09-30: the regression passed on CPU and RTX 4090 Plain GPU,
-including every member of a 64-member k=18 group. A two-member k=28 GPU group
-passed exact round-trip checks across all 4,194,304 grouped chunks and 86 full
-proofs (43 per member). The complete GPU job took 59.60 s with an 18 GiB plotting
-budget in a 22 GiB container. A separate host assembly plus verification took
-50.75 s, peaked at 295,944 KiB RSS (289.01 MiB), and reproduced the published
-group byte for byte under the 512 MiB modeled buffer cap. Solver/chainer memory
-is included in that measured RSS, although excluded from the modeled cap.
-These measurements cover this hardware, two members per k=28 file, and 64
-members per k=18 file; larger k=28 files and other GPU tiers/vendors remain
-unverified.
+## Group construction reference runner
 
-Historical (pre-1.0), 2026-10-01 with GCC 16.2 and RTX 4090 Plain: CPU/GPU k=18
-regressions cover multiple files, distinct member IDs, resume, corruption,
-and index 65535. Two-file jobs with two members per file at k=22 and k=28
-passed CPU/GPU raw byte comparisons, complete grouped-fragment round-trips,
-and 206 full proofs. The k=22 job used indices 65532–65535 and meta group 255;
-the k=28 job used indices 0–3 and meta group 0. Unmodified readers rejected
-the 0x82 files, and the patched reader rejected overflowing index ranges.
+Ordinary group construction and compute services are part of the installed
+CLI. The standalone `pos2_pr118_grow` runner remains in this reference build
+for fixture, byte-parity and failure-injection checks; it uses the production
+engine rather than a second implementation. Its source is
+`src/host/GroupPlotter.cpp`, and its test scripts are under `scripts/test`.
+
+To build the GPU reference runner in the main tree, configure
+`-DXCHPLOT2_BUILD_GROUP_GROW=ON`. Add `-DXCHPLOT2_BUILD_GROUP_POOL=ON` when a
+fixture needs network compute. These flags are unnecessary for the installed
+`plan`, `plot`, `fill`, `grow`, and `compute` commands. The CPU reference build
+accepts `-DXCHPLOT2_BUILD_GROUP_POOL=ON` for its network tests.
+
+Use the installed commands and their [recovery guidance](../../REFERENCE.md#construction-and-recovery)
+for normal work, including checkpoint compatibility requirements.
+
+## Streaming assembly prototype
+
+`pos2_pr118_stream` experiments with assembling large groups using bounded
+batches and external merges. It writes ordinary upstream version 2 groups,
+starting at member index zero, and compiles against the unmodified format
+headers. The existing grouped-job runner remains the reference implementation.
+
+Build and run it against the `group.inputs` file in an existing job's raw
+directory. All raw members must already exist. This is a POSIX-only experiment;
+the work filesystem must support file/directory `fsync` and hard links:
+
+```sh
+cmake --build build-pr118 --target pos2_pr118_stream --parallel 2
+build-pr118/pos2_pr118_stream \
+  /plots/example.gplot.raw/group.inputs /scratch/group-experiment \
+  64 4 4 1024 64
+xchplot2 verify /scratch/group-experiment/group.gplot --full --trials 100
+```
+
+The arguments after the new work directory are the modeled RAM limit in MiB,
+members per batch, merge fan-in, buffer size per stream in KiB, and segment
+size in MiB. The work directory must not exist; its parent must exist. The tool
+creates it and its files with owner-only access. Larger batches reduce
+temporary record overhead and merge passes, but retain more decoded raw chunks.
+Larger buffers reduce small I/O requests while consuming more memory per active
+stream. Do not change raw files or scratch files while the job is running.
+
+Each batch becomes a range-ordered stream of compressed contributions with
+their final member indices. Intermediate passes copy those records without
+recompression. The final pass decodes contributions into the existing group
+delta/FSE encoding, writes packed chunks, and streams the upstream size index
+through a temporary file. RAM covers the active raw batch or merge buffers,
+the current group chunk, and manifest/run metadata. It does not retain raw
+indexes or decoded chunks for every group member, or an entire group index.
+The modeled limit excludes allocator overhead and operating-system caches;
+it is separate from plotting and farming memory. Empty member regions and
+unsupported size-index encodings are rejected, following the reference's format
+constraints.
+
+Temporary runs are split into segments, including records that cross segment
+boundaries. Before deleting consumed segments, the tool syncs replacement data
+and atomically saves a checkpoint containing the input positions, output lengths,
+and partial index byte. Staging checkpoints cover complete batches; merge/final
+checkpoints cover complete chunks after approximately one segment of output.
+Add `--keep-runs` to retain consumed segments for a storage comparison.
+
+Raw inputs are retained by default. Add `--consume-raw` to delete each raw batch
+after its replacement run and checkpoint are durable. This deletion is permanent:
+the work directory then holds data needed to finish the group. Keep the entire
+work directory and original `group.inputs` until the completed group is verified.
+Raw input filesystems must also support directory `fsync` when using this option.
+
+To resume after an interruption or write failure, rerun the same command with
+`--resume`. Keep the same inputs, work directory, batch size, fan-in, buffer and
+segment sizes, and reclamation options. The RAM limit may be increased. Resume
+requires matching checkpoint format, construction algorithm and native
+representation; legacy checkpoints retain their original source-build requirement.
+It checks required files before discarding
+uncommitted tails, restarts an unfinished raw batch, and continues merges at the
+saved chunk. A lock prevents simultaneous use of a work directory. If the first
+checkpoint was never created, all raw inputs remain and a new work directory is
+needed.
+
+Publication syncs the finished file and creates `group.gplot` without replacing
+an occupied destination. An interrupted publication can be resumed; resuming a
+completed job preserves its output. Checkpoints have checksums, and raw/completed
+file checks use identity, size and timestamps, not full content hashes. These
+checks do not replace verification or backups. This standalone prototype does
+not plan drive layouts or run compute services; use the installed commands for
+those workflows.
+
+The work directory contains `group.gplot`, `metrics.json`, `checkpoint` and `lock`
+on success; unfinished output uses `group.gplot.partial`. Metrics report original
+input size, raw payload reads, staged and merged bytes, run reads, output/index
+size, logical work-file high-water usage, remaining/reclaimed raw bytes, combined raw/work-file
+high-water usage (`peak_total_file_bytes`), modeled memory, active batch/stream
+counts, elapsed time for this invocation (`seconds_this_run`), and Linux peak RSS
+(`peak_rss_kib`, zero on other platforms). After recovery, cumulative activity
+counters exclude operations after the failed run's last checkpoint. Work-file
+usage excludes raw inputs and the small checkpoint/lock/metrics files. Both storage measures exclude
+filesystem metadata, block rounding and copy-on-write/snapshot retention. These
+counters do not measure physical disk traffic or peak allocated filesystem space.
+
+Run the regression harness against the existing assembler and production
+reader/prover. It compares complete output bytes across batching/merge settings,
+checks full proofs and single-member native output, exercises segment reclamation,
+resumes an interrupted job, and rejects invalid identities, lengths, budgets and
+occupied destinations:
+
+```sh
+python3 contrib/pos2-pr118/stream-test.py \
+  build/tools/xchplot2/xchplot2 build-pr118/pos2_pr118_group \
+  build-pr118/pos2_pr118_stream
+```
+
+Use `--members 64` for more merge passes, or `--k 22 --members 2` and
+`--k 28 --members 2` for larger files and streamed-index coverage. An optional
+`--work-dir /scratch/new-fixture` retains synthetic fixtures, proof output, and
+measurements; otherwise the harness removes them. This validates construction
+and sampled proofs, not device-sized farming performance.
+
+The recovery harness uses disposable copies of a retained k=18 fixture with
+5–64 members. It forces process exits around sync/checkpoint/deletion/publication
+boundaries, resumes after raw reclamation, and checks byte parity, changed inputs,
+truncated files, concurrent access and a failed write. It preserves the originals:
+
+```sh
+python3 contrib/pos2-pr118/stream-recovery-test.py \
+  build-pr118/pos2_pr118_stream /scratch/fixture/group.inputs \
+  /scratch/fixture/reference.gplot --work-dir /scratch/new-recovery-tests
+```
+
+### Comparing assembly methods
+
+Use [`xchplot2 bench`](../../REFERENCE.md#benchmarking) to measure ordinary
+direct plotting. For a complete group-creation comparison, report group size,
+time per member, warmup exclusions, and raw staging costs. Write savings from
+eliminating raw staging apply to the staged workflow; ordinary direct plotting
+already writes close to its final output size.
+
+Use the Linux benchmark with existing raw members. It separates assembly from
+verification, includes output file/directory syncing for both methods, compares
+complete output hashes, and runs the same exhaustive fragment/full-proof verifier
+once per method. Every repeat must reproduce those verified bytes. Inputs are
+retained. The new report directory keeps JSON results and logs; each checked
+output is removed before the next method:
+
+```sh
+python3 contrib/pos2-pr118/group-benchmark.py \
+  build-pr118/pos2_pr118_group build-pr118/pos2_pr118_stream \
+  /scratch/fixture/group.inputs /scratch/new-comparison \
+  --ram-mib 512 --batch-members 16 --fan-in 4 --buffer-kib 64 --segment-mib 64
+```
+
+The default is one warmup and three measured rounds with rotating method order.
+Raw generation and verification are outside assembly timing. Inputs are read
+before each assembly to encourage a warm cache when they fit in RAM; this cannot
+guarantee residency. `--cache unchanged` leaves cache state uncontrolled. Neither
+mode drops global caches or establishes cold HDD throughput. An optional
+`--baseline` accepts an older assembler instrumented with `assemble-only`; keep
+that instrumentation separate from algorithm changes when comparing revisions.
+
+Results include elapsed and child CPU time, sampled post-exec peak RSS, Linux
+process I/O counters and sampled allocated work-file blocks, including open
+unlinked index files. Sampling may miss peaks and adds observer overhead. Process
+I/O is not physical device traffic; allocated blocks exclude filesystem metadata
+and do not account for shared extents or snapshot retention. Raw allocation is
+reported separately. The stream's checkpoint syncs remain part of its measured
+cost; direct assembly only syncs its completed output. Use an idle machine and
+the intended disks/filesystems for storage conclusions. The benchmark does not
+measure farming challenge latency or model a drive-filling build.
 
 ## Migration boundaries
 
-The production writer retains the existing CPU reference boundary, shared
-compression pool, exclusive temporary files, fsync, atomic publication, and
-bounded resume checks. GPU kernels receive derived member IDs. Manifests
-persist group IDs plus explicit `gplot-v2` or `raw-v2` format names; legacy
-boolean/testnet manifests fail before plotting. Group verification uses each
-returned member index for solving and full-proof validation. Raw-v2 `.plot2`
-files are temporary assembler inputs, not the supported farming format.
+Installed commands write ordinary version 2 `.gplot` files. Saved manifests
+record group IDs, plot parameters and private memos; see
+[batch manifests](../../REFERENCE.md#batch-manifests) for the current formats.
+Raw-v2 `.plot2` files are temporary assembler inputs, not farming output.
 
 Do not rename or convert old `.plot2` files or earlier experimental groups.
 The Feistel change alters every plot's fragments, so these files and saved

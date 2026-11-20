@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <span>
 #include <string>
@@ -93,5 +94,50 @@ struct VerifyResult {
 // Samples quality chains. With full=true, solve and validate a full proof for
 // every returned chain; a chain without a valid full proof throws.
 VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool full = false);
+
+// Check a complete ordinary v2 group's header, payload bounds and canonical
+// chunk index without reading quality chains or reconstructing full proofs.
+// Does not check an expected identity or certify compressed payloads. Run inside
+// the worker's OS memory/CPU/time caps; success is not a full-proof result.
+void check_plot_file_structure_bounded(std::string const& filename, uint64_t memory_bytes,
+    std::function<void()> const& check_cancelled = {});
+
+// Production smoke validation is separate from verify's all-returned-chain
+// semantics. Each fresh challenge contributes at most one uniformly selected
+// full reconstruction. full_proofs is both the required positive sample count
+// and the maximum number of solver calls: a selected invalid chain fails.
+// Exhaustion, cancellation and empty samples fail; this does not certify every
+// member or compressed payload. Run inside the worker's OS RAM/CPU/time caps.
+// A positive cpu_threads also bounds the solver's internal thread fanout.
+struct BoundedVerifyBudget
+{
+    size_t max_challenges = 0, full_proofs = 0;
+};
+VerifyResult verify_plot_file_bounded(std::string const& filename, BoundedVerifyBudget const& budget,
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled = {}, unsigned cpu_threads = 0);
+
+// Read-only reference-reader observations. Call only inside the calibration
+// worker's OS memory cap and deadline: Chainer's search is data-dependent.
+struct ReaderCalibrationPhase
+{
+    uint64_t calls = 0, wall_ns = 0, cpu_ns = 0, max_wall_ns = 0, max_cpu_ns = 0;
+    uint64_t logical_requested_bytes = 0;
+    bool cpu_measured = true;
+};
+struct ReaderCalibrationLatency
+{
+    uint64_t p50_ns = 0, p95_ns = 0, p99_ns = 0, max_ns = 0;
+};
+struct ReaderCalibrationResult
+{
+    uint8_t k = 0, strength = 0;
+    uint16_t members = 0;
+    uint64_t chunks = 0, index_bytes = 0, largest_chunk_bytes = 0;
+    uint64_t samples = 0, quality_chains = 0, logical_lookup_bytes = 0, storage_bytes = 0;
+    ReaderCalibrationPhase index_probe, fresh_open, first_lookup, retained_lookup, distinct_lookup, storage_reads;
+    ReaderCalibrationLatency fresh_latency, distinct_latency;
+};
+ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint64_t samples,
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled);
 
 } // namespace pos2gpu

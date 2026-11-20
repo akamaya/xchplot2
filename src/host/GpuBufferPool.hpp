@@ -72,11 +72,21 @@ struct InsufficientVramError : std::runtime_error {
 };
 
 struct GpuBufferPool {
+    struct Sizing {
+        uint64_t total_xs = 0, cap = 0;
+        size_t storage_bytes = 0, pair_a_bytes = 0, pair_b_bytes = 0;
+        size_t xs_temp_bytes = 0, sort_scratch_bytes = 0, pinned_bytes = 0;
+        uint64_t device_bytes() const noexcept
+        { return storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t); }
+    };
+    // Queries backend sort scratch using the current device queue. This may
+    // initialize its runtime/context, but allocates no pool or pinned tables.
+    static Sizing sizing(int k, bool testnet = false);
     // Allocates all buffers sized for (k, strength, testnet). Throws
     // InsufficientVramError when the sized pool will not fit in free
     // device VRAM; throws std::runtime_error on any other CUDA
     // allocation or API failure.
-    GpuBufferPool(int k, int strength, bool testnet);
+    GpuBufferPool(int k, int strength, bool testnet, uint64_t max_device_bytes = 0);
     ~GpuBufferPool();
 
     GpuBufferPool(GpuBufferPool const&) = delete;
@@ -132,6 +142,12 @@ struct GpuBufferPool {
     // failure.
     uint64_t* ensure_pinned(int idx);
 
+    // Release an idle output slot when switching to a bounded consumer. The
+    // caller must finish every host consumer and exclude concurrent slot use
+    // first. Waits for queued device work; leaves the slot accounted as live
+    // if waiting or freeing throws. Existing batch callers may keep all slots.
+    void release_pinned(int idx);
+
     // Returns pool.d_pair_a, allocating it on first use. Deferred
     // from ctor so run_gpu_pipeline can submit Xs gen *before*
     // paying this 4.36 GB malloc_device. Thread-safe via double-
@@ -169,11 +185,10 @@ private:
     std::mutex pair_a_mu_;
 };
 
-// Free + total device VRAM at call time. On SYCL backends without a
-// portable free-memory query, free_bytes is approximated as
-// total_bytes (AdaptiveCpp's global_mem_size = device total). Used as
-// a preflight signal; sycl::malloc_device remains the source of
-// truth. POS2GPU_MAX_VRAM_MB caps both fields when set.
+// Free + allocatable device memory at call time. An unavailable or invalid
+// driver reading fails admission. Integrated Intel readings use measured
+// host free memory, bounded by physical host RAM and the runtime's allocation
+// cap. POS2GPU_MAX_VRAM_MB caps both fields when set.
 struct DeviceMemInfo {
     size_t free_bytes  = 0;
     size_t total_bytes = 0;
@@ -196,8 +211,10 @@ DeviceMemInfo query_device_memory();
 // actually hand out — which is what an admission decision needs. Pass true for
 // DELTAS: sysman measures against physical memory, the clamp saturates at the
 // top, and a difference taken from an idle baseline therefore under-reports.
-// The VRAM watchdog passes true so its peak is exact. No effect on CUDA/HIP,
-// where the driver already reports in one space.
+// The VRAM watchdog passes true to avoid that clamping distortion. Integrated
+// Intel GPUs return false for this mode: whole-host memory pressure cannot
+// establish a dedicated GPU allocation peak. No effect on CUDA/HIP, where
+// the driver already reports in one space.
 bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
                          size_t& total_bytes,

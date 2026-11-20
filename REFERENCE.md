@@ -3,6 +3,7 @@
 [README](README.md) · [Installation](INSTALL.md) · [Benchmarks](BENCHMARKS.md)
 
 [Plotting and recovery](#plotting-and-recovery) · [Configuration](#configuration-and-argument-files) ·
+[Groups and drive filling](#grouped-plotting-and-drive-filling) · [Shared compute](#shared-compute) ·
 [Devices](#devices-and-cpu-workers) ·
 [Benchmarking](#benchmarking) · [Memory](#memory-requirements) ·
 [Disk-offload](#host-ram-and-disk-offload) · [Other commands](#lower-level-subcommands) ·
@@ -19,14 +20,21 @@ xchplot2 plot -k 28 -n 10 \
 
 | Option | Meaning |
 |---|---|
-| `-k`, `--k K` | Even plot size in 18..28; default 28 |
-| `-n`, `--num N` | Number of plots; default 1 |
+| `-k`, `--k K` | 28 for farming (default); even sizes 18..26 for testing |
+| `-n`, `--num N` | Number of independent output files; default 1 |
+| `--group-members N` | Members per file, 1..65535; default 1 |
+| `--compute auto\|off` | Use saved compute pool membership when present; default `auto` |
 | `-s`, `--strength S` | Proof strength; default 2 |
 | `-f`, `--farmer-pk HEX` | Farmer public key, 96 hex characters |
 | `-p`, `--pool-pk HEX` | Pool public key, 96 hex characters |
 | `--pool-ph HEX` | Pool puzzle hash, 64 hex characters |
 | `-c`, `--pool-contract-address ADDRESS` | Pool contract address, `xch1...` or `txch1...` |
 | `-o`, `--out DIR` | Output directory; default current directory |
+| `-d`, `--devices SPEC` | Select [GPUs and CPU workers](#devices-and-cpu-workers) |
+| `-M`, `--max-host-ram SIZE` | Host-memory budget, such as `8G` or `512M` |
+| `-t`, `--temp-dir DIR` | Temporary storage for spill or grouped construction |
+| `-j`, `--workers N` | Shared plotting CPU budget for grouped construction |
+| `-r`, `--resume` | Recover the saved job and skip validated completed files |
 | `-i`, `--plot-index N` | Member index; must be 0 for single-member groups |
 | `-g`, `--meta-group N` | Meta-group field; default 0 |
 | `-S`, `--seed HEX` | Optional 64 hex characters for reproducible identities |
@@ -35,6 +43,8 @@ xchplot2 plot -k 28 -n 10 \
 Supply the farmer key and one of the pool key, puzzle hash, or contract
 address forms. See [plot indices and meta groups](#plot-indices-and-meta-groups)
 for the grouping distinction. Full help: `xchplot2 --help`.
+Only k28 is valid for farming. Smaller sizes exercise construction, recovery
+and proof validation in tests; their output is not farmable.
 
 On a host that is short of RAM for the tier its GPU lands on, add
 `--temp-dir <path>` to choose where the automatic disk-offload writes
@@ -45,9 +55,9 @@ Before plotting starts, `plot` saves the prepared identities and keys in an
 `xchplot2-job-*.tsv` manifest in the output directory. Use `--manifest FILE`
 to choose its location. Each new job keeps its own manifest; another job
 cannot overwrite it. Manifests contain private plot keys and are created
-with owner-only permissions on Linux.
+with owner-only permissions on Linux and protected owner-only ACLs on Windows.
 
-Repeat the same `plot` command with `--resume` (or `--skip-existing`) to
+Repeat the same `plot` command with `-r`/`--resume` (or `--skip-existing`) to
 recover its saved job, including when no `--seed` was supplied. If several
 saved jobs match, select one with `--manifest FILE`. The original keys,
 plot parameters, count, and output directory must match; devices and memory
@@ -67,6 +77,14 @@ continues; both options work in `plot` and `batch` modes. Manifest paths may
 be double-quoted to include spaces, quotes, or backslashes; line breaks in
 paths are unsupported.
 
+Commands show concise results by default. `-v`/`--verbose` adds diagnostics,
+assumptions and worker details; `-q`/`--quiet` suppresses informational messages.
+Quiet mode retains command results, output paths, warnings and errors. JSON
+reports retain their fields regardless of verbosity. Use `COMMAND --help`
+for common options and `COMMAND --help-all` for the extended plotting options.
+`xchplot2 --version` (or `-V`) prints the version and source revision without
+loading configuration or initializing plotting devices.
+
 An aggregate progress line updates after each plot completes:
 
 ```
@@ -79,22 +97,26 @@ stderr is redirected it prints one line per plot and defaults to off.
 plots-based (average s/plot × remaining), formatted as
 hours/minutes/seconds when the estimate exceeds one hour.
 
-`-q`/`--quiet` suppresses info-level stderr output — the progress line,
-end-of-run summaries, and streaming-tier notes. Warnings and errors
-still print. `plot` writes each absolute output path to stdout after that
+Quiet mode suppresses automatic progress and plotting summaries. Explicit
+`--progress` still enables progress; `--no-progress` does not disable verbose
+details. `plot` writes each absolute output path to stdout after that
 file is published or validated by resume, in completion order. Failed or
 unstarted plots are never listed, and completed paths remain available if
 a later plot fails. Exit status is 0 for completion, 1 for argument errors,
 2 for an exception, 3 for per-plot failures, or 4 for unfinished work.
 `-q` and `-v` are mutually exclusive.
 
-Plots are written to an exclusively created `<name>.gplot.partial.XXXXXX`
-file, flushed through its original file descriptor, and atomically renamed on
-completion. The final name is published only after writing succeeds.
-A first `Ctrl-C` asks the plotter to
-finish the plot in flight and stop; a second hard-kills. Concurrent writers
-use separate temporary files; the last completed rename wins. Resume checks
-the header identity, memo, chunk index, and file bounds before skipping a plot.
+The single-member batch engine writes to an exclusively created
+`<name>.gplot.partial.XXXXXX` file, flushes its original file descriptor, and
+atomically renames it on completion. Concurrent writers use separate temporary
+files; the last completed rename wins. Resume checks the header identity,
+memo, chunk index, and file bounds before skipping a plot.
+Grouped construction keeps its resumable output at `<name>.gplot.partial`
+until the whole group is complete, then renames it without replacing an
+occupied final path. `grow` also removes the final name while extending a file.
+A first `Ctrl-C` asks active work to stop safely; a second aborts immediately.
+The single-member engine finishes its current plot; grouped construction can
+stop at a recovery checkpoint before the file is complete.
 
 ### Batch manifests
 
@@ -106,7 +128,7 @@ as they do for `plot`:
 xchplot2 batch /path/to/job.tsv --devices gpu --resume
 ```
 
-Each non-comment line has nine whitespace-separated fields in this order:
+Ordinary single-member and raw manifests have nine whitespace-separated fields in this order:
 
 ```text
 k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name
@@ -116,6 +138,11 @@ k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name
 for a temporary member consumed by the group assembler. `group_id_hex` is
 64 hex characters; the member ID is derived from it, the index, and meta group.
 `memo_hex` encodes up to 255 bytes (`""` represents an empty memo).
+`plot --group-members N` and automatic shared plotting save `gplot-v2-grouped`
+rows with a tenth field, the member count. This explicit format prevents older
+binaries from silently treating a grouped job as single-member output. Grouped
+rows start at index zero; `batch` selects grouped construction for that format.
+Grouped, ordinary single-member and raw jobs require separate manifests.
 Legacy manifests with a testnet boolean and per-plot ID are rejected.
 Memo and path fields accept double quotes, with backslash escapes
 for quotes and backslashes. `out_name` must be a filename, not a path;
@@ -123,6 +150,1935 @@ relative `out_dir` paths resolve from the working directory. Blank lines
 and `#` comments are ignored. Invalid rows are rejected before plotting.
 Prefer the automatically saved manifest for recovery; see
 [Security](SECURITY.md) before sharing manifests containing private keys.
+
+## Grouped plotting and drive filling
+
+These commands are included in normal Linux Cargo, CMake and container builds,
+and in experimental native Windows CMake builds. Windows grouped construction
+requires local NTFS volumes with ordinary, uncompressed, unencrypted files;
+ReFS, network volumes and sparse files are rejected. Native Windows support
+remains experimental; see the [platform limitations](INSTALL.md#windows).
+Windows retains compact retirement records beside completed external jobs
+for recovery. Keep them with the output until recovery is no longer needed.
+Unknown disk topology is scheduled conservatively. Windows NVMe destinations
+sharing a known subsystem share a writer group; distinct known subsystems can
+run independently. Unsupported or unknown NVMe identities retain conservative
+whole-job serialization.
+
+Ordinary grouped plotting, filling and growth accept the same `--devices`
+selectors as batch plotting: `cpu`, `cpu0`, `gpu`, `gpu0`, `all`, and comma
+combinations such as `gpu0:tiny,cpu0`. Repeated selectors are deduplicated.
+Multiple selected devices and explicit CPU NUMA selectors use private local executors under one `--workers`
+CPU budget and `--max-host-ram` budget. Three quarters of that RAM is divided
+equally among the producers; the remainder covers receiving and construction.
+Each producer must fit its share. These explicit local executors need no pool
+enrollment or network listener and cannot be combined with shared compute
+connection/offer options. Repeat the device selection when resuming; it is an
+execution choice, separate from saved plot identities and farming policy.
+
+Single local CPU/GPU selection and `--backend auto` retain automatic shared
+compute when enrolled; automatic local GPU selection can fall back to CPU.
+Migration still requires its reviewed single-producer resources: select
+`--backend cpu` or `--devices gpuN`. `--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`,
+and `--max-host-ram min` belong to the single-member batch engine. Use
+`--compute off` to keep that engine for ordinary plotting after enrolling a
+machine in shared compute.
+
+Create three independent files, each containing four members:
+
+```bash
+xchplot2 plot -n 3 --group-members 4 \
+    -f "$FARMER_PK" -c "$POOL_ADDRESS" -o /plots
+```
+
+`-n` always counts files; `--group-members` counts members within each file.
+The normal private job manifest and `plot --resume` / `batch --resume`
+interfaces retain the prepared identities. New unseeded jobs get fresh keys.
+
+For a directory layout, pass the destination directories as trailing arguments.
+Shell globs, brace expansion and quoted Bash arrays work normally:
+
+```bash
+xchplot2 plan -- /disk-{a,b}/plots
+xchplot2 fill --plan-only -- /disk-a/plots /disk-b/plots
+# Quoted arrays preserve spaces in destination names:
+destinations=(/disk-a/plots "/disk-b/plot files")
+xchplot2 plan -- "${destinations[@]}"
+```
+
+Without `--save-plan`, both forms perform the same read-only preview. They need
+existing destination directories but no keys, create no files or locks, and
+start no compute services.
+The default report summarizes the destinations, planned files and members,
+storage allowance and intended harvester. `-v` adds model assumptions and
+resource details; `--json` emits the machine-readable report. An infeasible
+layout reports its reason and exits unsuccessfully. `--help` shows the common workflow;
+`--help-all` includes recovery, tuning and shared-compute options.
+
+To execute a reviewed layout, save a plan without private plot keys:
+
+```bash
+xchplot2 plan /disk-a/plots /disk-b/plots --save-plan farm.plan
+xchplot2 fill farm.plan -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+`--save-plan` also works with `fill --plan-only`. It creates only the requested
+plan and refuses to overwrite an existing file. The plan contains the
+resolved harvester inputs, initial assignments, destination identities, quotas
+and fill policy, with no plot keys. `plan farm.plan` inspects it without
+plotting; `-F FILE` or `--from-plan FILE` is an explicit alternative for either command.
+Execution preserves those assignments and checks the current storage,
+available space and joint farming workload before creating the private job.
+The reviewed capacity must still be available; additional free space does not
+enlarge its quota. Execution options such as plotting RAM, workers and scratch
+may change. Different layout inputs, destination identities or source policy
+require a new review. For new ordinary jobs, construction progress alone does
+not invalidate a preview: execution checks the current committed work and
+reassesses the remaining proposal under the reviewed limits. New previews and
+job recovery require matching plan schema, farming model, key derivation and
+numeric representation. New construction checkpoints have their own format,
+algorithm and representation checks. Legacy plans and checkpoints retain their
+original-build requirement.
+
+With no directories, `plan` lists candidate mounted data volumes with available
+space and detected media type. It excludes system mounts, RAM filesystems,
+read-only volumes and unsupported filesystems. These are suggestions; select
+the intended directories explicitly before filling them.
+One command accepts up to 1,024 destination directories. Directories on the
+same filesystem share its available capacity; adding another directory there
+does not add disk space.
+
+Use `--paths-from FILE` for one literal path per line, including paths with
+spaces. Blank lines are ignored; paths resolve from the current working
+directory. Use `--paths0-from FILE` for NUL-delimited paths. Either accepts `-`
+to read standard input. Lists do not expand shell expressions or comments.
+An empty explicit list is an error. `--` makes subsequent arguments literal,
+including names beginning with `-` or `@`:
+
+```bash
+xchplot2 plan --paths-from destinations.txt
+printf '%s\0' /disk-*/plots | xchplot2 plan --paths0-from -
+```
+
+To build the layout, supply the farmer public key and one pool destination.
+The plot seed is generated automatically; `-S "$SEED"` remains available for
+reproducible identities:
+
+```bash
+xchplot2 fill -f "$FARMER_PK" -c "$POOL_ADDRESS" -- /disk-{a,b}/plots
+# Continue the entire job through either member, without repeating keys or paths:
+xchplot2 fill /disk-b/plots
+```
+
+`fill` always plans a farming layout, including with an explicit
+`--group-members N`. Omit that option or use `auto` to select file membership
+from the farming profile. Files start at index zero; the planner assigns
+shared-ID families and meta groups across physical storage resources.
+`--max-groups N` limits files per directory, and `--max-total-members N`
+limits membership per directory. Without those limits, the initial layout uses
+available capacity. `--capacity-bytes SIZE` caps aggregate output capacity
+per filesystem; `--leave-free SIZE` leaves space free (default 64 MiB).
+`--headroom-bytes` remains an alias.
+Sizes accept bytes or suffixes such as `512M` and `14G`.
+
+New jobs keep a private, checksummed `.xchplot2/grow-farm.plan` in every member
+directory with the seed, farmer/pool identity, complete destination list, limits
+and farming profile. Each copy describes the whole job. New jobs store shared
+storage settings and the resolved farming configuration once within each copy; the
+capacity allowance includes recovery files and space for their replacements.
+Keep these files with the outputs; the seed derives private plot keys
+and must not be shared. It is not a wallet seed. A temporary
+`.xchplot2/grow-farm.plan.next` may remain after interruption; keep it for recovery
+too. New farming plans record their creating build as provenance and can resume
+completed ordinary groups with a build supporting their metadata layout,
+plan schema, farming model,
+key-derivation identity and numeric representation. New in-progress checkpoints
+also require compatible construction format, algorithm and native representation;
+the creating build remains provenance. Legacy checkpoints and plans still require
+their original build. A compatible plan does not make an incompatible checkpoint
+resumable. `status --inspect` reports the checkpoint compatibility identities.
+Existing jobs with top-level `grow-farm.plan` or `grow-replot.plan` records
+retain their complete original layout, including interrupted `.next` copies.
+Keep those records where they are. Conflicting top-level and private records,
+including mixed layouts across destinations, are refused before changes.
+Read-only planning and status do not create `.xchplot2` directories.
+Save portable plans, migration reviews and successors outside this reserved
+recovery namespace. New plot and farm destinations must also stay outside `.xchplot2`.
+
+`plan --metadata-only PLAN` reads a saved plan without private plot keys, and
+`plan --metadata-only --manifest FILE` reads one private job copy. This mode
+reports saved assignments and compatibility without probing destinations,
+starting services or inspecting construction checkpoints. It can inspect a
+supported legacy plan from another build without making that plan executable.
+The report does not establish current availability or farming readiness.
+Plan and metadata reports label layout counts as forecasts or fixed assignments.
+Saved target counts (`admitted_files` and `admitted_members` in JSON) can grow
+beyond an original forecast. Status reports completed observations separately.
+Metadata-only inspection reads the supplied record; refresh a preview with
+`plan` to include validated local progress before inspecting that preview.
+
+To assess several managed jobs under one harvester budget, save an updated
+plan for each job, then assess the plans together. These plans contain no
+private plot keys:
+
+```bash
+xchplot2 plan --manifest /disk-a/plots/.xchplot2/grow-farm.plan --save-plan job-a.plan
+xchplot2 plan --manifest /disk-b/plots/.xchplot2/grow-farm.plan --save-plan job-b.plan
+xchplot2 plan --assess-jobs job-a.plan job-b.plan --json
+```
+
+Refreshing requires all of that job's destinations and a recovered revision.
+The summary retains its initial forecast and admitted member extents, including
+expansions. Joint assessment includes those full promises even for offline
+destinations. It shares the declared CPU, lookup-worker, cache and reader-memory
+budgets, keeps independent jobs' identity families independent, and combines
+known storage sharing conservatively. Duplicate jobs and destination aliases
+are rejected. Harvester service inputs, plot parameters and meta constraints
+must match; saved group-size choices and layout objectives may differ.
+
+This mode reads the supplied summaries and checks their explicit destination
+paths for topology. It does not open private source manifests, plots or
+checkpoints, and does not create an execution plan. Its result covers saved
+forecasts, not a measurement of current load. Refresh summaries after filling
+or expanding a job before drawing current-load conclusions. Unresolved offline
+topology is shared conservatively; outside plots and services remain unmodeled.
+
+Resume searches every supplied directory and loads the full job. Directory
+order and omitted arguments do not change its scope. `fill -r` from a member
+directory, or `fill -r --manifest /disk-b/plots/.xchplot2/grow-farm.plan`, also works.
+Different jobs, conflicting revisions, corrupt copies or mismatching explicit
+keys are rejected before output changes. Resume audits existing outputs,
+preserves completed files, and recovers partial construction. Plotting RAM,
+workers and compute selection can change. `fill -r` explicitly keeps the saved
+future policy. Repeating `fill DIR` also checks newly available capacity when
+the job is idle; if a coordinator is already running, it shows that job's status.
+Explicit future-policy options request a [revision](#revising-a-running-fill).
+Use `--no-resume` when an existing job should be an error.
+
+The initial member count is a size forecast. As compression leaves room, new
+jobs can extend the final unsealed file or admit another file within the
+reviewed limits. Each addition must fit the combined job's farming workload,
+exact construction space, file-size limit, headroom and scratch allowance.
+Compatible changes on different destinations can share a saved revision.
+Replacement copies can be staged concurrently on independent drives; every
+destination must have a durable copy before the revision is published and
+construction relying on it proceeds.
+Completed files stay unchanged, and resume retains admitted additions and the
+recorded stop reason. Construction methods and configured I/O windows can
+stop filling before the output budget is exhausted, so some unused capacity
+can remain. Existing jobs retain their saved fill policy.
+`metadata-capacity` means another extent would exceed the job's reserved
+recovery metadata. That limit can also leave space unused. `fill -r` retains
+the stop; repeating `fill DIR` reassesses future capacity and metadata needs.
+
+To add another destination, preview it together with any existing member,
+then explicitly extend the job:
+
+```bash
+xchplot2 plan /disk-b/plots /disk-c/plots --save-plan expansion.plan
+xchplot2 fill expansion.plan
+```
+
+The preview includes all saved destinations. Completed and started files keep
+their plot identities and membership reservations; the new layout must fit the combined farm's CPU,
+memory, storage and response limits. An expansion can be infeasible even when
+the new disk has room. The assessment covers plots belonging to this job;
+unmanaged plots consume disk space but their farming workload is not modeled.
+`fill --extend /disk-b/plots /disk-c/plots` requests an expansion directly.
+All original destinations must be available for expansion. A new revision is
+saved across the members before new plotting starts; interrupted publication
+is completed with ordinary `fill -r`.
+
+Use `--discover-drives DIR` to select writable supported local filesystems mounted
+at or below a directory, at any depth. The option is repeatable and combines
+with explicit destinations or `--extend`. It reads the operating system's
+mount list; ordinary subdirectories are not treated as additional drives.
+Aliases of the same mounted directory are deduplicated. Shared filesystems
+still share one capacity budget. `-v` explains skipped mounts. A selection with
+no eligible drives or explicit destinations is an error. `--mounts-under` remains
+an alias.
+
+```bash
+xchplot2 plan --discover-drives /mnt/farm --save-plan farm.plan
+xchplot2 fill /existing/plots --discover-drives /mnt/new-drives
+```
+
+### Revising a running fill
+
+`fill DIR` with explicit options revises an ordinary job's future capacity,
+free-space target, file and member limits, group size, strength, or harvester
+assumptions. Extra destination paths add storage. `--update` and `--extend`
+remain explicit alternatives. An expanded filesystem can be used without
+adding another directory. `fill -r` retains the saved policy.
+
+```bash
+xchplot2 plan /disk/plots --capacity-bytes 8T --save-plan resize.plan
+xchplot2 fill resize.plan
+xchplot2 fill /disk/plots --group-members 8 --strength 3 \
+  --farming-max-eligible-groups 2
+xchplot2 status /disk/plots
+```
+
+Completed plots and started groups retain their identities and reservations.
+If a destination fills while testing room for another group, an empty
+`.gplot.partial` can remain. Status and resume exclude that file from the
+pending and published group counts. Withdrawing its reservation releases
+the empty private file.
+Parameter changes start with later groups; resizing replaces only the unstarted
+forecast. File and member targets may be lowered below existing work; that
+stops future allocation while started files keep their original reservations.
+A hard byte cap must still cover committed work and recovery metadata; a
+refusal reports the required allowance. Updates do not delete or move plots.
+Different parameter cohorts are assessed together under the current harvester
+budget using their own service costs and shared physical resources. Additional identity
+families may require a higher declared eligible-group limit; changing that
+limit still requires the joint memory and response checks to pass. A calibration
+for one plot shape cannot silently be reused for another shape. Infeasible plans
+report required resources and, where the bounded search finds them, assessed
+alternative settings with any remaining constraint failures. Suggestions do
+not change the declared harvester automatically.
+
+Select those settings by name to produce a plan without private plot keys:
+
+```bash
+xchplot2 plan /disk/plots --alternative memory,eligible-groups --save-plan resources.plan
+xchplot2 plan /disk/plots --alternative capacity --save-plan capacity.plan
+xchplot2 fill --from-plan resources.plan
+```
+
+Resource names are `memory`, `eligible-groups`, `deadline`, `cpu-cores`, and
+`lookup-workers`. Selecting a resource alternative explicitly changes the
+displayed harvester declarations; provide those resources when farming the plan.
+A lookup-worker alternative can also require a higher core budget, and its
+additional reader-memory demand is reassessed.
+Comma-separated selections are reassessed in order. The report shows the
+original and selected file/member counts, resource budgets, required reader
+memory and response bound. A selection that remains infeasible cannot be saved.
+`capacity` keeps every declared harvester setting and lowers only the future
+member cap, preserving completed plots and started reservations. It samples
+across the allowed interval and refines above the best feasible cap, because
+cache and file-layout changes can make feasibility nonmonotonic. The bounded
+search reports the best cap it assessed and whether a larger feasible cap may
+remain. The selected result receives a fresh complete assessment before saving.
+Selected previews use the usual source-policy, native-directory and progress
+checks when applied with `fill`.
+
+During an active fill, requests and their results are saved on available
+destinations belonging to the job. There is no required first destination.
+The running fill reassesses a request at a safe checkpoint once all required
+destinations are available. It applies the revision and continues only if the
+checks pass. Repeating a request has the same effect as submitting it once;
+editing a waiting request preserves compatible earlier changes.
+Requests made on disconnected members are reconciled when the drives return.
+Conflicting edits receive a field-specific refusal. `status` reports waiting,
+applied, superseded, cancelled or refused requests and their reasons. A queued
+request is not a promise of feasibility; refusal leaves the active fill on its
+saved policy. To review additional space for an older job's recovery records,
+press Ctrl-C in the running fill terminal and wait for the command to exit.
+Then use:
+
+```bash
+xchplot2 plan /disk/plots --upgrade-job --save-plan upgrade.plan
+xchplot2 fill --from-plan upgrade.plan
+```
+
+The review takes nonblocking locks on every required destination, retains the saved
+harvester and outer limits, and audits completed plots and started reservations.
+It saves a preview; applying that preview publishes the upgraded allowance under
+the normal writer fences. A busy coordinator must stop before this review can
+finish. Metadata-only inspection remains available while it is running.
+If an active checkpoint needs its original build, the recovery report gives
+that build, target and quoted continuation/drain commands. Choose a trusted
+original binary yourself, record drain intent if it supports that mode, then
+use its shown `fill --resume` command to finish started files and repeat the
+review. An original-build-only plan still needs that build's
+supported upgrade/export path. Saved sealed/unsealed counts include unstarted
+forecast and do not establish live checkpoint completion. These commands do
+not run another binary automatically or discard unfinished construction.
+
+`fill --cancel-update DIR` cancels waiting policy requests. Local plotting
+controls remain in force until an explicit control changes them. A refused request can be
+replaced by another `fill`; committed revisions cannot be cancelled.
+Use `plan` to review proposed changes without submitting them.
+
+Control either the whole job or a destination with these commands:
+
+```bash
+xchplot2 pause /disk-a/plots
+xchplot2 drain /disk-a/plots --destination /disk-b/plots
+xchplot2 retire /disk-a/plots --destination /disk-b/plots
+xchplot2 resume /disk-a/plots
+```
+
+`pause` stops at the next safe checkpoint. `drain` finishes started files without
+starting another. `resume` allows paused or drained work to continue and starts
+an idle job, or reports the running fill. It uses the normal execution defaults; use
+`fill --resume` to supply backend, workspace or temporary-directory options.
+Add `--policy-only` to record intent without starting an idle job. A destination
+pause or drain remains in force until that destination is resumed.
+Available drives honor controls at the next safe checkpoint even while other
+destinations are missing; unavailable destinations show pending intent. Controls use
+a compact causal snapshot, so repeated actions do not fill the policy request
+queue. Concurrent conflicting actions remain restricted until the drives are
+reconnected and an explicit action resolves the affected scope.
+
+`retire` removes a destination from required membership while preserving its
+plots and recovery records. Available started files finish before detachment.
+A missing destination can be detached, but its outstanding storage and farming
+grants remain reserved until it returns and acknowledges retirement under its
+native writer lock. Remaining members can spend their existing grants; they
+cannot enlarge or reshape shared allocations while that obligation is unfenced.
+Status distinguishes requested retirement, detachment, acknowledgement and
+reclamation. After reclamation, the retired metadata remains a fixed historical
+record. `resume` never rejoins a detached destination. A fully retired job cannot
+accept new members; plan a separate job for future allocation.
+
+Older v8 jobs can detach a missing member only when the retirement records fit
+their existing metadata grant. This preserves every original allocation and
+does not create new independent work or ownership-record allowances. If the
+grant is too small, the command reports that retirement was not applied; restore
+the original destinations for `--upgrade-job`, or retain the old job and review
+a separate recovery job. Upgrade before losing a drive when possible.
+
+`status DIR` reports saved progress without opening plots for writing or
+acquiring construction locks. New jobs use each drive's durable progress record,
+including its observation time and last writer state. `--watch` repeats the
+report; `--inspect` also scans outputs and checks construction metadata.
+`plan --status DIR` and `fill --status DIR` remain supported. Reports include
+completed files and members, pending construction, remaining allowance,
+unavailable destinations and a next action. Available filesystem space is
+separate because directories can share it. A concurrent write can make deep
+inspection incomplete; retry after that write. Saved writer state is not a live
+health check. Current local owner checks combine the held immutable ownership
+record, exact process generation and a bound heartbeat. Remote or ambiguous
+ownership remains unknown; a PID or recent timestamp alone does not establish
+liveness. A stopped owner and a stale record left by a killed owner are reported
+separately. These checks do not establish full payload integrity.
+
+Add `--live` to include read-only shared-compute and migration-service
+diagnostics in the same report:
+
+```bash
+xchplot2 status /disk/plots --live --timeout-ms 5000
+xchplot2 status migration.plan --live --harvester local-migration.json --json
+```
+
+`--timeout-ms` is the total time allowed for live queries in milliseconds
+(`100..60000`, default `5000`).
+Reports distinguish saved intent, current observations, unavailable checks and
+remaining unknowns, with the affected work and next action. Compute inspection
+checks enrollment expiry, compatible advertised workers and admission state;
+it does not start services, acquire leases or import membership policies. Use a
+numeric `--compute-broker ADDRESS:PORT` if discovery is unavailable; hostname
+resolution is excluded from this bounded probe. Exact task admission remains an
+execution check. `--compute off` disables shared-compute inspection.
+
+Migration service probes use an explicitly selected local `--harvester` profile,
+explicit reader flags, or the executing job's private local bindings. Public
+plans do not authorize executables. Before a private execution journal exists,
+key-specific farming prerequisites remain unknown. A successful probe does not
+grant permission to retire plots or replace the execution-time resource and
+reader checks. Ordinary status remains offline unless `--live` is requested.
+
+For new ordinary jobs, `fill DIR` continues work on available drives while a peer
+is missing. Saved per-drive grants can cover growth beyond the initial forecast,
+including another file, without republishing the whole job. These grants are
+finite while a peer is missing. When all required writers are available and
+retirement obligations are fenced, filling reassesses remaining capacity under
+the saved limits.
+Completion is recorded locally, and the coordinator waits for required peers to
+return. Returning drives are checked before progress is merged and work resumes.
+`fill -r --allow-missing DIR` performs available work and exits with status 4
+while peers remain unavailable. New shared reservations and policy changes
+still require all remaining members and respect retained retirement obligations.
+Legacy jobs retain their stricter recovery limits.
+A mountpoint containing a different native directory is treated as unavailable.
+Jobs that may have outstanding shared scratch grants require every original
+writer to be available or durably retired before admitting fresh construction.
+Available recorded transactions can finish within their saved grants. Enabling
+temporary scratch on a job that did not reserve it requires `fill --update` with
+the coordinator stopped and all required destinations available.
+
+If a drive appears at another path, supply the new path or discover it with
+`--discover-drives`. Matching persistent directory identity lets the job use
+that path without rewriting its saved policy. A running `fill` also rescans its
+requested discovery roots for missing members and reconnects matching identities.
+A copied directory has a different identity and needs explicit relocation.
+Drain a destination before copying it so its started files can finish.
+Unfinished construction still requires its original files and scratch
+directories; copying them changes their checked identities.
+For an intentional copy or move to a new directory, keep the output and saved
+job together, take the old path offline, then use `fill -r --relocate OLD NEW`. The new directory locates
+the job; another existing member or `--manifest FILE` can also serve that purpose.
+All members must be available after applying the relocation. Replacement
+outputs are audited before the new location is saved.
+
+### Growing an existing group
+
+```bash
+xchplot2 grow /plots/example.gplot --max-members 8
+```
+
+`grow` requires an existing ordinary v2 group file and recovers interrupted
+construction before extending it. It reads the file's identity and parameters;
+keys are unnecessary. `--max-members N` is the desired total membership, with
+a maximum of 65535. Capacity and construction limits can stop growth earlier.
+If several additions are ready, request their final membership in one command.
+For example, growing a 72-member file to 74 lets the plotter publish both
+additions in one rewrite when they fit the RAM and capacity budgets.
+Incremental growth reads existing chunks during sizing and encoding. Separate
+requests for 73 and 74 each require a rewrite. `--batch-members` can also
+limit how many additions fit in one rewrite.
+Use `plot` to create a new named job, or `fill` to manage a directory layout.
+On Linux, in-place growth requires private data extents. Use
+`cp --reflink=never` when making a copy to grow on a filesystem that supports
+reflinks.
+
+### Construction and recovery
+
+`-M`/`--max-host-ram SIZE` bounds modeled construction, producer, transport and
+codec buffers across the job. When omitted, planning and plotting use the
+available host RAM, including process cgroup limits on Linux. This is a ceiling;
+small groups allocate only the buffers they need. Set an explicit cap to leave
+more memory for other applications. The operating system, libraries and file
+cache are outside that buffer model.
+
+`-j`/`--workers N` sets the shared plotting CPU budget for grouped construction.
+Native CPU generation and chunk compression draw from the same budget. Zero or
+omission uses the available logical CPU count. Separate plotting processes each
+have their own construction budget.
+
+Automatic construction chooses among incremental rewriting, staging,
+merging and external contributions according to available RAM and scratch.
+`--construction auto|incremental|staged|merged|external` forces a method when
+needed. `--batch-members N` bounds construction batches independently of the
+final file membership. `--member-storage compact|raw` selects retained
+fragments; compact is the default.
+
+Repeat `-t`/`--temp-dir DIR` to offer scratch on additional filesystems, or use
+`--temp-dirs /scratch-a /scratch-b`. End a multi-directory list with another
+option or `--`; destinations after `--` are positional arguments.
+For new jobs, destination directories are available for temporary files by
+default when no explicit temporary directories are supplied. With `--temp-dir`
+or `--temp-dirs`, only those directories are offered by default.
+`--destination-temp off|on|ssd|hdd` overrides this choice; `off` excludes
+destinations, `on` permits any destination, and the media filters require known,
+uniformly matching drives. Explicit scratch directories remain available
+regardless of that policy. Saved jobs and previews retain their scratch
+restrictions. `--temp-capacity-bytes SIZE` caps scratch per filesystem.
+External construction needs permitted scratch.
+
+With I/O overlap enabled, external construction can use several independent
+HDDs for one plot. The planner leaves drives available for other simultaneous
+destinations and divides scratch work by the bandwidth each disk can supply.
+It starts unmeasured drives with an equal share and updates placement as bulk
+transfers finish. On Linux it compares the plotter's submitted reads and writes
+with block-device counters to estimate bandwidth used by other processes.
+It also measures simultaneous transfers to account for shared storage paths.
+
+The plotter reads ahead and flushes extents on separate spindles concurrently.
+During final packing it retries reads deferred by a busy disk before the
+current reader buffer runs out. The RAM grant bounds the read cache and the
+number of outstanding transfers. A single scratch HDD can also read ahead
+while an independent HDD writes the plot. Packing enables this when the
+cache can hold the queue and at least 2 MiB per retained run. On striped
+HDD scratch, the planner can retain additional runs when the cache provides
+16 MiB per reader after reserving space for disk queues. This can eliminate
+an intermediate scratch read and rewrite.
+Partitions and alternate paths to one drive share its bandwidth. Resuming a
+plot uses the scratch locations and capacities saved in its checkpoint.
+
+On Linux, an independent output HDD can start writing completed ranges while
+the plotter prepares the next chunks. The packer aligns these writes to page
+boundaries so appending the next chunk can proceed while the disk is busy.
+The packing checkpoint synchronizes the output and index before releasing
+consumed scratch.
+
+When a compute worker supplies compressed contributions, the plotting host
+validates their chunks as they arrive. It reuses the consecutive prefix in
+member order for conservative sizing. An out-of-order suffix is read from
+scratch. Tight capacity still triggers exact sizing against the saved runs.
+With compute sharing disabled (`--compute off`), external construction can
+stream local GPU output to scratch when a complete member cannot fit in RAM.
+The producer and codec workspaces must still fit, and scratch must hold both
+incoming data and contributions.
+When the final member count is fixed and the last batch fits in RAM, external
+construction packs it directly with the saved contributions, avoiding its
+temporary write and read. An interruption
+during packing regenerates that batch and checks it against the checkpoint
+before continuing. Recovery must have enough RAM for the saved batch. These
+checkpoints require a build that supports resident final batches; completed
+plots retain the ordinary v2 format.
+
+Writers sharing a physical drive serialize their I/O. Independent drives can
+progress together within the shared RAM and CPU limits. With I/O overlap
+enabled, external jobs on independent output HDDs can share a codec worker.
+Before timings are available, a producer that can overlap generation with I/O
+can open additional HDDs when the current batch still fits in RAM. The planner
+divides scratch bandwidth among them.
+With completed measurements it chooses the concurrency with the shortest
+projected completion time. A group in its final HDD pack can also free a
+receive slot for another group using shared compute.
+
+`--io-overlap on|off`,
+`--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
+and clean-cache release. `--window-bytes SIZE` sets the I/O window size;
+`--checkpoint-bytes SIZE` sets the target bytes between recovery checkpoints.
+These options override the automatic choices. On known HDDs, automatic
+incremental construction can increase the checkpoint interval up to 1 GiB when
+completed work on that drive shows a benefit, within the same memory budget.
+Longer intervals can require more work to be repeated after interruption.
+
+Construction checkpoints are private. New records require a compatible format,
+algorithm and native representation; legacy records require their original build. Retain the
+in-progress `.partial` file, plan and any owned scratch/checkpoint directory together;
+do not move or edit them during recovery. The completed output name appears only
+after finalization. Press Ctrl-C and wait for the command to exit, then repeat the
+owning command with `--resume` (`grow` resumes implicitly). Completed output
+paths appear on stdout after publication or a successful resume audit.
+`--json` replaces human output with the plan or construction metrics;
+`--quiet` suppresses informational stderr and `--verbose` adds construction
+details and final metrics. `--progress` reports assembled members separately
+from published files, and shows active generation, assembly, merging, packing
+and finalization phases with elapsed time and read/write totals. Output-file
+counts do not imply separate physical drives. `--no-progress` disables these
+updates; the terminal defaults match `plot`.
+
+### Farming layout
+
+Automatic directory planning chooses farming group size and meta families
+together. The plotting machine's RAM, GPU speed and temporary disks determine
+how to construct that layout; the planner does not use them as the final
+harvester's CPU or cache capacity. It uses the destination's physical-resource
+topology and a declared farming profile. The default preview reports the
+profile's source, CPU and memory allowances and initial file counts.
+`--verbose` adds response estimates, assumptions, detected configuration,
+identity families, resource sharing and workload estimates.
+For measured construction and lookup costs at 71, 72 and 73 members, see
+[grouped plots on HDDs](BENCHMARKS.md#grouped-plots-on-hdds).
+
+File sizes are estimates: compressed output can be slightly larger or smaller,
+and a small difference can decide whether one more whole member fits. Filling
+checks actual storage use before admitting more work. Temporary construction
+and recovery space is a separate allowance, so it can limit filling even when
+the final files would fit.
+
+Use `--harvester local` when plotting on the intended harvester, or
+`--harvester FILE` to use a profile from another machine. To transfer a profile,
+export it on the intended harvester and copy it to the plotter:
+
+```bash
+# On the intended harvester; no destination or plotting keys are needed:
+xchplot2 plan --harvester local --save-profile harvester.json
+# Copy harvester.json to the plotter, then review its destinations:
+xchplot2 plan /disk-a/plots --harvester harvester.json --save-plan farm.plan
+xchplot2 fill farm.plan -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+`--save-profile` refuses to overwrite an existing file and needs no destination.
+It also works alongside an ordinary destination preview, including explicit
+farming overrides in the reusable export. A saved plan already contains its harvester profile; execution
+does not need the profile file again. A file literally named `local` can be
+selected as `--harvester ./local`.
+
+For repeated use, set the harvester in the existing
+[configuration file](#configuration-and-argument-files), so normal plan and
+fill commands need no selection flag:
+
+```toml
+[plan]
+harvester = "/path/to/harvester.json"
+
+[fill]
+harvester = "/path/to/harvester.json"
+```
+
+Use `harvester = "local"` on the intended harvester. Command-line
+`--harvester` overrides the saved selection. Without a selection, the planner
+uses its declared defaults and reports them as assumptions.
+
+Detection observes this process's CPU affinity and available memory, reads
+the local Chia configuration, and attempts read-only authenticated harvester
+RPCs through the installed `chia` executable. It starts no Chia services.
+Use `--chia-root DIR` and `--chia-executable FILE` when needed. The default root
+follows `CHIA_ROOT`, then `~/.chia/mainnet`. RPC detection is limited to a
+configured loopback endpoint; missing tools, unsupported configuration or an
+offline service are reported as unavailable, not as an empty farm.
+
+The public [Chia development implementation](https://github.com/Chia-Network/chia-blockchain/tree/f94da8ed38485c7c1cb5f9a3d252d26f68ad6efb/chia/harvester)
+uses the configured harvester lookup thread pool for v2 partial proofs.
+Detection can use that observed concurrency. It does not establish finalized
+PoS2 CPU, memory or cache defaults. Available hardware is not measured spare
+capacity: CPU/memory budgets and service costs remain declared assumptions.
+Explicit `--farming-*` options override imported or detected inputs for a new
+job; for example, lower `--farming-cores` and `--farming-memory-bytes` to leave
+resources for other services. Saved jobs keep the resolved profile and its
+provenance on resume.
+
+The JSON report's `farming_profile` can be imported either on its own or inside
+the full report. It carries harvester inputs, hostname, observation time and
+count-only loaded-plot snapshots; it imports no destination assignments or
+plot keys. Snapshots do not establish refresh completion or the cost of
+unmanaged plots. The assessment covers this job only, even when other plots
+were detected. Reserve an allowance for outside work and qualify the intended
+reader before relying on the estimate.
+
+To sample the pinned group reader on explicit ordinary plots, run calibration on
+the intended reader machine and save its observations with an editable profile:
+
+```bash
+xchplot2 plan --calibrate /plots/example.gplot --calibration-samples 16 \
+  --save-profile reader-profile.json --json
+xchplot2 plan /new/plots --harvester reader-profile.json --save-plan farm.plan
+```
+
+Calibration reads the supplied files without changing them. It reports fresh
+and retained-reader quality lookups, foreground reader CPU time, and separate
+read-only storage observations. Each file reports p50, p95, p99 and maximum
+wall time for opening a reader and looking up its first challenge, and for a
+different challenge on the retained reader. Percentiles use nearest rank across
+the requested samples. The repeated-challenge timing remains available under
+`retained_lookup`. The report also gives the smallest and largest sampled
+membership. The planner uses the configured bandwidth, seek and concurrency
+assumptions for storage. The operating system controls which file pages stay
+in cache between samples.
+Calibration does not solve full proofs or measure spare harvester capacity.
+
+The per-member CPU estimate uses the higher measured CPU time from the repeated
+and distinct challenges on the retained reader. Calibration can raise the
+existing CPU estimates using the sampled maxima and margin. The resulting
+estimates are editable and apply to the sampled conditions.
+The saved profile records the sampled k, strength, reader, method and margin,
+with its own calibration hostname/time. An imported baseline's configuration,
+inventory and hardware snapshot keep their original hostname/time. Planning
+rejects a calibrated profile for a different k, strength or reader; test-size
+profiles require matching explicit test-size options rather than default k28.
+
+Supply at most 64 plots with the same k and strength. Samples default to 16 per
+plot and are capped at 1024. `--calibration-timeout-ms` defaults to 30000 and
+`--calibration-memory-bytes` to `512M`, per reader worker. The worker cap is
+admitted alongside the parent's buffers under `--max-host-ram`; its platform
+limit covers address space on Linux or committed process memory on Windows,
+and does not promise an equal RSS or filesystem-cache limit. Use `--json` or
+`--save-profile FILE`; saving refuses an existing file. Harvester imports and
+explicit farming inputs can supply the baseline. Calibration samples only the
+supplied plots.
+
+Defaults are deliberately independent of the plotting host:
+
+| Farming input | Default | Override |
+| --- | --- | --- |
+| Objective | Minimize recurring dynamic work within the hard response deadline; latency breaks ties | `--farming-objective energy\|latency` |
+| Eligible groups per physical storage resource | At most 1 per filter check | `--farming-max-eligible-groups N` |
+| Relative CPU and I/O work weights | 1 and 1 | `--farming-cpu-work-weight N`, `--farming-io-work-weight N` |
+| Concurrent CPU work | 4 cores | `--farming-cores N` |
+| Synchronous lookups | 4 workers | `--farming-lookup-workers N` |
+| Reader working memory | 512 MiB | `--farming-memory-bytes N` |
+| Index cache | Stateless reader, no cache | `--farming-reader stateless\|cached`, `--farming-index-cache-bytes N` |
+| Per-member CPU time | 4 ms for decoding, chaining and reader work | `--farming-chain-us-per-member N` |
+| Index/open CPU allowance | 50 ns per expanded entry | `--farming-index-ns-per-entry N` |
+| Hard modeled quality-response deadline | 8 seconds | `--farming-deadline-ms N` |
+| Filter horizon | Base bits 9 and 8, adjusted for strength and capped at 13 | `--farming-filter-bits N`, `--farming-future-filter-bits N` set effective bits directly |
+
+The response deadline is an operational latency limit, not a consensus deadline.
+The future profile models one scheduled filter reduction without assigning a
+calendar activation date. The default cadence is 75/8 seconds. The default CPU
+coefficients are assumed service envelopes, not measurements of the user's
+harvester. Deadline admission is conditional on those envelopes covering the
+reader and storage's actual service costs.
+
+Cold-reader admission reserves up to eight compressed bytes per index entry,
+the valid format's maximum codeword size. Capacity forecasting uses an expected
+index size separately. This avoids treating the average compressed index as a
+worst-case read bound.
+
+Detected HDDs use a 10 ms access cost, 250 MB/s transfers and one active read;
+detected SSDs use 0.2 ms, 500 MB/s and up to four active reads. Unknown devices
+use 20 ms, 125 MB/s and one active read, with shared resources serialized
+conservatively. These are model inputs, not storage benchmarks. Shared transfer
+bandwidth, synchronous lookup workers and harvester CPU capacity constrain the
+modeled job. Per-file member processing remains serial.
+
+Larger files reduce repeated index work and disk accesses, but processing more
+members serially makes each lookup longer. Smaller files shorten individual
+lookups while increasing the repeated work. The planner compares balanced
+integer layouts within the declared storage, CPU, worker and memory limits.
+An efficient average workload alone does not establish a response deadline.
+
+Meta groups change eligibility correlations, so choose them together with file
+size. The [filter implementation](https://github.com/Chia-Network/chia-blockchain/blob/main/chia/types/blockchain_format/proof_of_space.py)
+compares a hash of the group ID and filter challenge with the signage-point
+index XOR the meta value, masked by the effective filter. Distinct masked meta
+values exclude simultaneous eligibility only within the same group ID.
+Rotating meta numbers while generating unrelated group IDs does not provide
+that guarantee. When the effective filter shrinks, some meta values alias.
+Window scheduling also correlates neighboring signage points; a planner must
+evaluate consecutive challenges, including carried-over work.
+
+Within one shared-ID family, balance member counts across its usable meta
+slots. With one file per slot and no other eligible work on the drive, this
+minimizes the largest activation. Ordinary files start at member index zero:
+reusing both the group ID and meta value in another such file duplicates member
+identities. Exhausted meta slots require a new identity family. Assign families
+per physical storage resource, keeping that assignment stable on resume.
+
+Measure or explicitly model the actual reader. The pinned k28 C++ reader
+expands a chunk index to 32 MiB per resident group reader. The pinned C API
+constructs a reader for each quality request, so it instead pays index loading
+and decoding on each lookup. The on-disk index is compressed and data dependent;
+32 MiB describes the expanded index, not a fixed read size. It also reads the
+selected chunks for all members and chains them before returning the group's
+qualities. Index-cache policy,
+decoding/chaining work and total farm concurrency therefore matter alongside
+disk access. Do not infer farming CPU or cache capacity from the plotting host.
+
+The cached profile assumes persistent readers loaded before farming. It removes
+index-loading costs only when the entire expanded index set fits the declared
+cache; otherwise it uses cold costs. The working-memory budget includes that
+cache and concurrent reader scratch. Repeated lookups on one persistent reader
+are serialized. These memory estimates constrain the profile; they are not a
+strict RSS bound on the farmer's variable proof and fragment allocations.
+
+Deadline admission considers every identity family that could be eligible
+together, including families on different drives. It bounds CPU, lookup-worker
+and physical I/O contention for that burst. The bound must fit both the response
+deadline and the signage-point interval, so admitted work finishes before the
+next arrival. The model assumes work-conserving queues with FIFO admission to
+CPU and read resources. Same-family meta exclusion is retained under both
+modeled filter settings. A finite sample with no late responses cannot replace
+this admission check.
+
+`--farming-objective energy`, the default, minimizes an expected dynamic-work
+proxy: weighted CPU-active seconds plus I/O-active seconds per signage point.
+The positive `--farming-cpu-work-weight` and `--farming-io-work-weight` values
+express their relative costs. The defaults compare active time with equal
+weights. This proxy does not measure joules or account for idle power, spin-down
+policies or memory power. `--farming-objective latency` instead minimizes the
+response bound, with work as a tie-break. Both modes must satisfy the same hard
+deadline and eligibility limits.
+
+The JSON report includes `response_bound_seconds`, `feasible` and
+`infeasibility_reason`, along with `dynamic_work_seconds_per_sp` and its CPU/I/O
+components. `max_eligible_groups` is the configured per-resource limit;
+`certified_max_eligible_groups` is the assessed maximum. An infeasible profile
+produces a report and an error exit, without publishing a new plan or starting
+plot production. Adding destinations must pass a joint assessment of the new
+and existing assignments using the saved identities and profile.
+
+The search includes every balanced file count within its bounds. It compares
+joint file counts and refines individual directories until no such move
+improves the result. Mixed farms do not receive an exhaustive comparison of all
+possible assignments. Work and memory limits are enforced explicitly. Selection
+is conditional on the declared service envelopes and search coverage; it does
+not establish measured energy use or physical farming performance. Exact
+file-format and construction admission still apply when plotting.
+[Chia's farming estimates](https://docs.chia.net/chia-blockchain/consensus/proof-of-space-2.0/new-proof-farming-requirements/)
+provide context for the tradeoff; qualify the intended storage and reader before
+relying on a latency bound.
+
+### Replacing an existing farm
+
+Ordinary `fill` uses available space without deleting existing plots. Add
+`--replot` to authorize replacement of eligible old plots. It inventories the
+selected farm, checks the replacement schedule and saves a private resumable
+job before retiring any source. `plan` and `fill --plan-only` preview the same
+operation without changing the farm; neither is a prerequisite for execution.
+For example:
+
+```bash
+xchplot2 fill /disk-a/plots /disk-b/plots --replot \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+Resume an interrupted job with `xchplot2 fill /disk-a/plots`. Its private
+`.xchplot2/grow-replot.review` retains the selection, keys, profile and local
+reader and compute selections. All roots must be present when durable coordination is first
+established. Later, a missing drive waits while independent work can continue;
+resume through an available destination or the saved review.
+After migration completes, `fill DIR` uses ordinary farming recovery without
+requiring migration service checks again.
+Construction and compute overrides follow the same rules as saved reviews
+described below.
+
+New jobs without a declared `farm_resources` profile use automatic conservative
+limits. The plotter caps construction at half the local CPU/RAM ceiling, leaves
+additional farming headroom, and reduces allocations when live memory is tight.
+`--workers` and `-M` can lower those limits. The default producer is CPU; an
+explicit GPU selection retains physical-device checks and leaves VRAM headroom.
+Enrolled helpers are discovered through the existing shared-compute setup.
+
+During execution, an independently capped health probe checks the synced full
+node, connected farmer/harvester and started solver. Unavailable or stale health
+observations pause work at a recoverable boundary. Local CPU/RAM pressure also
+pauses work. When the selected reader's existing log supplies fresh lookup
+times, slow responses throttle I/O and pause construction; no logging change is
+required. Healthy observations allow recovery. These controls do not establish
+a worst-case proof deadline, GPU preemption or future-filter guarantee. RPC
+health remains available when lookup timing is not exposed.
+
+`plan DIR --replot --save-profile FILE` optionally saves this automatic setup
+and prints continuation commands. It does not require service-cost or queue
+declarations. Saved local profiles and private job bindings retain explicit
+compute choices, including membership directory, broker, local participation
+and offer limits. Explicit command-line choices override saved preferences.
+Portable reviews contain the resource policy, not local credentials or
+executable authority. Automatic resource profiles use schema 2; older binaries
+reject them. Existing schema 1 profiles retain their reviewed-envelope behavior.
+
+A fresh replot scan includes directories from the selected reader configurations
+and adds explicit destinations, path-list files and `--discover-drives` results.
+`--discover-farm` enables configuration discovery for ordinary `plan`/`fill` or
+`plan --inventory`; `--no-discover-farm` limits a replot scan to supplied roots.
+Use `--farm-config /path/to/config.yaml /other/reader/root` to include several
+Chia-family configurations. A root names its `config/config.yaml`. The selected
+profile's adapter roots and `--chia-root` are included; otherwise discovery uses
+`CHIA_ROOT` or the normal local Chia root when present. This reads configurations;
+it does not configure services or enroll other machines.
+
+Paths are normalized and deduplicated. `--exclude-destination /keep-a /keep-b`
+accepts several exclusions at once, including descendants and filesystem
+aliases. Excluded locations receive no output, scratch or source deletion.
+Their inventoried plots still count toward the active farm's resource demand.
+Like `--temp-dirs`, these lists end at another option or `--`; prefix names
+starting with `-` with `./`.
+
+Execution needs a compatible Chia harvester, farmer,
+started PoS2 solver and synced, activated full node. Linux and native Windows use
+native file claims and bounded worker processes. A platform without the required
+telemetry or process controls refuses admission. See the
+[compatibility guide](contrib/pos2-pr118/README.md) for PoS2 reader support.
+
+Replacement routes include solo pool contracts, external pooling and OG pool
+public keys. For an external pool, the farmer must report the configured public
+route, supported pooling protocol, initialized authentication parameters and
+current difficulty. Manually reviewed resource envelopes must cover that
+protocol and a conservative minimum difficulty; automatic policies monitor the
+live services. These RPC observations do not prove pool registration, a
+current authentication token, possession of an OG signing key or acceptance of
+a future proof. By default the first replacement in each destination establishes
+its exact public-key route after publication; migration does not wait for a
+random winning proof or pool partial.
+The selected membership and contract hash must already be appropriate for the
+pool. The [current Pool2 protocol](https://github.com/Chia-Network/pool2-reference#how-it-works)
+uses a RewardPuzzle route tied to the launcher ID and versioned authentication;
+an older contract address is not evidence of that membership. Migration does
+not create or upgrade a Plot NFT or change the wallet's pool membership.
+
+Inventory must cover every loaded plot root of each configured source and target
+reader, including existing destination data. To inspect or save it separately,
+use `plan --inventory`. The optional installed-reader arguments add authenticated
+observations from the existing services:
+
+```bash
+xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --save-plan inventory.plan --json
+```
+
+This reads native file identities, allocated and logical sizes, supported
+public headers and storage sharing. It exports no plot memos, private keys or
+seeds and starts no farming services. Without `--save-plan`, it only reports
+the inventory summary; use `--json` for the complete report. With `--save-plan`,
+the saved inventory includes resource observations and missing settings.
+Source files are unchanged in either case. Saving refuses an existing file.
+Pass `--replot-inventory inventory.plan` to reuse the saved inventory with
+`plan` or `fill --replot`; the older `--replot inventory.plan` spelling also works.
+Paths, public identifiers and
+hostnames remain in the report, so review those before sharing it.
+
+File names and extensions do not establish a format or deletion eligibility.
+Supported PoS1 headers can become retirement candidates after rechecking the
+same native files and parsed public header, including ordinary files currently
+unloaded from the reader. A present loaded record must agree with those fields.
+Proprietary PoS1 containers can also become candidates when
+an explicitly selected installed reader reports consistent public plot metadata
+for that exact native object. Filename and size alone are insufficient: native
+identity, timestamps and the observed header bytes are pinned, and the reader's
+plot public key and pool route must bind its reported plot ID. This identifies
+the reviewed object without reconstructing old proofs or claiming its contents
+are valid. Unknown files without that metadata, links, aliases and unreadable
+or changed objects stay protected. Existing PoS2 files remain part of the
+workload and are not PoS1 retirement candidates.
+
+`--farm-adapter chia|gigahorse|drchia` selects the installed reader interface;
+`--chia-executable` must name its actual executable. Each source phase captures
+and fences a coherent bounded reader registry for the selected batch. After
+construction and verification, migration refreshes source metadata before
+retirement and checks each reviewed source and target reader's loaded scope
+before each claim and unlink. Unexpected arrivals stop retirement. Reader,
+configuration or reported version changes invalidate the review, apart from
+the reviewed source-directory removal described below. DrChia builds
+without a version RPC record explicitly labelled CLI version provenance instead;
+that is not an independently reported running-service version. Unloaded ordinary
+files record the selected reader's route context separately from their public
+header identity; this does not claim that the reader loaded or decoded them.
+Native source claims retain the exact reviewed object across interruption and recovery.
+Registry calls, catalog traversal and native object reads have explicit time,
+memory and output limits. Retirement requires no vendor proof checker or GPU
+reconstruction of the old plot.
+
+`--farm-adapter-timeout-ms N` sets the native adapter operation timeout for
+inventory and migration commands (default `30000`, range `1..3600000`). Increase
+it explicitly if a complete reader or target-readiness snapshot times out.
+Supply the setting again when revalidating or resuming a saved review; it does
+not change the farming response deadline, process resource caps or the fresh
+service and catalog checks required before retirement.
+
+For different source and replacement readers, add a `farm_adapters` object
+beside `farm_resources` in the local `--harvester` profile:
+
+```json
+{
+  "schema": 1,
+  "target_route": "new-chia",
+  "routes": [
+    {"id": "old-gigahorse", "kind": "gigahorse",
+     "root": "/home/farmer/.chia/gigahorse", "executable": "/opt/gigahorse/chia",
+     "source_roots": ["/disk-a/plots"]},
+    {"id": "new-chia", "kind": "chia",
+     "root": "/home/farmer/.chia/mainnet", "executable": "/opt/chia/bin/chia",
+     "source_roots": []}
+  ]
+}
+```
+
+Each source root must match one explicit route. Pass this local profile during
+inventory, review and execution; saved public plans do not authorize executable
+paths. The resource declarations must also match the saved review on resume.
+An unexpected loaded plot stops progress until the catalog and workload are
+reviewed again. During execution, only the catalog and replacements already
+published by the private journal may appear in those readers' loaded registries.
+Explicitly classified metadata artifacts remain protected; a reader reporting
+one as a loaded plot contradicts its zero-workload classification and is refused.
+
+For authenticated remote services, a route can also declare `host` and
+`services`, keyed by `harvester`, `farmer`, `full_node` and `solver`. Each service
+entry supplies an absolute local `root` containing its existing private-CA CLI
+configuration, `rpc_host` matching that configuration's `self_hostname`, and
+`host` naming its physical resource host. Harvester, full-node and solver entries
+also supply `node_id`, the service TLS identity seen by the farmer, and
+`farmer_node_id`, the reciprocal farmer identity seen by that service. The
+farmer's public and private connection identities can differ. These local
+bindings select the authenticated contexts; a saved public plan imports none of
+the executable paths or authentication authority.
+
+Replacement and source paths must identify the same accessible native files for
+the controller and selected harvester, such as an explicitly shared filesystem
+with matching paths. RPC supplies public loaded metadata, not remote native
+inode attestation. A matching pathname on an unrelated remote filesystem does
+not establish the controller's exact replacement. Configure the actual shared
+file namespace and physical storage/resource mappings before review.
+
+The following declaration workflow is for manually reviewed resource envelopes.
+It is optional for new migrations using automatic limits. A supplied schema 1
+resource profile keeps this mode. Explicit `--resource-setting` declarations
+also select it when starting without an automatic profile; incomplete
+declarations are not silently promoted to guarantees.
+
+The inventory contains an editable `farm_resources` template and a separate
+`resource_preparation` checklist. Preparation generates local source filesystem
+and drive aliases, CPU/RAM resources for selected physical service hosts, and
+only the workload edges established by those bindings. Supported public format
+parameters and selected reader/version provenance are filled when observed.
+It does not select destination or scratch paths or invent capacities and costs.
+The checklist groups missing declarations by purpose and gives their field
+paths and required inputs. Every fact identifies its source and scope as
+observed, declared or unknown. Observed CPU affinity and effective
+physical/container memory supply local hardware ceilings during migration setup.
+Configured lookup threads and live free-memory snapshots do not establish
+another service's workload bounds.
+Saved quality-reader calibration retains its sample scope and cannot establish
+worst-case queues or a full-proof solver reserve.
+
+For a local setup, start with the controller, selected Chia services and source
+files on the same physical host. Inventory all source and existing destination
+data with the command above. The generated CPU/RAM nodes share that host; source
+storage nodes share any observed drive aliases. An unrecognized data file gets
+only its known storage edge until its decoder/service topology is declared.
+For example, the generated local memory node has this shape; retain its actual
+host and ID from the inventory:
+
+```json
+{
+  "id": "memory:<observed-host>",
+  "host": "<observed-host>",
+  "kind": "host_memory",
+  "capacity": 0,
+  "capacity_known": false,
+  "conditional_shared": false,
+  "telemetry_required": false,
+  "aliases": []
+}
+```
+
+The zero capacity and false flags are deliberately unknown placeholders.
+Use `--save-profile` during inventory or migration setup to retain reusable
+declarations and explicitly selected local reader bindings:
+
+```bash
+xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --save-plan inventory.plan --save-profile farm-setup.json
+xchplot2 plan /disk-a/plots --replot inventory.plan --harvester farm-setup.json \
+  --save-profile migration-setup.json
+```
+
+Setup gathers selected destination/scratch resources and execution settings,
+retains completed declarations, and prints remaining `--resource-setting`
+templates plus the next command. Replace their uppercase placeholders with
+reviewed values. For example, using the actual resource ID from the report:
+
+```bash
+xchplot2 plan /disk-a/plots --replot inventory.plan \
+  --harvester migration-setup.json \
+  --resource-setting 'resources[memory:HOST_ID].capacity=8589934592,capacity_known=true' \
+  --save-profile migration-setup-next.json
+```
+
+Memory fields use bytes, service capacities use parallel lanes, and service,
+queue, period and deadline bounds use microseconds. Selectors address stable
+resource/workload IDs; settings cannot create physical resources, alter catalog
+counts or select reader executables. JSON exposes `resource_settings`,
+`settings_limited`, `continue_setup_command` and `next_command`. Setup exports
+can remain incomplete and are not executable migration reviews. Once complete,
+use the profile with `fill --replot`, or preview and optionally save a review
+with `plan --replot --save-plan`. `fill --replot` also accepts the same
+`--resource-setting` declarations. An ordinary
+harvester profile can also seed automatic setup; adding explicit resource
+declarations selects the reviewed workflow above. Keep profiles containing
+`farm_adapters` or `compute_settings` private and local to the
+machine where their executable and configuration paths are authorized.
+
+You can also edit the existing `farm_resources` object in a copy of the inventory
+using the checklist: declare offered CPU/RAM/storage capacity, existing service and
+whole-queue bounds, output/scratch mappings, whole-file construction bounds,
+supervision for structural checks and replacement farming/full-proof cohorts.
+Add proof verification bounds when selecting sampled or strict migration checks.
+If a decoder or solver uses a GPU or another host, add its physical resources
+and complete service/network demands. A local topology does not exempt those workloads.
+Keep the original observations for comparison and save the completed copy as
+`farm-resources.json`. Reuse the declarations during another inventory without
+reentering the resource graph:
+
+```bash
+xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --harvester farm-resources.json --save-plan refreshed-inventory.plan --json
+```
+
+This copies the saved declarations unchanged, checks inventory counts and
+reports physical binding differences beside the new observations. It does not
+requalify the declared bounds. Review still checks the concrete migration and
+every resource phase. A completed resource-only file or inventory within the
+profile input size and parsing limits can also be supplied through
+`--harvester FILE`. For a large catalog, copy its completed `farm_resources`
+object into a standalone resource file, retaining any needed `farming_profile`
+and `farm_adapters` objects beside it. Use the existing
+[harvester profile workflow](#farming-layout) when supplying reader model inputs
+or quality calibration for the intended PoS2 reader. Keep each inventory entry's
+`workload_id` consistent with the profile's counts. Opaque data also needs a
+workload reservation unless explicitly classified as `non-plot` with a reason.
+That classification never makes the file a retirement candidate.
+
+| Profile part | Required scope |
+| --- | --- |
+| `resources` | Physical host, CPU, host memory, GPU compute and memory, storage, controllers, network and solvers actually shared by the work. Aliases identify one resource, not extra capacity. Memory capacities are bytes; other capacities are concurrent service lanes. |
+| `workloads` | Format, decoder/version, backend, pool difficulty, current and future quality/full-proof bursts, response deadline, provenance and complete resource costs for each existing cohort. |
+| `uses` | Resident and transient memory, full carried-in queue bounds, and either explicit reserved lanes or bounded service times. Service times are microseconds; memory use is bytes. |
+| `native` | Bounds for construction, structural supervision and selected proof checks, physical output/scratch/source mappings, controller and RPC supervision, and increasing member cohorts with separate new-farming and full-proof reserves. |
+| `gate` | Maximum telemetry age and the recovery interval/sample count required before admitting work again. |
+
+`native.service_hosts` maps service roles to their physical resource hosts;
+omitted roles use `native.host`. These labels must match the local adapter
+bindings. For external pooling, set `native.min_pool_difficulty` to the lowest
+difficulty covered by the full-solver envelope and `native.pool_protocol_version`
+to the configured protocol. A live difficulty below that floor, or a different
+protocol, stops further retirement. Higher difficulty remains within the
+reviewed arrival bound. Solo and OG routes leave both values zero.
+
+Additional loaded farmer-side harvesters require reviewed aggregate workloads with
+`external_service_node_id`, `external_service_host`, `plot_count` bounding loaded
+files, and `external_service_members` bounding their full member population.
+Their costs cover the receiver host and the shared farmer/solver resources.
+These unscanned service reservations remain charged throughout migration and
+cannot be retired as inventoried files. Unknown receivers or populations beyond
+the reviewed bounds stop progress.
+
+Unknown costs or capacities block admission. Declared reservations must cover
+the entire workload; changing a flag to `bounded` does not measure that bound.
+Partial-proof calibration does not supply a full-proof solver reserve. GPU
+names and ordinals are not physical identities: supported CUDA/HIP selections
+report their PCI identity with `devices --verbose`. A shared GPU needs a
+complete conditional service envelope; it has no guaranteed preemption or
+isolation from another application's queues. Imported remote resource profiles
+can support forecasts but do not grant control over remote services.
+
+Native envelopes must explicitly cover future filters and the controller's
+memory in each phase (`covers_future_filter` and
+`phase_totals_include_controller`). Construction, verification and RPC
+supervision run sequentially. Mandatory structural checks use the
+`native.supervision` CPU, RAM and storage envelope and an isolated worker
+restricted to one CPU, with memory and time limits. Selected full-proof checks
+also require `native.verification` and `max_verification_us` bounds;
+`verification_cpu_threads` defaults to one for new reviews.
+Structural-only reviews do not need those proof-phase declarations. The
+replacement farming cohort's `proof_reserve` remains required for the running
+farm's full-proof service, independently of the migration check policy.
+Each phase's CPU envelope includes its concurrent controller or monitor and
+capped worker, within the inherited CPU set.
+GPU session envelopes cover the full inherited CPU set in every phase:
+retained runtime helpers are not constrained by the host worker limit.
+They also require an explicit `standing_gpu_bytes` resident-memory bound in
+every phase for retained contexts, runtime caches and tables. Supply a complete
+declared or measured bound; it is additional to the allocation grant, and the
+VRAM safety margin does not substitute for it. GPU preflight can perform bounded
+active device probes.
+Construction and verification service costs cover the entire file up to
+`max_group_members`, including all internal batches and windows.
+`max_batch_members` limits an individual construction batch; a measured cost
+for one batch is insufficient for a larger file. An operation timeout does not
+measure or enforce its per-resource service cost.
+Declared bounds must cover every permitted execution setting, including smaller
+worker, batch and memory limits; measurements at one setting do not establish
+that envelope.
+For resources marked `conditional_shared`, admission adds all declared work and
+queued blocking time and checks response deadlines. This permits conditional
+sharing of a CPU or disk lane; it does not establish a measured service bound.
+
+Shared compute also needs a reviewed migration envelope. `native.compute_workers`
+maps each worker's authenticated `tls_identity` to its physical `host` and,
+where used, `gpu_identity`. Declare the configured `cpu_threads`, `slots`,
+`host_bytes`, `gpu_bytes`, standing host/GPU memory and permitted `allowed_kinds`
+(`generate-cpu`, `generate-gpu` or `encode`). Each worker's `reservation` covers
+its entire service, including work from other owners; idle status supplies no
+extra capacity. The host-memory partition already includes the worker baseline.
+`native.compute_owner_identity`, `compute_broker_identity` and
+`compute_broker_host` bind the owner and broker; `compute_services` reserves the
+persistent session/codec and broker resources. Migration setup authenticates
+discovered workers, including workers advertised before a broker starts, and
+imports their physical host, configured CPU/RAM partition and known GPU identity.
+Existing declarations are preserved. Shared physical resources are counted once.
+Unknown network costs, GPU residency and foreign farming service bounds remain
+explicit setup requirements; observed idle capacity cannot supply those bounds.
+Missing mappings or grants beyond the reviewed envelope block admission.
+Protected migration gives the owner/client/codec and the worker independent
+CPU gates. Its reviewed envelope reserves both workloads in full, so a local
+offer may exceed `--workers` when physical capacity and complete phase bounds
+permit it. Ordinary plotting retains its shared owner/worker gate.
+Local GPU worker reservations also cover the complete inherited CPU affinity
+for runtime helpers, as well as offered task CPUs and GPU allocation/residency.
+
+`fill --replot` permits the whole-file reclamation needed for the active
+replacement's output, scratch and farming resource budget. It selects a bounded
+set of sources and reserves the complete output on its destination before using
+the remaining space for scratch. With `--destination-temp on`, scratch can use
+the other selected destinations too; no dedicated temporary drive is required.
+Independent drives are preferred for scratch. The disk scheduler adjusts its
+active drive count, transfer sizes and pacing from completed I/O and, on Linux,
+kernel block service. Physical aliases share one gate. When the installed local
+reader's configured log supplies recent farming completions, slow responses
+reduce construction pressure and healthy samples allow gradual recovery.
+Missing, disabled, remote or unsupported logs retain conservative tuning.
+Capacity reservations still cover complete outputs and checkpoints. These
+observations do not establish a farming latency guarantee on an unqualified HDD
+array; an allocation or synchronization call already running must return before
+the scheduler can yield that drive.
+
+Use `--reclaim-before-bytes 0` to require replacement-first retirement, or a
+positive byte limit to cap early deletion more tightly. To preview and save
+that explicit limit before executing:
+
+```bash
+xchplot2 plan /disk-a/plots /disk-b/plots --replot-inventory inventory.plan \
+  --harvester mixed-farm.json --compute off --devices cpu \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --reclaim-before-bytes "$EARLY_DELETE_LIMIT" --destination-temp on \
+  --save-plan migration.plan --json
+xchplot2 fill migration.plan --compute off --devices cpu \
+  --harvester mixed-farm.json \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+The review fixes the selected source files, replacement batches, destination
+identities and resource assumptions. Inspect the old formats, k sizes, file
+counts and allocated bytes alongside the new k size and member counts.
+Physical bytes do not imply equivalent farming capacity, rewards or fees;
+unavailable value estimates remain unknown. A smaller compressed file need
+not use fewer farming resources.
+
+By default the review selects every eligible old PoS1 file in the inventory.
+Use repeatable `--replot-source-root ROOT` to select only exact inventoried
+roots, or `--replot-exclude-root ROOT` to protect exact inventoried roots.
+A root cannot be both selected and excluded. The complete inventory remains
+in the review: excluded and unselected files still consume their declared
+farming resources. Output limits such as `--max-groups` bound replacement
+outputs; they do not bound old-file retirement.
+
+For a bounded initial run, add `--replot-max-source-files N` or
+`--replot-max-source-bytes SIZE`. These limits apply to ranked whole old
+files, using their observed allocated bytes; a file that exceeds the remaining
+byte allowance is skipped. The review reports selected and protected file
+counts and allocated bytes. For example, pair `--replot-max-source-files 1`
+with `--max-groups 1 --max-total-members 1` to bound both old-file retirement
+and replacement work per destination, inspect the result, and save that review
+for execution. A saved review's exact source list remains authoritative.
+
+Replacement outputs retain the destination order in the review. Source mapping
+first checks the reviewed construction and selected verification resource stages,
+placing needed early resource or scratch-space release in the current batch
+even when the source's own filesystem has a later destination. It then favors the same filesystem,
+spreads allocated bytes across replacement outputs, and keeps reader workload
+cohorts together when the active batch can hold them. Bootstrap sources are
+mapped to the output that needs their space.
+Every prefix must still pass the resource, scratch-space and early-deletion
+checks. The fixed mapping governs retirement even when an independent later
+output is constructed ahead of a delayed acknowledgement or missing drive.
+Selection tries bounded alternatives when the ranked choice cannot fit the
+early-deletion limit. A search-bound refusal does not establish that no feasible subset
+exists. It permits no additional retirement; existing pending commitments and
+used early-deletion allowance remain in the private journal.
+
+`--reclaim-before-bytes SIZE` belongs to the saved policy. When omitted, its
+limit covers the source bytes assigned to the three largest mapped replacement
+batches, matching the pending-output bound; admission still
+reclaims only the whole files needed for that batch. The preview reports the
+resulting allocated-byte limit.
+Zero requires each mapped replacement to be ready before its sources are
+removed. A positive value permits that many allocated source bytes to be
+committed to removal or removed while their mapped replacements are not yet
+ready. The used allowance includes pending committed removals and persists
+across interruptions and restarts. It is released when the mapped replacement
+is recorded ready. Removal is irreversible: the new plot cannot reconstruct an old
+one. This limit measures physical bytes, not lost income or equal farming
+value. Temporary space selected with `--temp-dir` or `--temp-dirs` is construction scratch;
+it is not automatically a farmable replacement.
+External construction with an early-deletion allowance also requires a joint output and
+scratch admission. The review and execution check the actual temporary roots,
+filesystem sharing, full output/checkpoint reservations and outstanding deletion
+commitments before claiming any source. An inadequate `--temp-capacity-bytes` or
+unavailable scratch root refuses the deletion; credit cannot stand in for a
+complete scratch grant.
+
+Each batch must fit conservative output, construction, recovery and headroom
+allowances. Execution checks actual available space again. A rename or
+quarantine frees no capacity; open handles, snapshots or filesystem behavior
+can delay its release after deletion. Extra free space does not enlarge the
+reviewed replacement schedule.
+
+Every replacement must match its expected identity, memo and parameters and
+pass bounded header, payload bounds and canonical chunk index checks before
+publication as an immutable `.plot2` file. These structural checks are the
+default for new reviews. They do not walk quality chains, solve full proofs or
+validate every compressed payload. Old source plots are never proof-solved by
+this workflow.
+
+Set `--replot-verification sampled` during review to add bounded full-proof
+checks for selected groups. It defaults to the first group only. Use
+`--replot-proof-first-groups N` to check the first N groups and
+`--replot-proof-every-groups N` to check every Nth group; a periodic value of zero
+disables that part of the schedule. Group numbers are one-based across the
+entire reviewed output order, including all destinations. A group is selected
+if it belongs to the prefix or its number is divisible by the periodic value.
+The schedule is saved and remains the same across interruptions. A sampled
+policy must select a nonzero prefix or period. `--replot-verification strict`
+requires full-proof samples for every new group. It still samples proofs;
+it does not check every payload byte.
+
+Each selected group must yield a valid complete proof within its challenge,
+solver, CPU, memory and time budgets. A failed or exhausted sample stops the
+replacement; it does not undo early deletion. Sampling does not inspect every
+chain or prove every byte correct. Isolated check workers request lower CPU
+and I/O scheduling priority when supported. These preferences do not replace
+resource admission or impose service guarantees. Proof solving remains local.
+
+The default `--replot-confirmation directory` checks the first published
+replacement in each destination against the configured harvester and connected
+farmer's completed plot synchronization. The exact path, plot identity, public-key
+route, size, modification time and group membership must match. Later files in
+that directory retain structural and selected proof checks, with fresh farming
+service checks before retirement, without requiring a separate plot-list
+acknowledgement for each file. Directory confirmation does not prove that every
+later file has already reached the farmer.
+
+Construction finishes and releases its scratch before waiting for the first
+directory acknowledgement. Up to three outputs, including the active output,
+can be under construction or awaiting confirmation. Independent later outputs
+can proceed within that bound, with their complete output and scratch costs
+reserved and all outstanding early-deletion debt charged together. Queued
+outputs retain their identity, verification and publication state across a
+restart. A confirmed output releases its pending slot after its mapped source
+retirements and completion record are durable, so a healthy destination can
+continue while another drive is absent. Sources still follow their mapped
+replacement's retirement rules.
+
+Temporary RPC failures, disconnects, synchronization and solver startup delays
+retain the owned executor and its sealed outputs. They retry with bounded
+backoff until services recover or the user cancels. Directory confirmation also
+reconciles later published outputs periodically; a failed reconciliation stops
+further retirement while bounded construction can continue. Identity,
+configuration and policy mismatches require correction or revalidation and are
+not retried as transient outages.
+
+Select `--replot-confirmation file` for exact acknowledgement of every
+replacement. This mode retries transient readiness failures and audits the complete
+acknowledged prefix after construction or a synchronization-generation change.
+Older saved reviews retain their original file policy.
+
+Without an early-deletion allowance, the selected checks precede retirement of
+mapped old files. With an allowance, they complete the batch after its authorized
+early retirement. The target network must remain synced, active for PoS2 and
+compatible with the replacement parameters. Matched peer observations bind the
+selected harvester, farmer, full node and solver, using explicit reciprocal TLS
+identities for remote links. Other receivers must fit their reviewed service
+reservations. Protected retirement actions recheck service connections,
+completed plot synchronization, pool route/difficulty and native file identities.
+Completed synchronization can remain valid while services are idle. Imported
+JSON cannot assert readiness. Missing capabilities or changed populations block
+retirement.
+Pause messages report bounded resource causes and declared margins; source-unload
+waits identify the reviewed workload and reader route. These transient diagnostics
+do not change journal authority or make `--status` a live service-health check.
+An authorized pre-deletion still requires the live target network and the
+saved confirmation policy's checks.
+General service and configured public pool-route prerequisites apply before private
+pre-deletion; exact new plot/key acknowledgement follows publication under the
+selected confirmation policy. Missing or changed reviewed farmer/solver versions block execution
+while network-only forecasts remain available.
+
+Resource admission includes the old farm, completed replacements, construction,
+verification and separate full-proof demand, under current and future filter
+conditions. Retiring a plot does not release a foreign decoder's resident
+memory or queued work. Telemetry restricts native admissions and interrupts
+construction or verification work if protected headroom is lost. Construction
+stops at recoverable boundaries and resumes through checkpoint recovery; already-running
+native I/O must return before cancellation can be observed, and already-admitted
+backend work may finish at its existing completion or timeout boundary. A paused
+verification attempt restarts against the sealed replacement within its remaining
+verification work allowance. Waiting and retry cooldown do not consume that
+allowance. Telemetry does not stop or
+reconfigure the farmer, harvester, remote solver or their services.
+Migration chooses RAM and CPU allocations from current availability on fresh
+execution, resume and safe construction boundaries, within the reviewed
+envelope. An explicit `--max-ram`, `--workers` or offered compute limit remains a
+cap. Resource pressure waits for recovery or cancellation; it has no fixed
+overall retry deadline. Retained checkpoints keep their full memory and storage
+requirements until recovery can safely proceed.
+The reviewed envelope must also allow fresh observations after a restart while
+conservatively retaining the original arrivals until their removal is confirmed.
+The first complete target farming and full-proof cohort is reserved even when
+no replacement exists, covering the services that must already be running.
+An infeasible review requested with `--save-plan --json` still reports its
+structured reasons and leaves the requested save path unwritten.
+
+Keep the original `migration.plan` when one was exported, the private
+`grow-replot.review` for direct jobs, any active reviewed successor, every private
+`.xchplot2/grow-replot.plan` copy and any `.next` file, receipts and owned
+temporary files.
+New migrations also keep controller authority under
+`$XDG_STATE_HOME/xchplot2/migrations/` (normally
+`~/.local/state/xchplot2/migrations/`), or `%LOCALAPPDATA%\xchplot2\migrations\`
+on Windows. Preserve this directory with the destination metadata. Once
+established, it is required for recovery on the same host and user; destination
+copies alone cannot replace a missing controller record. Returning drives are
+reconciled against it, and conflicting or newer destination records require
+inspection before recovery.
+The private journal contains the seed and assignments from preparation onward.
+New jobs keep local reader bindings, `receipt-N` and `completion-N` records,
+and `stage-N.building` files with their construction sidecars under
+`.xchplot2/replot-JOB/` in each relevant destination. Existing jobs retain their original top-level journals,
+`.xchplot2-replot-JOB/` artifacts and `.xchplot2-stage-JOB-N.building` paths.
+Source claims remain under `.xchplot2-retire-JOB/` in the source root.
+Ordinary construction recovery files remain beside their output file, and
+directory locks retain their existing paths.
+Resume a direct job with `xchplot2 fill DIR`, or an exported review with
+`xchplot2 fill --from-plan migration.plan`, using the active successor
+in place of that filename after revalidation. Private state restores the keys.
+Accepted local reader paths, adapter kind and profile selection are also saved
+privately on the first destination when its metadata allowance has room.
+These defaults belong to the local host and user; explicit arguments override
+them, and a public review never supplies a local executable. Missing defaults
+require the original explicit local selections. Compute connection options remain
+explicit. Work that needs a missing source, destination or retained scratch root
+waits until it returns with the same native identity. Other independent batches
+can proceed within the pending-output limit. If an unavailable drive holds a
+retained checkpoint whose scratch grants cannot be read, potentially shared
+scratch stays reserved and new construction may wait for that drive.
+A source mismatch stops retirement while
+preserving the claimed file for inspection. On Windows, a reader that holds a
+source without delete sharing must unload it before the native claim can open.
+Keep the reader's RPC service running. Recovery of a batch with durable
+retirement progress can retain its previously validated metadata for those exact
+now-unloaded native objects. A later opaque batch without previously validated
+reader metadata must be loaded and freshly acknowledged before its own retirement
+begins. Ordinary supported public headers can identify unloaded files directly.
+
+Use `xchplot2 plan --status --from-plan migration.plan --json` for read-only
+progress. Status separates the durable phase, completed receipts, retirement
+states and used early-deletion allowance from current filesystem observations.
+It shows exact active claim and replacement paths, pending replica publication
+and the next safe action. It reports the selected verification policy and each
+group's actual full-proof evidence separately; structural completion never
+appears as a validated proof. It also distinguishes an active policy from a pending
+successor, a stale reviewed boundary or a different active policy, showing both
+the reviewed and current journal digests. By default, it does not contact
+farming or compute services. Add `--live` for current service-readiness queries;
+these queries do not establish why a previous process stopped.
+Missing replicas are reported as incomplete observations. No journal found is
+not proof that the job never ran; preserve remaining artifacts before recovery.
+
+`xchplot2 pause DIR`, `drain DIR` and `resume DIR` also control migrations; a saved
+review can select the job instead. `--destination DIR` targets one destination.
+Pause fences new construction and retirement at safe boundaries, while drain
+allows admitted work to finish. Controls persist across restarts. Status shows
+the live coordinator, its wait reason, pending outputs, completed outputs per
+destination and controller authority separately from the global receipt prefix.
+Use `--policy-only` to save intent for a stopped coordinator; this does not start it.
+
+To review changed installed readers or resource declarations, stop the
+coordinator, keep the original source and replacement objects, and save an
+updated local profile separately:
+
+```bash
+xchplot2 plan --revalidate --from-plan migration.plan \
+  --harvester updated-farm.json --save-plan migration-successor.plan --json
+xchplot2 fill --from-plan migration-successor.plan --harvester updated-farm.json
+```
+
+Verification policy changes also require a saved successor: add
+`--replot-verification structural|sampled|strict` and any sampled schedule to
+the revalidation command. Execution and status cannot override a saved policy.
+Older reviews without an explicit policy retain their original strict proof
+requirement until a successor explicitly changes it. Completed groups and
+already recorded full-proof results keep their actual evidence across policy
+changes; selecting strict later does not relabel earlier structural completion
+as a solved proof.
+
+Revalidation audits every original inventory entry, exact claims, completed
+receipts and sealed replacements, then refreshes reader observations and current
+farming acknowledgements. Review covers current and remaining phases; decoder
+residency or queues remain charged until fresh observations confirm unload.
+The successor preserves the original keys, fixed output identities and layout,
+selected native sources, completed receipts and early-deletion limit and used allowance.
+Claimed or retired files retain their original identification; separate current
+reader observations do not identify them again. Active opaque files must still
+be loaded and freshly identified by the current reader.
+
+A successor is bound to the exact stopped journal revision and any retained
+unfinished construction checkpoint. If either advances before activation, save
+a new review, even when the journal itself has not changed. Valid unfinished
+checkpoints can be reviewed with a compatible engine build, compatible memory and
+I/O grants, and their complete target and scratch reservations. Review leaves
+the checkpoint and its scratch files intact. Empty bootstrap files, orphan tails
+without a valid checkpoint and saved external work without its exact stage
+target must first recover through the active review to a supported checkpoint
+or verified boundary.
+
+After activation, ordinary checkpoint progress can continue through that
+successor; the original review cannot remove its policy. Further revalidation
+uses the currently active successor. Preserve the original review because
+completed receipts remain bound to its identity. Handoff and completed jobs need
+status or ordinary recovery rather than revalidation. If activation is
+interrupted before local defaults are saved, a profile with multiple reader
+routes may need to be supplied explicitly once more.
+
+New reviews can record a removal-compatible fingerprint for conventional Chia
+configuration. Once the private journal has durable retirement intent, removing
+that reviewed source directory from the reader's configuration is permitted.
+Keep all replacement directories configured and preserve every other setting,
+executable and service binding. Removing an ancestor of a replacement directory
+is refused.
+This also applies when the source and target share that configuration; fresh
+target acknowledgements remain required. Directory additions are refused.
+Native configuration rewrites may reorder keys or remove comments without
+changing the other settings. Older reviews and unsupported configuration syntax
+retain the exact-configuration requirement; keep or restore the reviewed
+configuration to resume those jobs.
+
+New inventories and reviews can record persistent native object evidence on
+Linux Btrfs, ext4/XFS when native filesystem UUID and object-handle interfaces
+are available, and local Windows NTFS. Linux tmpfs evidence covers only the same
+live filesystem instance and cannot survive a reboot. This permits device
+renumbering after a remount when the same source, destination and scratch objects
+remain at their reviewed paths.
+Recovery checks the recorded filesystem and object generations, immutable file
+metadata and current physical storage sharing before using the reviewed resource
+bounds. It does not grant additional capacity. Keep all recorded paths and owned
+scratch files intact; explicitly selected temporary directories must belong to
+the review. Older records and filesystems without this evidence still require
+their original native device identifiers. A successor reviewed with unfinished
+construction retains its exact checkpoint snapshot; after a remount, save a
+fresh revalidation before its first activation.
+
+After all replacements and retirements pass the final audit, the job publishes
+ordinary `.xchplot2/grow-farm.plan` copies for new jobs, or top-level copies for
+legacy jobs. Completed replacement files retain their
+identities and fixed member counts; ordinary recovery never grows them.
+An unfinished migration must finish through its active reviewed plan before
+ordinary fill or extension can operate on its destinations.
+Reassess any remaining legacy workload before extending a completed ordinary job.
+
+## Shared compute
+
+A compute pool is a set of trusted machines that share generation and encoding
+capacity. It is independent of the Chia pool destination used for plot keys.
+A plotting host owns its files, checkpoints and publication. A broker assigns
+leases; workers return computed fragments directly to the plotting host.
+Workers never receive destination paths, farmer/pool keys, seeds or private
+plot memos. Enroll only machines you trust to compute correctly.
+
+On a timed generation connection the worker reports time spent generating and
+encoding, and time spent sending results. The owner measures time waiting for
+frames after first output and time consuming frames, including scratch writes.
+Send and receive waits include backpressure and can overlap. After three
+completed samples for a matching plot size, strength and result type, the
+owner can compare generation batch sizes and choose how many destinations
+receive concurrently. With an older peer the owner uses the existing task
+timings. The full execution forecast also needs measured packing and storage
+costs for the destination.
+While those timings are incomplete, the scheduler favors a partially filled
+group that can start packing soon on an idle drive. Observed member sizes
+help it serve destinations with room before probing nearly full ones.
+A repeatedly deferred destination still gets a turn.
+
+Near the output limit, external construction receives uncertain compressed
+members individually. The planner can reserve extra scratch for these
+transfers. When the remaining member limit and a completed group of the
+same k and strength indicate the job should fit, it keeps the normal scratch
+reservation and can use packed batches. The owner stops a compressed transfer
+once locally validated chunks prove the candidate would exceed the final
+file allowance. If the bound is inconclusive, exact sizing can still admit
+the member. Previously accepted members remain eligible for publication.
+
+In construction JSON, `pool_partial_capacity_probes` counts compressed
+transfers stopped early for capacity. `pool_timed_generation_tasks` counts
+measured tasks.
+The destination scheduler reports its most recent generation estimate in
+`pool_generation_seconds_per_member` and its receiver count in
+`pool_receiving_destinations`. Both start at zero. The `phases` object gives
+the logical bytes read and written in each construction phase.
+
+On the first machine, create a pool and an invitation for another machine:
+
+```bash
+xchplot2 compute setup --name storage-a
+xchplot2 compute invite worker-b.invite --name worker-b
+```
+
+Transfer the invitation privately to that machine, then run there:
+
+```bash
+xchplot2 compute setup worker-b.invite
+```
+
+Create a separate invitation for each additional machine. An invitation holds
+that machine's private TLS identity, not the pool's signing key. Delete
+transferred copies after joining. Enrollment is pool membership: every member
+can share with multiple plotting hosts. It is not an exclusive machine pair.
+`setup` reuses existing enrollment and broker selection, accepts the same resource
+settings as `configure`, and installs and starts a worker on a helper.
+A new plotting-host setup installs and starts a background broker.
+New setups use TCP 18444 for the broker and TCP 18445 for the worker.
+Use `--role plotter` or `--role worker` to choose the role explicitly.
+If service installation fails, use the startup command in the diagnostic with
+the saved enrollment and settings. To run the steps individually, use `init`,
+`join` and the foreground `worker` command.
+
+After enrollment, `plot`, `fill`, and `grow` use shared compute automatically.
+New plotting-host setups share one persistent broker between jobs. To select
+an existing dedicated broker, use `setup --broker HOST:PORT`. For an embedded
+broker per job, use `setup --broker auto`. While a plotting job runs, its local
+executor offers bounded capacity. Nearby workers discover the broker and join.
+Several brokers can use one worker at once. The worker enforces one combined
+CPU, RAM, GPU and task-slot budget across their requests. One executor per
+enrolled machine identity prevents concurrent local jobs from advertising
+the same capacity twice.
+
+Run `compute worker` to keep offering capacity independently of a plotting
+job; it stays in the foreground until stopped. Save defaults for future jobs:
+
+```bash
+xchplot2 compute configure --cpus 4 --host-bytes 8G --gpu-bytes 4G
+xchplot2 compute status
+```
+
+A standalone worker adapts to its available CPU affinity and host RAM, with one
+task slot and automatic CPU/GPU selection. Saved or explicit limits remain
+caps. Automatic GPU allocation uses available VRAM at startup with the backend's
+required safety allowance; it does not infer spare GPU compute time from free
+memory. A plotting job partitions its host budget between the embedded service, local work,
+construction and optional remote encoding, honoring saved offered limits.
+A worker registers with up to 128 brokers by default. Save another limit with
+`compute configure --max-brokers N`, or override it with
+`compute worker --max-brokers N` (1..4096). Each registration consumes reserved
+transport RAM; automatic local executors lower their registration limit to
+fit the offered memory. Dedicated workers enforce the saved or explicit limit;
+when lowering their host RAM, lower `--max-brokers` too if startup reports an
+insufficient transport budget. For example, a 512 MiB CPU worker can use
+`compute configure --max-brokers 16`.
+Status reports deferred brokers when the limit is
+reached. Idle registrations rotate to admit waiting brokers; granted or active
+work keeps its registration until its reservation is released.
+For large registries or slow links, raise each dedicated broker's `--worker-ms`
+above the full refresh cycle; the default registration expiry is 30 seconds.
+Refreshes use bounded concurrency, so an oversized limit can otherwise cause
+idle registrations to expire between visits.
+Explicit service flags override saved defaults. Admission and retries adapt
+to available workers and measured task/transfer cost; discovery alone does
+not guarantee that a worker has enough capacity for a particular task.
+
+`compute status` authenticates live brokers and workers and summarizes their
+availability and work. Add `-v` to see saved defaults, certificate expiry,
+identities, owners, jobs, queue wait reasons, offered resources, broker
+reservations and actual worker usage. A worker shared by
+several brokers enforces its total limit locally; a broker's reservation view
+is not a pool-wide capacity measurement.
+The foreground worker reports its authenticated broker registrations. Run
+`compute status` on the plotting host to check its connection back to the
+worker. During plotting, `--progress` reports members generated, bytes
+received, members assembled and files published by the current process.
+Received bytes include retry traffic and local executor transfers.
+
+```bash
+xchplot2 compute status --json
+xchplot2 compute status --broker 192.168.1.10:18444 --limit 256
+xchplot2 compute pause
+xchplot2 compute drain
+xchplot2 compute resume
+```
+
+`pause` stops new tasks while accepted tasks finish. `drain` also
+changes to `drained` after accepted work finishes; `resume` allows new tasks.
+Only the worker's own enrolled identity can control it. Enrolled workers save
+pause/drain/resume intent privately before acknowledging it. Intent survives
+service restarts, automatic-executor replacement and certificate renewal; a
+restarted draining worker is drained until explicitly resumed. Controls on
+unmanaged workers using explicit TLS files last only for that process. Status
+reports this distinction. Use `--worker HOST:PORT` to query or control a worker
+when discovery is unavailable. Explicit endpoints select the services to
+query; otherwise status uses saved broker settings and LAN discovery.
+`--limit` bounds each broker section (default 128, maximum 4096);
+`--timeout-ms` bounds network queries (default 5000). JSON includes errors and
+truncation indicators. Live pages can change while being read.
+
+Discovery advertisements are untrusted hints. Status and work connections
+require mutual TLS in the enrolled pool. Builds can collaborate when their
+wire protocol and explicit task, generation, codec and representation contracts
+agree. Source-build identity is diagnostic provenance. Generation and codec
+eligibility are checked separately; incompatible work is not scheduled.
+Compatible releases can be rolled through workers without rebuilding every
+machine together. A wire-protocol change requires upgrading brokers, workers
+and plotting hosts together. This version uses compute protocol 6 and does not
+interoperate with protocol 5. Drain workers and wait for `drained` before
+replacing services. Preserve the saved enrollment directory, restart services,
+then run `compute resume` on the drained workers to accept new tasks.
+
+### Background workers and brokers
+
+Save resource and network defaults with `compute configure`, then install a
+service for this enrolled machine:
+
+```bash
+xchplot2 compute service print
+xchplot2 compute service install
+xchplot2 compute service status
+xchplot2 compute service restart
+xchplot2 compute service remove
+```
+
+The default role is `worker`; add `--role broker` for a dedicated broker.
+`print` displays the definition without installing or starting it. `install`
+starts the service and arranges subsequent startup. `start`, `stop`, `restart`
+and `remove` act only on the service generated for this identity. Use
+`compute drain` on workers and wait for `drained` before stopping if accepted
+tasks should finish first. Restart after changing saved defaults or replacing
+the executable. After restarting a drained worker, run `compute resume` to
+accept new tasks; restarting alone does not clear its saved drain setting.
+
+Linux uses a systemd user service; logout behavior follows the system's user
+manager policy. Windows uses Task Scheduler at user login, without elevation,
+and requires that user to remain logged in. The native Windows service path
+is experimental: rapid stop/start/restart can leave the worker stopped on
+x86-64. Check `compute service status` and `compute status` after restarting.
+
+### Networks and dedicated brokers
+
+LAN discovery uses mDNS/DNS-SD on active multicast interfaces. It excludes
+loopback and point-to-point VPNs unless selected explicitly. Sharing listeners
+accept the selected networks plus loopback. Interface changes are refreshed
+automatically. IPv4 and IPv6 are supported; write IPv6 endpoints as
+`[address]:port`, with a scope on link-local addresses such as
+`[fe80::1234%enp3s0]:18444`. On Windows, select an adapter by its name or
+interface index; `lo` selects loopback on either platform. Choose interfaces
+explicitly when needed:
+
+```bash
+xchplot2 compute configure --interface enp3s0 --interface wg0
+xchplot2 compute configure --interface auto
+```
+
+Discovery stays on the local link. Routed networks and VPNs can use a direct
+broker address. Run a dedicated broker on an enrolled machine, then configure
+plotting hosts and workers to use it:
+
+```bash
+# Dedicated machine; default TCP port 18444:
+xchplot2 compute broker
+# On participating machines:
+xchplot2 compute configure --broker 192.168.1.10:18444
+# Return a plotting host to an embedded broker per job:
+xchplot2 compute configure --broker auto
+```
+
+`compute worker --broker HOST:PORT` can repeat direct addresses and also
+browse discovered brokers. `--discovery off` disables discovery; a standalone
+worker then needs a direct broker. Broker and worker `--listen` / `--advertise`
+options override saved listener settings. Save predictable ports with
+`compute configure --broker-port 18444 --worker-port 18445`, then restart
+the affected services. The worker port also applies to a plotting job's local
+executor. Changing a local dedicated broker port updates its matching saved
+loopback route. Update explicit routes on remote machines to use the new port.
+Older compute profiles default to TCP 18444 for the broker and an available
+port for the worker. Set `--worker-port 0` to select an available worker port.
+Embedded per-job brokers choose available ports. Use a persistent broker
+when a firewall rule requires a fixed port.
+The current build reads older compute profiles automatically. Newly saved
+profiles include listener ports and require a build that supports them.
+
+On a host with separate management and plotting links, the broker handles
+leases. The plotting host connects to the worker's advertised address for
+plot data. For example, with `10.10.10.2` on the plotting host and
+`10.10.10.1` on the GPU worker, these commands use the dedicated link.
+
+```bash
+# Plotting host
+xchplot2 compute broker --listen 10.10.10.2:18444 --discovery off
+# GPU worker
+xchplot2 compute worker --broker 10.10.10.2:18444 --listen 10.10.10.1:18445 \
+  --advertise 10.10.10.1:18445 --discovery off --backend gpu
+```
+
+Use `--compute-broker 10.10.10.2:18444` on the plotting job. An existing
+broker can also stay on its management address. In that case use its address
+for both broker options and keep the worker listener and advertisement on
+the dedicated link. The plotting host must be able to reach the advertised
+worker port.
+
+Firewalls must permit the chosen TCP listeners and UDP 5353 when discovery is
+enabled. On each machine, `compute firewall` prints commands for its saved
+ports, inbound role (`broker`, `worker`, or `both`) and the peer addresses or
+LAN subnet you permit.
+
+```bash
+# Broker host with its LAN interface in the FedoraServer zone
+xchplot2 compute firewall --firewall firewalld --zone FedoraServer --role broker --from 192.168.1.0/24
+# Helper host using UFW on enp3s0
+xchplot2 compute firewall --firewall ufw --interface enp3s0 --role worker --from 192.168.1.0/24
+```
+
+Review and run the printed commands locally. The firewalld commands add both
+runtime and permanent rules. The UFW commands use the selected or saved
+interfaces. Use `--discovery off` for direct routes without mDNS, and repeat
+`--from` for additional IPv4 or IPv6 peers. Use `firewall-cmd --get-active-zones`
+to find the zone assigned to the LAN interface. Select the VPN interface when
+allowing connections over a VPN. For rule management, see the
+[firewalld rich-rule reference](https://firewalld.org/documentation/man-pages/firewalld.richlanguage.html)
+and [UFW manual](https://manpages.ubuntu.com/manpages/jammy/man8/ufw.8.html).
+
+The saved setup is in `$XDG_CONFIG_HOME/xchplot2/compute`, falling back to
+`$HOME/.config/xchplot2/compute`; Windows instead defaults to
+`%LOCALAPPDATA%\xchplot2\compute` when `XDG_CONFIG_HOME` is unset.
+`compute ... --directory DIR` or plotting's
+`--compute-directory DIR` selects another setup. Preserve it for recovery:
+the stable node identity scopes fixed seeds, so the same supplied seed on two
+enrolled plotting machines creates different plot identities. Private saved
+manifests can be resumed directly with `batch` without re-deriving keys.
+Old ordinary manifests continue to use their original engine; use
+`plot --compute off --resume` when resuming one after enrollment.
+
+### Overrides and interruption
+
+`--compute off` disables automatic sharing for a plotting command.
+`--compute-local off` uses pool workers without offering local capacity.
+`--compute-broker HOST:PORT` overrides the saved broker for one job.
+Advanced direct connections can still supply `--compute-owner-id`,
+`--compute-ca`, `--compute-cert` and `--compute-key`; the broker and worker
+help list their corresponding TLS flags. No enrollment files are needed for
+that explicit interface. It does not keep a signed membership registry or
+propagate policy updates; use saved enrollment for managed revocation and
+renewal. An enrolled peer still applies its own policy to direct connections.
+
+`--compute-owner-id ID` also overrides an enrolled machine's storage-owner
+namespace and keeps a stable broker owner for the broker's `--owner-share ID:WEIGHT`
+setting. Use a distinct explicit ID for each concurrent job. Without this
+override, automatic jobs get separate temporary broker owners while retaining
+the machine's stable key namespace.
+
+`--compute-inflight N` bounds outstanding work, `--compute-codec-ram auto|SIZE`
+controls the optional encoding partition (`0` disables it), and
+`--compute-timeout-ms N` / `--compute-socket-timeout-ms N` bound task and socket
+waits. The defaults are one hour per task and 30 seconds per socket operation.
+`--compute-frame-bytes SIZE` bounds each transport frame. Local offer overrides
+are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
+`--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
+lists standalone task, thread, window and transport limits.
+Optional encoding probes back off after repeated failures while local encoding
+continues. When a window spans several network requests, the owner compares
+local encoding with each worker's total time per byte across its share of that
+window. Plotting JSON distinguishes calibration attempts, declined or failed
+codec windows and unavailable windows, and retains the latest bounded failure
+message in `pool_codec_last_failure`. These counters are separate from completed
+generation tasks.
+
+Workers may arrive or leave while jobs run. Lost or expired work is retried
+without publishing incomplete results. Available local compute permits
+fallback during broker outages. A storage-only job waits within its task
+deadline, then reports failure while preserving recovery state. Broker
+restarts fence old leases; plot commits remain on their storage owners.
+Stopping a job also stops any broker and executor it owns. Other local jobs
+can take over the executor and retry unfinished work.
+
+### Membership renewal and revocation
+
+Enrollment files and invitations use owner-only permissions. The pool creator
+holds the signing authority. Inspect its registry and revoke a stable node ID:
+
+```bash
+xchplot2 compute members
+xchplot2 compute revoke NODE_ID
+xchplot2 compute policy-export pool.policy
+```
+
+Revocation applies to that node, including replacement certificates. Signed
+policy updates propagate over authenticated connections and are checked on
+existing connections before further operations. Disconnected members cannot
+learn a new revocation until they reconnect or import the policy with
+`compute policy-import pool.policy`. Distribute it to every remaining member
+when excluding a machine. The registry holds up to 1024 stable nodes. Members
+created by an older build may be absent from the registry until renewal;
+the authority can still revoke their node IDs explicitly.
+
+To rotate a machine's certificate while preserving its node ID and seeded
+plot namespace, run these commands on the indicated machines:
+
+```bash
+# Machine being renewed:
+xchplot2 compute renew-request machine.request
+# Pool creator, after receiving that request:
+xchplot2 compute renew-sign machine.request machine.replacement
+# Original machine, after receiving the replacement:
+xchplot2 compute renew-import machine.replacement
+```
+
+Restart the renewed machine's services to use the new credentials. Repeat the
+same command and file paths if interrupted; renewal retains the pending key
+and signed response for recovery. Certificates last at most one year and
+cannot outlive the pool authority. An expired leaf can be renewed while the
+saved private key and authority remain valid. The authority lasts ten years;
+its expiry or loss of its signing key requires a new pool and re-enrollment.
+Lost machine credentials also require re-enrollment unless a private backup
+is available. Keep plot manifests for recovery of existing output identities.
 
 ## Configuration and argument files
 
@@ -134,7 +2090,8 @@ strings and `#` or `;` comments. Arrays, nested tables, and multiline strings
 are unsupported.
 
 Use long option names without `--`. `[defaults]` applies to every command;
-a section such as `[plot]` or `[bench]` overrides those defaults. Explicit
+a section such as `[plot]`, `[fill]` or `[bench]` overrides those defaults.
+Compute service sections use `[compute.broker]` and `[compute.worker]`. Explicit
 command-line flags override the same options from the file. Put options
 that only apply to one command in that command's section:
 
@@ -183,37 +2140,42 @@ Later flags override earlier values. `@~/bench.args` expands the leading
 `~/` in the argument-file path. Inside the file, `#` starts a comment;
 shell quoting, variable expansion, and nested argument files are unsupported.
 Use the configuration file or directly quoted CLI arguments for paths with
-spaces. Pass `--config` directly on the command line, not inside an argument file.
+spaces. For `plan` and `fill` destination lists, use
+[`--paths-from` or `--paths0-from`](#grouped-plotting-and-drive-filling).
+Pass `--config` directly on the command line, not inside an argument file.
 
 ## Plot indices and meta groups
 
 Both are v2 PoS fields and default to 0. `plot -n N` writes N independent
-single-member `.gplot` groups with fresh keys, each at member index 0.
+`.gplot` groups with fresh keys. `--group-members M` chooses M members per
+file; every file starts at member index zero.
 `--seed` and saved-job resume preserve those identities. The meta group (u8)
 selects a challenge-isolation boundary. Every member of a group shares its
 group ID and memo; its ID is SHA-256 of `group_id || u16_be(index) || meta_group`.
 
 The official version 2 format from
 [pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118)
-stores a group size and assumes member indices start at zero. The
+stores a group size and assumes member indices start at zero. Installed
+`plot`, `fill` and `grow` commands write this ordinary format. The separate
 [experimental grouped-job runner](contrib/pos2-pr118/README.md#experimental-grouped-jobs)
-assembles multiple members with shared keys. Its `--files` and nonzero
-`--plot-index` support still require the explicitly marked 0x82 reader
-extension, which unmodified upstream readers cannot read.
+retains shared-ID files with nonzero starting indices. Those files require
+the explicitly marked 0x82 reader extension, which unmodified upstream
+readers cannot read.
 
 PoS2 1.0 changes the Feistel cipher as well as the file format. Old raw plots,
 earlier experimental groups, and saved jobs require replotting; renaming or
 rewriting their headers is insufficient. `--testnet` / `-T` are rejected:
 PoS2 no longer has a separate testnet Xs hash. Both pool modes now use the
 V2 taproot derivation in
-[chia-blockchain PR #21484](https://github.com/Chia-Network/chia-blockchain/pull/21484).
-That farmer-side integration is pending, so format/proof interoperability
-does not establish compatibility with a released farmer.
+[chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500).
+[Farmer plot-group integration](https://github.com/Chia-Network/chia-blockchain/pull/21566)
+merged on 2026-10-28. Development integration and format/proof interoperability
+do not establish support in a released farmer or network activation.
 
 ## Devices and CPU workers
 
-`xchplot2 devices` lists the IDs accepted by `--devices`. With no selection,
-plotting uses one GPU. CPU plotting is opt-in and uses pos2-chip's CPU
+`xchplot2 devices` lists the IDs accepted by `--devices`. Without an enrolled
+compute pool or grouped construction, plotting uses one GPU by default. CPU plotting is opt-in and uses pos2-chip's CPU
 implementation. Combine selectors with commas:
 
 | Selector | Workers |
@@ -268,8 +2230,8 @@ grep -h Cpus_allowed_list /proc/$(pgrep -n xchplot2)/task/*/status | sort | uniq
 
 ### Batch completion and worker rates
 
-Multi-worker jobs report each worker's rate and suggested batch sizes that
-reduce idle time at the end. A tail guard stops a slower worker from starting
+With `-v`, multi-worker jobs report each worker's rate and suggested batch
+sizes that reduce idle time at the end. A tail guard stops a slower worker from starting
 a plot when faster workers are expected to finish the remaining queue sooner.
 It applies to CPUs and GPUs. `XCHPLOT2_TAIL_GUARD=0` disables the guard.
 Rate estimates and already-running plots can still leave a tail.
@@ -334,9 +2296,10 @@ deprecated no-op alias because peer transport is already the default.
 ## Benchmarking
 
 `bench` measures how fast your hardware plots by writing synthetic
-unfarmable `.gplot` files (random group IDs, no keys), then reports
-steady-state throughput in TiB/s, TiB/hour, TiB/day, and TiB/month
-(30-day basis):
+unfarmable `.gplot` files (random group IDs, no keys). The default report shows
+seconds per plot, TiB/hour and a write-time estimate. `-v` adds TiB/s, TiB/day,
+TiB/month (30-day basis) and detailed measurements. Use k28 to measure farming
+throughput; smaller sizes report test-size results:
 
 ```bash
 # Quick smoke (k=18 finishes in seconds on most GPUs)
@@ -355,9 +2318,9 @@ xchplot2 bench -k 28 -o /scratch --compute-only
 | `-n N`, `--num N` | Measured plot count used to size the queue; default 10 |
 | `--warmup W` | Initial completions excluded per worker; default 1 |
 | `-o DIR`, `--out DIR` | Directory for real output writes; default current directory |
-| `--devices SPEC`, `--cpu`, `--cpu-workers N` | Select the [devices and CPU workers](#devices-and-cpu-workers) to measure |
+| `-d`/`--devices SPEC`, `--cpu`, `--cpu-workers N` | Select the [devices and CPU workers](#devices-and-cpu-workers) to measure |
 | `--tier T` | Force a [streaming tier](#memory-requirements), even when the pool fits |
-| `--max-host-ram SIZE`, `--temp-dir DIR`, `--no-auto-spill` | Use the normal [host memory and spill policy](#host-ram-and-disk-offload) |
+| `-M`/`--max-host-ram SIZE`, `-t`/`--temp-dir DIR`, `--no-auto-spill` | Use the normal [host memory and spill policy](#host-ram-and-disk-offload) |
 | `--keep` | Retain synthetic output files on disk for inspection |
 | `--json` | Also emit a JSON report to stdout for saving or comparing runs |
 | `--compute-only` | Add a second pass using RAM-backed output when available |
@@ -366,8 +2329,8 @@ xchplot2 bench -k 28 -o /scratch --compute-only
 
 The queue contains `(warmup + num) × workers` plots. Faster workers can
 complete more of that queue; `-n` does not guarantee equal per-worker counts.
-Each worker's warmup is excluded separately, and the report shows the
-steady-state window and per-worker rates. Increase `-n` if a short run
+Each worker's warmup is excluded separately. `-v` adds the steady-state
+window and detailed per-worker measurements to the report. Increase `-n` if a short run
 cannot measure a slower worker.
 
 Every pass includes FSE compression and real file writes. The second
@@ -402,6 +2365,14 @@ Minimal, and Tiny. Pinned is a separate manual tier, not a smaller automatic fal
 The owning driver supplies free VRAM after context creation. A missing
 reading or insufficient `peak + buffer` causes refusal before allocation.
 
+Integrated Intel GPUs share host memory. Admission uses the driver's free
+host-memory reading, bounded by physical host RAM and the runtime's allocation
+cap. CPU allocations and cache activity affect those counters, so they cannot
+measure dedicated GPU memory use. `POS2GPU_ASSERT_VRAM=1` is unavailable on
+these devices; use `POS2GPU_ASSERT_VRAM=0` for throughput benchmarks. CPU byte
+parity and full-proof checks still apply to plotting correctness.
+See the [integrated Intel limitation](#troubleshooting) before production use.
+
 The streaming base peaks below come from [VramBudget.hpp](src/host/VramBudget.hpp).
 They are allocation models, not the desktop driver deltas or host RSS in
 [BENCHMARKS.md](BENCHMARKS.md#gpu-results).
@@ -425,11 +2396,10 @@ memory throughout the run and fails if use exceeds the budget.
 `POS2GPU_VRAM_MARGIN_MB` changes the buffer; desktop activity may need more
 than the default. Models scale with k.
 
-Lower VRAM tiers generally need more host RAM. Use the current per-tier
-[host RSS measurements](BENCHMARKS.md#gpu-results) for
-planning, with room for the OS and other workers. Host admission uses a
-separate model of pinned and anonymous memory, plus a reserve. Eligible
-storage can be moved to disk when that model does not fit.
+Lower VRAM tiers generally need more host RAM. Set `--max-host-ram` to leave
+room for the OS and other workers; see [host RAM and disk-offload](#host-ram-and-disk-offload).
+Host admission uses a separate model of pinned and anonymous memory, plus a
+reserve. Eligible storage can be moved to disk when that model does not fit.
 
 Memory quantities in this guide use MiB/GiB. Environment names ending in
 `_MB` take MiB counts; existing diagnostic output may label them `MB`.
@@ -519,6 +2489,8 @@ This accepts a 64-character hex group ID and derives its member ID. It uses CPU 
 prints phase timings. Use `-m` / `--memo HEX`, `-o` / `--out DIR`,
 `-N` / `--out-name NAME` for output parameters. `--raw` writes a temporary
 raw member and allows indices 0..65535; group output requires index 0.
+Use `-v`/`--verbose` for diagnostics; the positional verbose argument remains
+supported, with an explicit flag taking precedence.
 The [CPU-reference fixture](CONTRIBUTING.md#building-and-running-tests)
 shows a matching group-ID test and GPU batch. Arbitrary IDs and memos do not
 produce farmable plots.
@@ -542,7 +2514,8 @@ xchplot2 parity-check --dir build/tools/parity
 ```
 
 Runs the available `*_parity` and `*_test` executables, prints each result
-and failure output, and returns nonzero if a test fails. The default
+and failure output, and returns nonzero if a test fails. `-v` includes timings
+and output from successful tests; `-q` retains the final counts and failures. The default
 directory is `./build/tools/parity`. Build the tests first; see
 [CONTRIBUTING.md](CONTRIBUTING.md#building-and-running-tests) for CMake,
 CTest, hardware requirements, and CPU-reference byte comparisons.
@@ -594,6 +2567,10 @@ common commands and options; use this reference for the complete command guide.
   the floor the spill can reach, so if it says the gap cannot be
   closed, the box genuinely needs more RAM for that card. See [Host RAM
   and disk-offload](#host-ram-and-disk-offload).
+
+- **Integrated Intel Level Zero plotting**: this path can produce invalid
+  plots and is not supported for production. Use `--devices cpu` on these
+  systems.
 
 - **Intel Arc B580 sort hangs**: on Fedora 44 with AdaptiveCpp 25.10 and
   Intel compute-runtime 26.22, disable direct submission. Apply the workaround to the plotting process:
@@ -672,7 +2649,7 @@ common commands and options; use this reference for the complete command guide.
 | `POS2GPU_ASSERT_VRAM=1` | Fail when the watchdog's sampled device-wide decrease in free VRAM exceeds the declared budget, including its margin. Other processes can affect this measurement; repeat on an idle GPU before attributing a failure to the model. Armed by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
-| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
+| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr. The [group construction engine](#construction-and-recovery) also reports output transfers, host CPU time and controller waits. Diagnostic synchronization can change overlap; these are not kernel-busy measurements. |
 | `ACPP_GFX=gfxXXXX` | AMD container AOT target; Cargo detects the GPU separately. See [AMD target selection](INSTALL.md#amd-target-selection). |
 | `ACPP_TARGETS=...` | Override Cargo target selection, such as `generic` or `hip:gfx1031`. For direct CMake use `-DACPP_TARGETS=...`. |
 | `CUDA_ARCHITECTURES=89`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |

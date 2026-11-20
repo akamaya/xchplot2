@@ -11,6 +11,7 @@
 // pos2-chip.
 
 #include "host/PlotFileWriterParallel.hpp"
+#include "host/BoundedProofSampling.hpp"
 #include "host/BatchPlotter.hpp"
 
 #include "gpu/AsyncErrorLog.hpp"   // async_error_count / first_async_error
@@ -30,13 +31,17 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
 #include <mutex>
+#include <limits>
+#include <optional>
 #include <queue>
 #include <random>
 #include <stdexcept>
@@ -658,6 +663,287 @@ VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool
         if (count) ++res.challenges_with_proof;
     }
     return res;
+}
+
+namespace {
+uint64_t calibration_add(uint64_t left, uint64_t right)
+{
+    if (right > UINT64_MAX - left) throw std::runtime_error("calibration byte or timing count overflow");
+    return left + right;
+}
+uint64_t calibration_product(uint64_t count, uint64_t width)
+{
+    if (width && count > UINT64_MAX / width) throw std::runtime_error("calibration allocation bound overflow");
+    return count * width;
+}
+std::optional<uint64_t> calibration_cpu_now()
+{
+#ifdef _WIN32
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!::GetThreadTimes(::GetCurrentThread(), &created, &exited, &kernel, &user)) return {};
+    ULARGE_INTEGER k{}, u{}; k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+    return calibration_product(calibration_add(k.QuadPart, u.QuadPart), 100);
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec value{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) || value.tv_sec < 0 || value.tv_nsec < 0) return {};
+    return calibration_add(calibration_product(uint64_t(value.tv_sec), 1000000000), uint64_t(value.tv_nsec));
+#else
+    return {};
+#endif
+}
+template <typename Operation>
+uint64_t calibration_measure(ReaderCalibrationPhase& phase, Operation&& operation)
+{
+    auto const cpu_begin = calibration_cpu_now();
+    auto const begin = std::chrono::steady_clock::now();
+    operation();
+    auto const wall = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin).count());
+    auto const cpu_end = calibration_cpu_now();
+    ++phase.calls; phase.wall_ns = calibration_add(phase.wall_ns, wall);
+    phase.max_wall_ns = std::max(phase.max_wall_ns, wall);
+    if (!cpu_begin || !cpu_end || *cpu_end < *cpu_begin) phase.cpu_measured = false;
+    else
+    {
+        auto const cpu = *cpu_end - *cpu_begin;
+        phase.cpu_ns = calibration_add(phase.cpu_ns, cpu); phase.max_cpu_ns = std::max(phase.max_cpu_ns, cpu);
+    }
+    return wall;
+}
+struct CanonicalGroupIndex
+{
+    PlotGroupFile::Header header{};
+    std::vector<uint64_t> offsets;
+    uint64_t chunks = 0, index_bytes = 0, largest_chunk_bytes = 0;
+};
+CanonicalGroupIndex read_canonical_group_index(std::string const& filename, uint64_t memory_bytes,
+    std::function<void()> const& check_cancelled)
+{
+    auto require = [](bool condition, char const* message)
+    { if (!condition) throw std::runtime_error(message); };
+    auto room = [&](uint64_t bytes)
+    { require(bytes <= memory_bytes && bytes <= SIZE_MAX, "group index buffers exceed the worker memory cap"); };
+    if (check_cancelled) check_cancelled();
+    CanonicalGroupIndex index; auto& header = index.header; auto& offsets = index.offsets;
+    constexpr uint64_t fixed_bytes = 1024 * 1024;
+    std::ifstream input(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())), std::ios::binary);
+    input.exceptions(std::ios::failbit | std::ios::badbit);
+    input.read(reinterpret_cast<char*>(&header), sizeof(header));
+    require(header.magic == PlotGroupFile::MAGIC && header.version == PlotGroupFile::FORMAT_VERSION && header.group_size,
+        "verification requires a complete ordinary v2 group");
+    PlotProofParams::validate_input_args(header.k, header.strength);
+    require(header.k >= 18 && header.k <= 28 && !(header.k & 1), "unsupported verification plot k");
+    uint64_t const begin = sizeof(header) + header.memo_length;
+    auto const size = std::filesystem::file_size(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())));
+
+    index.chunks = PlotGroupFile::getChunkCountForK(header.k);
+    require(header.chunk_index_offset >= begin && header.chunk_index_offset < size &&
+        size - header.chunk_index_offset <= calibration_product(index.chunks, 16), "invalid group index bounds");
+    index.index_bytes = size - header.chunk_index_offset;
+    // Covers packed input, decoded offsets and canonical re-encoding's
+    // vector growth, then the retained offsets beside the actual reader.
+    room(calibration_add(fixed_bytes, calibration_add(index.index_bytes, calibration_product(index.chunks, 32))));
+    std::vector<uint64_t> packed(size_t((index.index_bytes + 7) / 8));
+    offsets.resize(size_t(index.chunks));
+    input.seekg(std::streamoff(header.chunk_index_offset));
+    input.read(reinterpret_cast<char*>(packed.data()), std::streamsize(index.index_bytes));
+    BitReader bits(packed, size_t(index.index_bytes * 8));
+    gsz_decode(offsets, header.group_size, bits);
+    uint64_t end = begin;
+    auto const expected = gsz_expected_for_g(header.group_size);
+    unsigned const rice = unsigned(gsz_rice_k_for_g(header.group_size));
+    require(rice < 63, "invalid group index parameter");
+    for (auto bytes : offsets)
+    {
+        require(bytes && bytes <= header.chunk_index_offset - end, "group index does not cover payload");
+        auto const magnitude = bytes < expected ? expected - bytes : bytes - expected;
+        require((magnitude >> rice) <= 62 - rice, "group index code exceeds its bound");
+        index.largest_chunk_bytes = std::max(index.largest_chunk_bytes, bytes); end += bytes;
+    }
+    require(end == header.chunk_index_offset, "group index does not cover payload");
+    BitWriter canonical; gsz_encode(offsets, header.group_size, canonical);
+    auto const encoded = canonical.asBytes();
+    require(encoded.size() == index.index_bytes && std::equal(encoded.begin(), encoded.end(),
+        reinterpret_cast<uint8_t const*>(packed.data())), "group plot has a noncanonical index or unfinished tail");
+    uint64_t offset = begin;
+    for (auto& bytes : offsets) { auto const next = offset + bytes; bytes = offset; offset = next; }
+    if (check_cancelled) check_cancelled();
+    return index;
+}
+} // namespace
+
+void check_plot_file_structure_bounded(std::string const& filename, uint64_t memory_bytes,
+    std::function<void()> const& check_cancelled)
+{
+    if (!memory_bytes) throw std::invalid_argument("invalid structural plot verification memory cap");
+    (void)read_canonical_group_index(filename, memory_bytes, check_cancelled);
+}
+
+VerifyResult verify_plot_file_bounded(std::string const& filename, BoundedVerifyBudget const& budget,
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled, unsigned cpu_threads)
+{
+    if (!budget.max_challenges || !budget.full_proofs || budget.full_proofs > budget.max_challenges)
+        throw std::invalid_argument("invalid bounded plot verification challenge or solve budget");
+    if (check_cancelled) check_cancelled();
+    // Release the shared structural probe before the reader allocates its index.
+    {
+        auto const index = read_canonical_group_index(filename, memory_bytes, check_cancelled);
+        auto const index_memory = calibration_add(index.index_bytes, calibration_product(index.chunks, 32));
+        auto const sets_memory = calibration_product(NUM_CHALLENGE_SETS, calibration_add(
+            calibration_product(index.largest_chunk_bytes, 24),
+            calibration_product(index.header.group_size, sizeof(std::vector<ProofFragment>))));
+        if (calibration_add(1024 * 1024, calibration_add(index_memory, sets_memory)) > memory_bytes)
+            throw std::runtime_error("group reader buffers exceed the worker memory cap");
+    }
+    GroupProver group(filename);
+    auto const& info = group.getPlotGroup().getInfo();
+    PlotGroupParams const params(info.group_id, info.k, info.strength, info.meta_group);
+    std::random_device entropy;
+    std::mt19937_64 random(entropy());
+    return verification_detail::sample(budget, random,
+        [&](auto const& challenge) { return group.prove(challenge); },
+        [&](auto const& challenge, auto const& member, auto const& chain)
+        {
+            auto const member_params = params.get_plot_params_for_index(member.plot_index);
+            ProofFragmentCodec codec(member_params);
+            std::array<uint32_t, TOTAL_T1_PAIRS_IN_PROOF> x_bits{};
+            size_t index = 0;
+            for (auto fragment : chain.chain_links)
+                for (auto x : codec.get_x_bits_from_proof_fragment(fragment)) x_bits.at(index++) = x;
+            if (index != x_bits.size()) throw std::runtime_error("Sampled quality chain has an invalid proof width");
+            if (check_cancelled) check_cancelled();
+            Solver solver(member_params, cpu_threads ? cpu_threads : std::thread::hardware_concurrency());
+            ProofValidator validator(params, member.plot_index);
+            for (auto const& proof : solver.solve(x_bits)) {
+                if (check_cancelled) check_cancelled();
+                auto const links = validator.validate_full_proof(proof, challenge);
+                if (links && *links == chain.chain_links) return;
+            }
+            throw std::runtime_error("Sampled quality chain has no valid full proof");
+        }, check_cancelled);
+}
+
+ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint64_t samples,
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled)
+{
+    if (!samples || samples > 1024 || !memory_bytes)
+        throw std::invalid_argument("invalid reader calibration sample count or memory cap");
+    auto require = [](bool condition, char const* message)
+    { if (!condition) throw std::runtime_error(message); };
+    auto room = [&](uint64_t bytes)
+    { require(bytes <= memory_bytes && bytes <= SIZE_MAX, "reader calibration buffers exceed the worker memory cap"); };
+    auto check = [&] { if (check_cancelled) check_cancelled(); };
+    check(); ReaderCalibrationResult result;
+    PlotGroupFile::Header header{};
+    std::vector<uint64_t> offsets;
+    constexpr uint64_t fixed_bytes = 1024 * 1024;
+    calibration_measure(result.index_probe, [&]
+    {
+        auto index = read_canonical_group_index(filename, memory_bytes, check_cancelled);
+        header = index.header; offsets = std::move(index.offsets);
+        result.k = header.k; result.strength = header.strength; result.members = header.group_size;
+        result.chunks = index.chunks; result.index_bytes = index.index_bytes; result.largest_chunk_bytes = index.largest_chunk_bytes;
+    });
+    result.index_probe.logical_requested_bytes = calibration_add(sizeof(header), result.index_bytes);
+    // The same per-chunk encoded-size bound used by the reference verifier,
+    // retained across every selected set. Chainer itself is bounded by the OS
+    // worker cap/deadline, not by average or sampled fragment counts.
+    auto const index_memory = calibration_add(result.index_bytes, calibration_product(result.chunks, 32));
+    auto const sets_memory = calibration_product(NUM_CHALLENGE_SETS, calibration_add(
+        calibration_product(result.largest_chunk_bytes, 24),
+        calibration_product(header.group_size, sizeof(std::vector<ProofFragment>))));
+    room(calibration_add(fixed_bytes, calibration_add(index_memory, sets_memory)));
+    std::vector<uint8_t> transfer(65536);
+    std::ifstream storage(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())), std::ios::binary);
+    storage.exceptions(std::ios::failbit | std::ios::badbit);
+    std::mt19937_64 fresh_random(0), retained_random(1);
+    auto next_challenge = [](std::mt19937_64& random)
+    {
+        std::array<uint8_t, 32> value{};
+        for (size_t i = 0; i < value.size(); i += sizeof(uint64_t))
+        { auto const word = random(); std::memcpy(value.data() + i, &word, sizeof(word)); }
+        return value;
+    };
+    // At most 16 KiB of samples inside the fixed worker reservation.
+    std::vector<uint64_t> fresh_times(samples), distinct_times(samples);
+    uint64_t const range_per_chunk = uint64_t(1) << (header.k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+    auto requested_bytes = [&](auto const& selected)
+    {
+        uint64_t requested = 0;
+        for (auto const& range : selected.fragment_set_ranges)
+        {
+            require(range.end > range.start, "invalid calibration challenge range");
+            auto const first = range.start / range_per_chunk, last = (range.end - 1) / range_per_chunk;
+            require(last < result.chunks, "calibration challenge range exceeds plot");
+            for (auto chunk = first; chunk <= last; ++chunk)
+            {
+                auto const end = chunk + 1 == result.chunks ? header.chunk_index_offset : offsets[size_t(chunk + 1)];
+                requested = calibration_add(requested, end - offsets[size_t(chunk)]);
+            }
+        }
+        return requested;
+    };
+    for (uint64_t sample = 0; sample < samples; ++sample)
+    {
+        check();
+        auto const challenge = next_challenge(fresh_random);
+        std::unique_ptr<GroupProver> prover;
+        auto const open_ns = calibration_measure(result.fresh_open, [&] { prover = std::make_unique<GroupProver>(filename); });
+        result.fresh_open.logical_requested_bytes = calibration_add(result.fresh_open.logical_requested_bytes, sizeof(header));
+        auto const params = prover->getPlotGroup().getGroupProofParams();
+        auto const selected = ChallengeSetSelector::selectChallengeSets(params, challenge);
+        auto const requested = requested_bytes(selected);
+        std::vector<PlotQualityChains> qualities;
+        fresh_times[sample] = calibration_add(open_ns, calibration_measure(result.first_lookup, [&] { qualities = prover->prove(challenge); }));
+        result.first_lookup.logical_requested_bytes = calibration_add(result.first_lookup.logical_requested_bytes,
+            calibration_add(requested, result.index_bytes));
+        qualities.clear(); qualities.shrink_to_fit();
+        check();
+        calibration_measure(result.retained_lookup, [&] { qualities = prover->prove(challenge); });
+        result.retained_lookup.logical_requested_bytes = calibration_add(result.retained_lookup.logical_requested_bytes, requested);
+        for (auto const& member : qualities) result.quality_chains = calibration_add(result.quality_chains, member.quality_chains.size());
+        qualities.clear(); qualities.shrink_to_fit();
+        check();
+        auto const distinct = next_challenge(retained_random);
+        auto const distinct_bytes = requested_bytes(ChallengeSetSelector::selectChallengeSets(params, distinct));
+        distinct_times[sample] = calibration_measure(result.distinct_lookup, [&] { qualities = prover->prove(distinct); });
+        result.distinct_lookup.logical_requested_bytes = calibration_add(result.distinct_lookup.logical_requested_bytes, distinct_bytes);
+        qualities.clear(); qualities.shrink_to_fit(); prover.reset();
+        result.logical_lookup_bytes = calibration_add(result.logical_lookup_bytes,
+            calibration_add(calibration_product(requested, 2), distinct_bytes));
+        // Independent read-only storage observations retain repeated requests
+        // across ranges. OS caching is deliberately left uncontrolled.
+        for (auto const& range : selected.fragment_set_ranges)
+        {
+            auto const first = range.start / range_per_chunk, last = (range.end - 1) / range_per_chunk;
+            for (auto chunk = first; chunk <= last; ++chunk)
+            {
+                check(); auto const offset = offsets[size_t(chunk)];
+                auto const end = chunk + 1 == result.chunks ? header.chunk_index_offset : offsets[size_t(chunk + 1)];
+                calibration_measure(result.storage_reads, [&]
+                {
+                    storage.seekg(std::streamoff(offset));
+                    for (auto remaining = end - offset; remaining;)
+                    {
+                        auto const bytes = std::min<uint64_t>(remaining, transfer.size());
+                        storage.read(reinterpret_cast<char*>(transfer.data()), std::streamsize(bytes)); remaining -= bytes;
+                    }
+                });
+                result.storage_bytes = calibration_add(result.storage_bytes, end - offset);
+                result.storage_reads.logical_requested_bytes = result.storage_bytes;
+            }
+        }
+        ++result.samples;
+    }
+    auto distribution = [](std::vector<uint64_t>& times)
+    {
+        std::sort(times.begin(), times.end());
+        auto rank = [&](size_t percent) { return times[(times.size() * percent - 1) / 100]; };
+        return ReaderCalibrationLatency{rank(50), rank(95), rank(99), times.back()};
+    };
+    result.fresh_latency = distribution(fresh_times); result.distinct_latency = distribution(distinct_times);
+    check(); return result;
 }
 
 std::vector<uint64_t> read_plot_file_fragments(std::string const& filename)

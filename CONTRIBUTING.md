@@ -27,12 +27,52 @@ and accepts `thread` or `address` for sanitizer runs.
 `xchplot2 parity-check --dir build/tools/parity` runs the available
 `*_parity` and `*_test` executables and reports each failure's output.
 
+Construction and compute fixtures use the same CMake test definitions in the
+independent CPU reference build. They need a C++20 compiler, CMake, Git, Cargo,
+and OpenSSL 3 development headers; no GPU toolchain is required:
+
+```bash
+cmake -S contrib/pos2-pr118 -B build-group-tests -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON -DXCHPLOT2_BUILD_GROUP_POOL=ON
+cmake --build build-group-tests --parallel 2
+ctest --test-dir build-group-tests --output-on-failure --no-tests=error --timeout 900
+```
+
+This Linux suite covers construction, crash recovery, cross-build checkpoints,
+compute admission, and authenticated loopback worker/membership operations.
+
 The parity binaries under `tools/parity/` are the correctness gate:
 
 - AES, Xs, T1, T2, and T3 tests check agreement with pos2-chip's CPU reference.
 - Backend-specific sort and bucket tests cover vendor kernels and scratch.
 - `plot_file_parity` covers the writer/reader round-trip.
 - Host tests cover memory budgets, spill storage, recovery, and reporting.
+
+Farming plan compatibility uses its schema, farming model and key-derivation
+identities with matching numeric representation; the
+recorded source build is provenance for new plans. Bump the schema for
+incompatible saved-policy or plan-format changes,
+the model identity when assessment semantics change, and the key-derivation
+identity when owner/seed derivation, family/meta schedules or group-key
+derivation changes. Keep existing plan bytes and parent digests stable when
+loading compatible records. New construction checkpoints use explicit format,
+algorithm and native-representation identities; bump the affected identity when
+its recovery contract changes. Retain the original producer build as provenance.
+Cross-build recovery fixtures must cover interrupted construction and compare
+completed output with the pinned CPU reference. Legacy plans and checkpoints
+retain their original exact-build requirement, including after a compatible
+reader saves them again.
+
+Compute compatibility uses explicit identities in
+`src/host/ComputeCompatibility.cpp`. Bump `pool::protocol_version` for wire-format
+changes, the task identity for task semantics, the generation identity for
+canonical CPU/GPU output, the codec identity for chunk encoding/join behavior,
+and the representation identity for packed-field interpretation. Generation
+also depends on the codec contract because it can produce coencoded
+contributions. Source hashes identify producer provenance, not eligibility;
+resource profiles and supported task kinds are negotiated separately. The
+compatibility fixture independently links differing producer/contract variants,
+checks real generation/codec parity, and rejects incompatible leases.
 
 Kernel, sort, and plot-format changes must pass parity at k=22 and k=28.
 Output bytes must remain identical to the pinned CPU reference. The
@@ -72,6 +112,12 @@ src/host/
 ├── GpuBufferPool         persistent device buffers and host drain slots
 ├── BatchPlotter          workers, memory admission, and writer queues
 ├── BatchManifest         saved identities and recovery manifests
+├── GroupPlotter          group construction, drive scheduling and recovery
+├── GroupFarming          farming layout and admission model
+├── ComputePool/Worker    broker leases and globally bounded executors
+├── ComputeSession        automatic job services and saved pool membership
+├── ComputeIdentity       enrollment, signed membership policy and renewal
+├── GroupFile             native allocation, positioned I/O and recovery locks
 └── PlotFileWriterParallel  CPU reference boundary, writer, and verification
 tools/xchplot2/           CLI and shell completions
 tools/parity/             parity and host tests
@@ -93,13 +139,43 @@ The user-facing tier models are in [REFERENCE.md](REFERENCE.md#memory-requiremen
 Measured throughput and memory use are in
 [BENCHMARKS.md](BENCHMARKS.md).
 
+## CI workflows
+
+Keep each workflow focused on its own checks:
+
+| Workflow | Purpose |
+| --- | --- |
+| `CI` | Lint, documentation, Rust, host C++ tests with sanitizers, CPU construction and compute tests, Python harness checks, and container-installer fixtures |
+| `arch-matrix` | Compile CUDA objects for sm_86, sm_89 and sm_120; the installation containers cover sm_61 and sm_75 |
+| `install-matrix` | Fresh dependency installation, complete Cargo/CMake builds, installed CLI tests, and production container builds |
+| `Binary release` | Package and test Linux and Windows archives on both host architectures |
+| `GPU hardware` | Execute correctness and memory suites on the trusted GPU fleet |
+
+Build workflows filter changes to their inputs. CI starts on every PR and
+`main` push so spelling checks cover all tracked text, then selects lint and
+test jobs by their inputs. Documentation checks also run for deletions and
+renames that could break local links. The installation matrix selects native
+and WSL checks separately from container builds; release PRs select Linux and
+Windows builds separately. Manual dispatch runs all checks for the selected
+workflow, subject to its platform, architecture or suite inputs. Scheduled
+installation checks and tag release builds retain their full matrices.
+CI and installation workflows keep each push run because their job filters
+cover only that push. Their PR and manual runs, and architecture workflow
+runs, cancel older runs for the same event and ref. Release builds cancel
+superseded PR runs only; running tag and manual release builds are not cancelled.
+GPU execution remains separate from hosted build and CPU checks.
+Update path filters when adding a build input or a script called by a workflow.
+For workflows with job filters, update both the workflow trigger and the
+`changes` job. Keep test fixtures scoped to the jobs that build or run them.
+
 ## Install CI
 
 `install-matrix` runs the dependency installer on fresh OS images, followed
 by `cargo install --path . --locked`, a complete CMake CLI build, and the
 existing CPU-safe plot/proof tests. It checks that the requested AdaptiveCpp
 backend exists and that Intel's SPIR-V translator runs. No installed
-toolchains are restored from cache in these jobs.
+toolchains are restored from cache in these jobs. Runtime checks select the
+OpenMP backend because hosted runners have no GPU drivers or devices.
 
 | Platform | NVIDIA | AMD | Intel |
 | --- | --- | --- | --- |
@@ -124,6 +200,34 @@ repository changes. The existing container and CUDA architecture matrices
 remain separate coverage. The [binary release job](#binary-releases) checks
 native Windows separately.
 
+Linux installs also run `scripts/test/group-cli.py --automatic-compute` and
+`scripts/test/compute-cli.py` against both installed binaries. The grouped
+suite covers full proofs, read-only plans, all construction engines' crash
+recovery, saved enrollment, several brokers sharing a worker, worker
+replacement and broker outages. The compute suite checks authenticated status,
+pause/drain/resume, renewal, revocation and background service commands.
+Linux service checks use an isolated test manager. Native Windows archive
+checks run the same suites on NTFS, including a temporary Task Scheduler task
+with `--service-manager`; the harness removes that task before returning.
+The same flag exercises a temporary systemd user service on Linux when a
+user manager is available.
+Discovery checks use loopback multicast and do not qualify a physical LAN.
+
+For network changes, `scripts/test/compute-network-test.py` checks the
+qualification harness, then run:
+
+```bash
+python3 scripts/test/compute-network.py /path/to/xchplot2 --logs /path/to/logs
+```
+
+This requires Linux user/network namespaces, `ip`, `nft`, `unshare` and
+`nsenter`. It tests IPv4/IPv6, multiple interfaces, routed dedicated brokers,
+firewall interruption and address changes inside disposable namespaces.
+`--hosts hosts.json` instead uses explicitly supplied SSH hosts; the script's
+header documents the host configuration and existing runtime requirements.
+SSH-host checks do not change their network or firewall settings. Keep
+namespace, forwarded SSH and direct physical LAN results distinct.
+
 These are build and install checks, not GPU driver or hardware certification.
 Hosted WSL2 jobs also lack GPUs; actual WSL GPU support depends on the card
 and its Windows driver. Vendor kernel execution and production plotting use
@@ -136,7 +240,9 @@ on trusted `main` / `cuda-only` pushes, schedules, and manual dispatches:
 
 Register runners and set `GPU_CORRECTNESS_MATRIX` to the installed fleet before
 setting the Actions repository variable `GPU_RUNNERS_READY` to `true`.
-That enables automatic push and daily runs. Without a correctness matrix,
+That enables automatic push and daily runs. Pushes test the changed branch
+only; schedules and manual dispatch can also test other configured refs.
+Without a correctness matrix,
 the original NVIDIA, AMD, Intel, and `cuda-only` lanes remain the default.
 Automatic weekly physical runs additionally require `GPU_PHYSICAL_MATRIX`;
 manual physical dispatch retains the default matrix below. Until readiness
@@ -156,6 +262,11 @@ plotter's memory use on a shared GPU. Allocation and admission guards remain
 active. `vram` and `physical` enforce the device-wide memory assertion and
 require an isolated GPU; the summary records which policy ran. A correctness
 pass does not qualify memory usage.
+
+Integrated GPUs with shared host memory can run `quick` and `correctness`
+when their capacity permits. Their counters include CPU and cache activity,
+so `vram` and `physical` reject them. A runtime allocation cap does not qualify
+as a physical dedicated VRAM capacity.
 
 Every suite also compares two k=18 raw-member vectors against CPU output on each
 selected tier and spill variant: strength 3 with an all-`ff` group ID, maximum
@@ -295,6 +406,8 @@ python3 scripts/test/gpu-ci.py build --backend level_zero --suite physical --phy
 Actions retain build logs, device inventory, CTest JUnit results, per-tier
 boundary/rejection logs, proof logs, and a JSON summary for 14 days. Generated
 plots are temporary; byte comparisons and reference hashes are recorded.
+Artifact names use the matrix job index so separate runners do not collide;
+`revision.txt` records the requested ref, runner label and checked-out commit.
 The summary records failed stages, exception messages, and subprocess command
 and exit code when available, including archive and inventory failures.
 NVIDIA runs additionally retain best-effort driver XML snapshots at suite
@@ -332,6 +445,11 @@ Document each branch's actual behavior; native CUDA and SYCL have different
 memory budgets and spill support. Record GPU, source revision, sample count,
 warmup, units, and measurement date with new results. Label older results
 whose provenance is incomplete.
+
+Contributor guides describe workflows and acceptance criteria. Keep debugging
+sessions, test counts and run-by-run validation results in local records or CI
+artifacts. User guides should explain supported behavior, limitations and the
+actions readers need to take.
 
 The existing Markdown job lints tracked documentation, including section
 fragments. Local links are checked without contacting external websites:
@@ -387,6 +505,17 @@ Both architectures include CUDA, HIP, and Level Zero; ARM64 also includes
 OpenCL. The ARM64 archive therefore has a newer glibc baseline. Hosted
 checks do not qualify GPU drivers or hardware.
 
+All project-managed AdaptiveCpp builds apply
+`ci/release/adaptivecpp-level-zero-events.patch`, which backports upstream's
+event-pool rotation fix. The first event in a new pool must consume its slot
+before another command can allocate one. They also apply
+`ci/release/adaptivecpp-level-zero-event-lifetime.patch` to retain native wait
+events until their consuming commands complete. Ownership is prepared before
+submission, and completed dependencies are released under the queue mutex.
+Existing Intel toolchains need the
+[rebuild described in INSTALL.md](INSTALL.md#native-install).
+
+Linux archives also include OpenSSL 3 and the mdns license.
 Artifacts are written to `build/release-linux/dist/`. `acpp --acpp-deploy`
 collects CPU, CUDA, HIP, and ARM64 OpenCL runtime/JIT dependencies; the build
 script adds Level Zero, checks the GPU backends, collects license notices, and
@@ -394,6 +523,8 @@ makes library paths relative.
 
 PR and manual runs retain workflow artifacts. Manual runs can select one
 platform and host architecture; PR and tag runs build the full matrix.
+Only tag pushes attach archives to a draft release; manual checks against a
+tag retain their archives as workflow artifacts.
 Keep the version in `Cargo.toml`, `Cargo.lock`, and `CMakeLists.txt` identical
 on `main` and `cuda-only`. Tag `main` as `vVERSION` and native CUDA as
 `vVERSION-cuda-only`, and push both tags together. The CUDA tag identifies
@@ -415,7 +546,10 @@ and LLVM-SPIRV translator. The cached install tree is invalidated when
 compiler sources or options change. `scripts/build-release.ps1` collects
 runtime DLLs and notices, builds all targets, runs the host checks, and
 writes one combined `build/release-windows/dist/*-windows-ARCH-sycl.zip`.
-It also requires `cargo-about` 0.9.2 and the toolchain in `ACPP_PREFIX`.
+It also requires `cargo-about` 0.9.2, native Windows Perl, and the toolchain
+in `ACPP_PREFIX`. `ci/release/build-openssl-windows.ps1` builds the pinned
+static OpenSSL libraries with the active Visual Studio tools; their license
+and the mdns license are included in the archive.
 The toolchain applies `contrib/adaptivecpp-windows-hip.patch` for upstream
 device-IR fixes and `contrib/adaptivecpp-windows-level-zero.patch` for
 Windows headers, linking, DLL installation, and integrated SPIR-V builds.
@@ -436,6 +570,10 @@ additionally requires their graphics drivers, so those two checks run only
 when their drivers are installed. The ZIP includes the compiler and
 redistributable runtime dependencies; users need only their graphics driver.
 These checks do not qualify Windows GPU execution.
+Windows GPU qualification requires allocation and kernel parity checks,
+k=22/k=28 CPU byte comparisons and full proofs, every fitting tier and disk-spill
+variant, memory-pressure rejection, cancellation and recovery using the
+extracted archive on Windows hardware.
 
 Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)
 for the archive and CPU checks. It also compares the SYCL plotting pipeline

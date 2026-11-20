@@ -17,6 +17,60 @@
 
 namespace pos2gpu {
 
+// T2 experimental Tezcan AES (same 16x-replicated T0 mapping as T1).
+// Device helpers stay local to this translation unit.
+static inline AesState t2c_tezcan_round(
+    AesState s, const AesState& key, const uint32_t* t, uint32_t bank)
+{
+    AesState out;
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        uint32_t a = t[(s.w[c] & 255u) * 16 + bank];
+        uint32_t b = t[((s.w[(c+1)&3] >> 8) & 255u) * 16 + bank];
+        uint32_t d = t[((s.w[(c+2)&3] >> 16) & 255u) * 16 + bank];
+        uint32_t e = t[(s.w[(c+3)&3] >> 24) * 16 + bank];
+        b = (b << 8) | (b >> 24);
+        d = (d << 16) | (d >> 16);
+        e = (e >> 8) | (e << 24);
+        out.w[c] = a ^ b ^ d ^ e ^ key.w[c];
+    }
+    return out;
+}
+
+static inline AesState t2c_tezcan_rounds(
+    AesState state, const AesHashKeys& keys, int rounds, const uint32_t* t, uint32_t bank = 0)
+{
+    #pragma unroll 2
+    for (int r = 0; r < rounds; ++r) {
+        state = t2c_tezcan_round(state, keys.round_key_1, t, bank);
+        state = t2c_tezcan_round(state, keys.round_key_2, t, bank);
+    }
+    return state;
+}
+
+static inline uint32_t t2c_tezcan_target(
+    const AesHashKeys& keys, uint32_t table_id, uint32_t match_key,
+    uint64_t meta, const uint32_t* t, int extra, uint32_t bank = 0)
+{
+    AesState s = set_int_vec_i128(
+        int32_t(meta >> 32), int32_t(meta),
+        int32_t(match_key), int32_t(table_id));
+    return t2c_tezcan_rounds(
+        s, keys, kAesMatchingTargetRounds << extra, t, bank).w[0];
+}
+
+static inline Result128 t2c_tezcan_pairing(
+    const AesHashKeys& keys, uint64_t l, uint64_t r,
+    const uint32_t* t, int extra, uint32_t bank = 0)
+{
+    AesState s = set_int_vec_i128(
+        int32_t(r >> 32), int32_t(r),
+        int32_t(l >> 32), int32_t(l));
+    s = t2c_tezcan_rounds(s, keys, kAesPairingRounds << extra, t, bank);
+    return Result128{{s.w[0], s.w[1], s.w[2], s.w[3]}};
+}
+
+
 void launch_t2_compute_bucket_offsets(
     uint32_t const* d_sorted_mi,
     uint64_t total,
@@ -381,6 +435,306 @@ bool t2_twophase_enabled()
 
 } // namespace
 
+static void launch_t2_match_all_buckets_compact(
+    AesHashKeys keys,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_mi,
+    uint64_t const* d_offsets,
+    uint64_t const* d_fine_offsets,
+    uint32_t num_match_keys,
+    uint32_t num_buckets,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    int num_match_info_bits,
+    int half_k,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t out_capacity,
+    uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q)
+{
+    (void)num_buckets; // only the [begin, end) sub-range is iterated
+    if (bucket_end <= bucket_begin) return;
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
+    uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
+
+    constexpr size_t threads = 256;
+    uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
+    size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
+
+    // Set on the host; do not read environment variables on device.
+    bool const use_tezcan = [] {
+        const char* v = std::getenv("POS2GPU_T2_TEZCAN");
+        return v && v[0] == '1';
+    }();
+
+    auto* d_out_count_ull =
+        reinterpret_cast<unsigned long long*>(d_out_count);
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> sT_local{
+            sycl::range<1>{16 * 256}, h};
+        // 512 candidate pairs of 2x u64 = 8 KiB plus 16 KiB AES table.
+        constexpr uint32_t pair_cap = 512;
+        sycl::local_accessor<uint64_t, 1> pairs_l{sycl::range<1>{pair_cap}, h};
+        sycl::local_accessor<uint64_t, 1> pairs_r{sycl::range<1>{pair_cap}, h};
+        sycl::local_accessor<uint32_t, 1> total_local{sycl::range<1>{1}, h};
+
+        h.parallel_for(
+            sycl::nd_range<2>{
+                sycl::range<2>{ static_cast<size_t>(num_buckets_in_range),
+                                blocks_x * threads },
+                sycl::range<2>{ 1, threads }
+            },
+            [=, keys_copy = keys](sycl::nd_item<2> it) {
+                uint32_t* sT = &sT_local[0];
+                size_t local_id = it.get_local_id(1);
+                #pragma unroll 1
+                for (size_t i = local_id; i < 16 * 256; i += threads) {
+                    if (use_tezcan) sT[i] = d_aes_tables[i / 16];
+                    else if (i < 4 * 256) sT[i] = d_aes_tables[i];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                uint32_t bucket_id   = bucket_begin + static_cast<uint32_t>(it.get_group(0));
+                uint32_t section_l   = bucket_id / num_match_keys;
+                uint32_t match_key_r = bucket_id % num_match_keys;
+
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
+
+                uint64_t l_start = d_offsets[section_l * num_match_keys];
+                uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
+                uint32_t r_bucket = section_r * num_match_keys + match_key_r;
+
+                uint64_t l = l_start
+                           + it.get_group(1) * uint64_t(threads)
+                           + local_id;
+                // Every lane must participate in scan/barriers, including
+                // padded l lanes in the last block.
+                uint64_t meta_l = 0;
+                uint64_t first = 0, fine_hi = 0;
+                uint32_t target_l = 0, count = 0;
+                if (l < l_end) {
+                    meta_l = d_sorted_meta[l];
+                    target_l = (use_tezcan
+                        ? t2c_tezcan_target(keys_copy, 2u, match_key_r, meta_l, sT, 0, static_cast<uint32_t>(local_id) & 15u)
+                        : pos2gpu::matching_target_smem(keys_copy, 2u, match_key_r, meta_l, sT, 0))
+                        & target_mask;
+                    uint32_t shift = uint32_t(num_match_target_bits - fine_bits);
+                    uint32_t fine_key = target_l >> shift;
+                    uint64_t fi = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                    fine_hi = d_fine_offsets[fi + 1];
+                    first = pos2gpu::fine_bucket_lower_bound(
+                        d_sorted_mi, d_fine_offsets[fi], fine_hi, target_l, target_mask);
+                    for (uint64_t r = first; r < fine_hi; ++r) {
+                        if ((d_sorted_mi[r] & target_mask) != target_l) break;
+                        if (++count > pair_cap) break;
+                    }
+                }
+
+                uint32_t const test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
+                    : ((1u << num_test_bits) - 1u);
+                uint32_t const info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
+                    : ((1u << num_match_info_bits) - 1u);
+                int const meta_bits = 2 * k;
+
+                // Preserve all three output fields and the original atomic
+                // allocation semantics; candidate order is not guaranteed.
+                auto emit = [&](uint64_t ml, uint64_t mr) {
+                    Result128 res = use_tezcan
+                        ? t2c_tezcan_pairing(keys_copy, ml, mr, sT, 0, static_cast<uint32_t>(local_id) & 15u)
+                        : pos2gpu::pairing_smem(keys_copy, ml, mr, sT, 0);
+                    if ((res.r[3] & test_mask) != 0) return;
+                    uint32_t mi = res.r[0] & info_mask;
+                    uint64_t full_meta = uint64_t(res.r[1]) | (uint64_t(res.r[2]) << 32);
+                    uint64_t out_meta = (meta_bits == 64)
+                        ? full_meta : (full_meta & ((1ULL << meta_bits) - 1ULL));
+                    uint32_t xl = static_cast<uint32_t>((ml >> k) >> half_k);
+                    uint32_t xr = static_cast<uint32_t>((mr >> k) >> half_k);
+                    uint32_t xb = (xl << half_k) | xr;
+                    sycl::atomic_ref<unsigned long long,
+                                     sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device>
+                        counter{*d_out_count_ull};
+                    unsigned long long oi = counter.fetch_add(1ULL);
+                    if (oi >= out_capacity) return;
+                    d_out_meta[oi] = out_meta;
+                    d_out_mi[oi] = mi;
+                    d_out_xbits[oi] = xb;
+                };
+
+                // Bound scan count to 513. Any overflow is handled by a
+                // group-uniform exact fallback, not by dropping pairs.
+                uint32_t offset = sycl::exclusive_scan_over_group(
+                    it.get_group(), count, sycl::plus<uint32_t>{});
+                if (local_id == threads - 1) total_local[0] = offset + count;
+                it.barrier(sycl::access::fence_space::local_space);
+                uint32_t n = total_local[0];
+                if (n > pair_cap) {
+                    // All lanes enter this branch together. Padded lanes do
+                    // nothing, and no lane needs a later barrier.
+                    if (l < l_end) {
+                        for (uint64_t r = first; r < fine_hi; ++r) {
+                            if ((d_sorted_mi[r] & target_mask) != target_l) break;
+                            emit(meta_l, d_sorted_meta[r]);
+                        }
+                    }
+                    return;
+                }
+
+                for (uint32_t j = 0; j < count; ++j) {
+                    uint32_t ci = offset + j;
+                    pairs_l[ci] = meta_l;
+                    pairs_r[ci] = d_sorted_meta[first + j];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                for (uint32_t ci = uint32_t(local_id); ci < n; ci += uint32_t(threads))
+                    emit(pairs_l[ci], pairs_r[ci]);
+            });
+    }).wait();
+}
+
+static void launch_t2_match_all_buckets_tezcan(
+    AesHashKeys keys,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_mi,
+    uint64_t const* d_offsets,
+    uint64_t const* d_fine_offsets,
+    uint32_t num_match_keys,
+    uint32_t num_buckets,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    int num_match_info_bits,
+    int half_k,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t out_capacity,
+    uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q)
+{
+    (void)num_buckets; // only the [begin, end) sub-range is iterated
+    if (bucket_end <= bucket_begin) return;
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
+    uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
+
+    constexpr size_t threads = 256;
+    uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
+    size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
+
+    auto* d_out_count_ull =
+        reinterpret_cast<unsigned long long*>(d_out_count);
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> sT_local{
+            sycl::range<1>{16 * 256}, h};
+
+        h.parallel_for(
+            sycl::nd_range<2>{
+                sycl::range<2>{ static_cast<size_t>(num_buckets_in_range),
+                                blocks_x * threads },
+                sycl::range<2>{ 1, threads }
+            },
+            [=, keys_copy = keys](sycl::nd_item<2> it) {
+                uint32_t* sT = &sT_local[0];
+                size_t local_id = it.get_local_id(1);
+                #pragma unroll 1
+                // Tezcan 16-way bank-replicated T0. All 256 T0 entries are
+                // available as 16 equivalent copies in shared memory.
+                for (size_t i = local_id; i < 16 * 256; i += threads) {
+                    sT[i] = d_aes_tables[i / 16];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                uint32_t bucket_id   = bucket_begin + static_cast<uint32_t>(it.get_group(0));
+                uint32_t section_l   = bucket_id / num_match_keys;
+                uint32_t match_key_r = bucket_id % num_match_keys;
+
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
+
+                uint64_t l_start = d_offsets[section_l * num_match_keys];
+                uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
+                uint32_t r_bucket = section_r * num_match_keys + match_key_r;
+
+                uint64_t l = l_start
+                           + it.get_group(1) * uint64_t(threads)
+                           + local_id;
+                if (l >= l_end) return;
+
+                uint64_t meta_l = d_sorted_meta[l];
+
+                uint32_t target_l = t2c_tezcan_target(
+                                        keys_copy, 2u, match_key_r, meta_l, sT, 0, static_cast<uint32_t>(local_id) & 15u)
+                                  & target_mask;
+
+                uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
+                uint32_t fine_key   = target_l >> fine_shift;
+                uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
+                uint64_t lo         = pos2gpu::fine_bucket_lower_bound(
+                    d_sorted_mi, d_fine_offsets[fine_idx], fine_hi,
+                    target_l, target_mask);
+
+                uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
+                                                            : ((1u << num_test_bits) - 1u);
+                uint32_t info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
+                                                                 : ((1u << num_match_info_bits) - 1u);
+                int meta_bits = 2 * k;
+
+                for (uint64_t r = lo; r < fine_hi; ++r) {
+                    uint32_t target_r = d_sorted_mi[r] & target_mask;
+                    if (target_r != target_l) break;
+
+                    uint64_t meta_r = d_sorted_meta[r];
+
+                    pos2gpu::Result128 res = t2c_tezcan_pairing(
+                        keys_copy, meta_l, meta_r, sT, 0, static_cast<uint32_t>(local_id) & 15u);
+
+                    uint32_t test_result = res.r[3] & test_mask;
+                    if (test_result != 0) continue;
+
+                    uint32_t match_info_result = res.r[0] & info_mask;
+                    uint64_t meta_result_full = uint64_t(res.r[1]) | (uint64_t(res.r[2]) << 32);
+                    uint64_t meta_result = (meta_bits == 64)
+                                            ? meta_result_full
+                                            : (meta_result_full & ((1ULL << meta_bits) - 1ULL));
+
+                    uint32_t x_bits_l = static_cast<uint32_t>((meta_l >> k) >> half_k);
+                    uint32_t x_bits_r = static_cast<uint32_t>((meta_r >> k) >> half_k);
+                    uint32_t x_bits   = (x_bits_l << half_k) | x_bits_r;
+
+                    sycl::atomic_ref<unsigned long long,
+                                     sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device>
+                        out_count_atomic{ *d_out_count_ull };
+                    unsigned long long out_idx = out_count_atomic.fetch_add(1ULL);
+                    if (out_idx >= out_capacity) return;
+
+                    d_out_meta [out_idx] = meta_result;
+                    d_out_mi   [out_idx] = match_info_result;
+                    d_out_xbits[out_idx] = x_bits;
+                }
+            });
+    }).wait();
+}
+
 void launch_t2_match_all_buckets(
     AesHashKeys keys,
     uint64_t const* d_sorted_meta,
@@ -407,6 +761,34 @@ void launch_t2_match_all_buckets(
     uint32_t bucket_end,
     sycl::queue& q)
 {
+    // Tezcan-only experiment. Local compaction has precedence when ON.
+    // This branch intentionally bypasses T2's two-phase attempt so the
+    // original fused kernel and Tezcan fused kernel can be compared fairly.
+    if (const char* tv = std::getenv("POS2GPU_T2_TEZCAN"); tv && tv[0] == '1') {
+        const char* cv = std::getenv("POS2GPU_T2_COMPACT");
+        if (!(cv && cv[0] == '1')) {
+            launch_t2_match_all_buckets_tezcan(
+                keys, d_sorted_meta, d_sorted_mi, d_offsets,
+            d_fine_offsets, num_match_keys, num_buckets, k,
+            num_section_bits, num_match_target_bits, fine_bits,
+            target_mask, num_test_bits, num_match_info_bits, half_k,
+            d_out_meta, d_out_mi, d_out_xbits, d_out_count, out_capacity,
+            l_count_max, bucket_begin, bucket_end, q);
+            return;
+        }
+    }
+    // Optional work-group local compaction. Original implementations
+    // (including two-phase) remain unchanged when disabled.
+    if (const char* v = std::getenv("POS2GPU_T2_COMPACT"); v && v[0] == '1') {
+        launch_t2_match_all_buckets_compact(
+            keys, d_sorted_meta, d_sorted_mi, d_offsets,
+            d_fine_offsets, num_match_keys, num_buckets, k,
+            num_section_bits, num_match_target_bits, fine_bits,
+            target_mask, num_test_bits, num_match_info_bits, half_k,
+            d_out_meta, d_out_mi, d_out_xbits, d_out_count, out_capacity,
+            l_count_max, bucket_begin, bucket_end, q);
+        return;
+    }
     (void)num_buckets; // only the [begin, end) sub-range is iterated
     if (bucket_end <= bucket_begin) return;
     uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
@@ -530,6 +912,328 @@ void launch_t2_match_all_buckets(
     }).wait();
 }
 
+static void launch_t2_match_section_pair_split_compact(
+    AesHashKeys keys,
+    uint64_t const* d_meta_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    uint64_t const* d_offsets,
+    uint64_t const* d_fine_offsets,
+    uint32_t num_match_keys,
+    uint32_t num_buckets,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    int num_match_info_bits,
+    int half_k,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t out_capacity,
+    uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q)
+{
+    (void)num_buckets;
+    if (bucket_end <= bucket_begin) return;
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
+    uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
+
+    constexpr size_t threads = 256;
+    uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
+    size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
+
+    // Set on the host; do not read environment variables on device.
+    bool const use_tezcan = [] {
+        const char* v = std::getenv("POS2GPU_T2_TEZCAN");
+        return v && v[0] == '1';
+    }();
+
+    auto* d_out_count_ull =
+        reinterpret_cast<unsigned long long*>(d_out_count);
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> sT_local{
+            sycl::range<1>{16 * 256}, h};
+        // 512 candidate pairs of 2x u64 = 8 KiB plus 16 KiB AES table.
+        constexpr uint32_t pair_cap = 512;
+        sycl::local_accessor<uint64_t, 1> pairs_l{sycl::range<1>{pair_cap}, h};
+        sycl::local_accessor<uint64_t, 1> pairs_r{sycl::range<1>{pair_cap}, h};
+        sycl::local_accessor<uint32_t, 1> total_local{sycl::range<1>{1}, h};
+
+        h.parallel_for(
+            sycl::nd_range<2>{
+                sycl::range<2>{ static_cast<size_t>(num_buckets_in_range),
+                                blocks_x * threads },
+                sycl::range<2>{ 1, threads }
+            },
+            [=, keys_copy = keys](sycl::nd_item<2> it) {
+                uint32_t* sT = &sT_local[0];
+                size_t local_id = it.get_local_id(1);
+                #pragma unroll 1
+                for (size_t i = local_id; i < 16 * 256; i += threads) {
+                    if (use_tezcan) sT[i] = d_aes_tables[i / 16];
+                    else if (i < 4 * 256) sT[i] = d_aes_tables[i];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                uint32_t bucket_id   = bucket_begin + static_cast<uint32_t>(it.get_group(0));
+                uint32_t section_l   = bucket_id / num_match_keys;
+                uint32_t match_key_r = bucket_id % num_match_keys;
+
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
+
+                uint64_t l_start = d_offsets[section_l * num_match_keys];
+                uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
+                uint32_t r_bucket = section_r * num_match_keys + match_key_r;
+
+                uint64_t l = l_start
+                           + it.get_group(1) * uint64_t(threads)
+                           + local_id;
+                // Sliced path used by low-VRAM tiers. The indices in
+                // offsets/fine_offsets are global; slice accesses must
+                // subtract the appropriate section row start.
+                uint64_t meta_l = 0;
+                uint64_t first = 0, fine_hi = 0;
+                uint32_t target_l = 0, count = 0;
+                if (l < l_end) {
+                    meta_l = d_meta_l_slice[l - section_l_row_start];
+                    target_l = (use_tezcan
+                        ? t2c_tezcan_target(keys_copy, 2u, match_key_r, meta_l, sT, 0, static_cast<uint32_t>(local_id) & 15u)
+                        : pos2gpu::matching_target_smem(keys_copy, 2u, match_key_r, meta_l, sT, 0))
+                        & target_mask;
+                    uint32_t shift = uint32_t(num_match_target_bits - fine_bits);
+                    uint32_t fine_key = target_l >> shift;
+                    uint64_t fi = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                    fine_hi = d_fine_offsets[fi + 1];
+                    uint64_t lo = d_fine_offsets[fi], hi = fine_hi;
+                    while (lo < hi) {
+                        uint64_t mid = lo + ((hi - lo) >> 1);
+                        uint32_t t = d_mi_r_slice[mid - section_r_row_start] & target_mask;
+                        if (t < target_l) lo = mid + 1;
+                        else hi = mid;
+                    }
+                    first = lo;
+                    for (uint64_t r = first; r < fine_hi; ++r) {
+                        if ((d_mi_r_slice[r - section_r_row_start] & target_mask) != target_l) break;
+                        if (++count > pair_cap) break;
+                    }
+                }
+
+                uint32_t const test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
+                    : ((1u << num_test_bits) - 1u);
+                uint32_t const info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
+                    : ((1u << num_match_info_bits) - 1u);
+                int const meta_bits = 2 * k;
+
+                // Preserve all three output fields and the original atomic
+                // allocation semantics; candidate order is not guaranteed.
+                auto emit = [&](uint64_t ml, uint64_t mr) {
+                    Result128 res = use_tezcan
+                        ? t2c_tezcan_pairing(keys_copy, ml, mr, sT, 0, static_cast<uint32_t>(local_id) & 15u)
+                        : pos2gpu::pairing_smem(keys_copy, ml, mr, sT, 0);
+                    if ((res.r[3] & test_mask) != 0) return;
+                    uint32_t mi = res.r[0] & info_mask;
+                    uint64_t full_meta = uint64_t(res.r[1]) | (uint64_t(res.r[2]) << 32);
+                    uint64_t out_meta = (meta_bits == 64)
+                        ? full_meta : (full_meta & ((1ULL << meta_bits) - 1ULL));
+                    uint32_t xl = static_cast<uint32_t>((ml >> k) >> half_k);
+                    uint32_t xr = static_cast<uint32_t>((mr >> k) >> half_k);
+                    uint32_t xb = (xl << half_k) | xr;
+                    sycl::atomic_ref<unsigned long long,
+                                     sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device>
+                        counter{*d_out_count_ull};
+                    unsigned long long oi = counter.fetch_add(1ULL);
+                    if (oi >= out_capacity) return;
+                    d_out_meta[oi] = out_meta;
+                    d_out_mi[oi] = mi;
+                    d_out_xbits[oi] = xb;
+                };
+
+                // Bound scan count to 513. Any overflow is handled by a
+                // group-uniform exact fallback, not by dropping pairs.
+                uint32_t offset = sycl::exclusive_scan_over_group(
+                    it.get_group(), count, sycl::plus<uint32_t>{});
+                if (local_id == threads - 1) total_local[0] = offset + count;
+                it.barrier(sycl::access::fence_space::local_space);
+                uint32_t n = total_local[0];
+                if (n > pair_cap) {
+                    // All lanes enter this branch together. Padded lanes do
+                    // nothing, and no lane needs a later barrier.
+                    if (l < l_end) {
+                        for (uint64_t r = first; r < fine_hi; ++r) {
+                            if ((d_mi_r_slice[r - section_r_row_start] & target_mask) != target_l) break;
+                            emit(meta_l, d_meta_r_slice[r - section_r_row_start]);
+                        }
+                    }
+                    return;
+                }
+
+                for (uint32_t j = 0; j < count; ++j) {
+                    uint32_t ci = offset + j;
+                    pairs_l[ci] = meta_l;
+                    pairs_r[ci] = d_meta_r_slice[first + j - section_r_row_start];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                for (uint32_t ci = uint32_t(local_id); ci < n; ci += uint32_t(threads))
+                    emit(pairs_l[ci], pairs_r[ci]);
+            });
+    }).wait();
+}
+
+static void launch_t2_match_section_pair_split_tezcan(
+    AesHashKeys keys,
+    uint64_t const* d_meta_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    uint64_t const* d_offsets,
+    uint64_t const* d_fine_offsets,
+    uint32_t num_match_keys,
+    uint32_t num_buckets,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    int num_match_info_bits,
+    int half_k,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t out_capacity,
+    uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q)
+{
+    (void)num_buckets;
+    if (bucket_end <= bucket_begin) return;
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
+    uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
+
+    constexpr size_t threads = 256;
+    uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
+    size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
+
+    auto* d_out_count_ull =
+        reinterpret_cast<unsigned long long*>(d_out_count);
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> sT_local{
+            sycl::range<1>{16 * 256}, h};
+
+        h.parallel_for(
+            sycl::nd_range<2>{
+                sycl::range<2>{ static_cast<size_t>(num_buckets_in_range),
+                                blocks_x * threads },
+                sycl::range<2>{ 1, threads }
+            },
+            [=, keys_copy = keys](sycl::nd_item<2> it) {
+                uint32_t* sT = &sT_local[0];
+                size_t local_id = it.get_local_id(1);
+                #pragma unroll 1
+                // Tezcan 16-way bank-replicated T0. All 256 T0 entries are
+                // available as 16 equivalent copies in shared memory.
+                for (size_t i = local_id; i < 16 * 256; i += threads) {
+                    sT[i] = d_aes_tables[i / 16];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                uint32_t bucket_id   = bucket_begin + static_cast<uint32_t>(it.get_group(0));
+                uint32_t section_l   = bucket_id / num_match_keys;
+                uint32_t match_key_r = bucket_id % num_match_keys;
+
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
+
+                uint64_t l_start = d_offsets[section_l * num_match_keys];
+                uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
+                uint32_t r_bucket = section_r * num_match_keys + match_key_r;
+
+                uint64_t l = l_start
+                           + it.get_group(1) * uint64_t(threads)
+                           + local_id;
+                if (l >= l_end) return;
+
+                // Sliced read (l-side): l ∈ [section_l_row_start, section_l_row_end).
+                uint64_t meta_l = d_meta_l_slice[l - section_l_row_start];
+
+                uint32_t target_l = t2c_tezcan_target(
+                                        keys_copy, 2u, match_key_r, meta_l, sT, 0, static_cast<uint32_t>(local_id) & 15u)
+                                  & target_mask;
+
+                uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
+                uint32_t fine_key   = target_l >> fine_shift;
+                uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                uint64_t lo         = d_fine_offsets[fine_idx];
+                uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
+                uint64_t hi         = fine_hi;
+
+                while (lo < hi) {
+                    uint64_t mid = lo + ((hi - lo) >> 1);
+                    // Sliced read (r-side): r ∈ [section_r_row_start, section_r_row_end).
+                    uint32_t target_mid = d_mi_r_slice[mid - section_r_row_start] & target_mask;
+                    if (target_mid < target_l) lo = mid + 1;
+                    else                       hi = mid;
+                }
+
+                uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
+                                                            : ((1u << num_test_bits) - 1u);
+                uint32_t info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
+                                                                 : ((1u << num_match_info_bits) - 1u);
+                int meta_bits = 2 * k;
+
+                for (uint64_t r = lo; r < fine_hi; ++r) {
+                    uint64_t r_off    = r - section_r_row_start;
+                    uint32_t target_r = d_mi_r_slice[r_off] & target_mask;
+                    if (target_r != target_l) break;
+
+                    uint64_t meta_r = d_meta_r_slice[r_off];
+
+                    pos2gpu::Result128 res = t2c_tezcan_pairing(
+                        keys_copy, meta_l, meta_r, sT, 0, static_cast<uint32_t>(local_id) & 15u);
+
+                    uint32_t test_result = res.r[3] & test_mask;
+                    if (test_result != 0) continue;
+
+                    uint32_t match_info_result = res.r[0] & info_mask;
+                    uint64_t meta_result_full = uint64_t(res.r[1]) | (uint64_t(res.r[2]) << 32);
+                    uint64_t meta_result = (meta_bits == 64)
+                                            ? meta_result_full
+                                            : (meta_result_full & ((1ULL << meta_bits) - 1ULL));
+
+                    uint32_t x_bits_l = static_cast<uint32_t>((meta_l >> k) >> half_k);
+                    uint32_t x_bits_r = static_cast<uint32_t>((meta_r >> k) >> half_k);
+                    uint32_t x_bits   = (x_bits_l << half_k) | x_bits_r;
+
+                    sycl::atomic_ref<unsigned long long,
+                                     sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device>
+                        out_count_atomic{ *d_out_count_ull };
+                    unsigned long long out_idx = out_count_atomic.fetch_add(1ULL);
+                    if (out_idx >= out_capacity) return;
+
+                    d_out_meta [out_idx] = meta_result;
+                    d_out_mi   [out_idx] = match_info_result;
+                    d_out_xbits[out_idx] = x_bits;
+                }
+            });
+    }).wait();
+}
+
 void launch_t2_match_section_pair_split(
     AesHashKeys keys,
     uint64_t const* d_meta_l_slice,
@@ -559,6 +1263,36 @@ void launch_t2_match_section_pair_split(
     uint32_t bucket_end,
     sycl::queue& q)
 {
+    // Tezcan-only experiment. Local compaction has precedence when ON.
+    // This branch intentionally bypasses T2's two-phase attempt so the
+    // original fused kernel and Tezcan fused kernel can be compared fairly.
+    if (const char* tv = std::getenv("POS2GPU_T2_TEZCAN"); tv && tv[0] == '1') {
+        const char* cv = std::getenv("POS2GPU_T2_COMPACT");
+        if (!(cv && cv[0] == '1')) {
+            launch_t2_match_section_pair_split_tezcan(
+                keys, d_meta_l_slice, section_l_row_start,
+            d_meta_r_slice, d_mi_r_slice, section_r_row_start,
+            d_offsets, d_fine_offsets, num_match_keys, num_buckets,
+            k, num_section_bits, num_match_target_bits, fine_bits,
+            target_mask, num_test_bits, num_match_info_bits, half_k,
+            d_out_meta, d_out_mi, d_out_xbits, d_out_count, out_capacity,
+            l_count_max, bucket_begin, bucket_end, q);
+            return;
+        }
+    }
+    // Optional work-group local compaction. Original implementations
+    // (including two-phase) remain unchanged when disabled.
+    if (const char* v = std::getenv("POS2GPU_T2_COMPACT"); v && v[0] == '1') {
+        launch_t2_match_section_pair_split_compact(
+            keys, d_meta_l_slice, section_l_row_start,
+            d_meta_r_slice, d_mi_r_slice, section_r_row_start,
+            d_offsets, d_fine_offsets, num_match_keys, num_buckets,
+            k, num_section_bits, num_match_target_bits, fine_bits,
+            target_mask, num_test_bits, num_match_info_bits, half_k,
+            d_out_meta, d_out_mi, d_out_xbits, d_out_count, out_capacity,
+            l_count_max, bucket_begin, bucket_end, q);
+        return;
+    }
     (void)num_buckets;
     if (bucket_end <= bucket_begin) return;
     uint32_t const num_buckets_in_range = bucket_end - bucket_begin;

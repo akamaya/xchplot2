@@ -116,6 +116,8 @@ int run_compute_membership(int argc, char** argv)
 { last_compute.assign(argv, argv + argc); return 0; }
 int run_compute_status(int argc, char** argv)
 { last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_firewall(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
 int run_compute_service(int argc, char** argv)
 { last_compute.assign(argv, argv + argc); return 0; }
 #endif

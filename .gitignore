@@ -30,7 +30,6 @@ target/
 # pos2-chip is fetched here automatically by CMake at configure time.
 # See CMakeLists.txt → FetchContent_Declare(pos2_chip).
 third_party/
-docs/
 
 # Local-only scratch (container build contexts, repro logs, throwaway
 # test artifacts). Never committed.

@@ -22,7 +22,7 @@
 | T3 Local Compaction, Tezcan OFF | 32.11 s/plot | T3 candidate compaction |
 | **T3 Local Compaction + banked Tezcan** | **29.10 s/plot** | **T3 match + Feistel reduced to about 10.02 s** |
 
-**Best measured result (2026-11-20):** **29.10 s/plot**, down **57.3%** from the initial 68.17 s/plot (**2.34x throughput**). The measured end-to-end rate was **81.2 TiB/month** (30-day projection), up from 64.3 TiB/month after T2 optimization.
+**Best measured result (2026-11-21):** **27.27 s/plot**, a **60.0% shorter time** than the initial 68.17 s/plot (approximately **2.50x plots/hour**). Latest Fine Bucket result: 10 measured plots after 1 warmup; see the [detailed record](docs/FINE_BUCKET_OPTIMIZATION_2026-11-21.md).
 
 These are **opt-in experimental optimizations**, not default settings or a world-record claim. Intermediate rows include measurements from different runs; the T2 and T3 Tezcan ON/OFF comparisons used one warmup plus three measured plots in each configuration.
 
@@ -31,7 +31,7 @@ These are **opt-in experimental optimizations**, not default settings or a world
 - **GPU:** NVIDIA GeForce RTX 4070 SUPER, 12 GB VRAM (`gpu0`); one GPU plotting worker
 - **OS / backend:** Windows 11; SYCL / AdaptiveCpp targeting CUDA
 - **Workload:** k=28, Strength 6; synthetic `.gplot` benchmark output
-- **Measurement:** one warmup plot followed by three measured plots
+- **Measurement:** Fine Bucket result: one warmup + ten measured plots; earlier optimization results used one warmup + three measured plots
 - **Fastest measured stage times:** T1 match ~7.8 s; T2 match ~9.8 s; T3 match + Feistel ~10.0 s
 - **Peak device-wide VRAM use:** 10,474 MiB, with 11,069 MiB free at benchmark start and a minimum of 595 MiB remaining
 - **Steady-state spread:** 28.98窶・9.21 s/plot, standard deviation 0.11 s in the fastest three-plot run
@@ -68,6 +68,18 @@ Full-proof checks sample random challenges; they do **not** exhaustively certify
 The original project's usage, build instructions, hardware compatibility and performance comparisons are preserved below. This fork does not modify or imply endorsement by the upstream project.
 
 ---
+
+<!-- BEGIN XCHPLOT2-FINE-BUCKET-DOC -->
+
+### Fine Bucket search optimization (2026-11-21)
+
+**Latest measured configuration:** `T1/T2/T3 Fine Bits = 8/16/16` with T2/T3 **16+4-bit compressed direct lookup** (`POS2GPU_FINE_DIRECT=1`, `COMPACT=1`) on Windows 11 / RTX 4070 SUPER, k=28 / Strength 6. The 10-plot measurement (plus one excluded warmup) achieved **27.27 s/plot** versus **27.95 s/plot** for 16-bit + binary search and **28.74 s/plot** for the 8-bit baseline. The saved 16-bit group offsets (128 MiB) and 4-bit suffix-start table (256 MiB) share the same **384 MiB** pool scratch between T2 and T3. A 255+-row group falls back to exact binary search; the default remains disabled.
+
+This is a *performance result*, **not a new full-proof correctness certification**: the new direct-lookup path still needs dedicated GPU parity and `verify --full` of an actual plot. It currently applies only to the **SYCL T2/T3 all-buckets COMPACT** path, not every backend/tier.
+
+See the complete design, reproducible PowerShell command, measurements, limits and verification checklist in [Fine Bucket 16+4 optimization record](docs/FINE_BUCKET_OPTIMIZATION_2026-11-21.md).
+
+<!-- END XCHPLOT2-FINE-BUCKET-DOC -->
 
 <!-- END XCHPLOT2-FORK-OPTIMIZATION -->
 

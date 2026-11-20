@@ -11,10 +11,12 @@
 
 #include "gpu/AesGpu.cuh"
 #include "gpu/AesHashGpu.cuh"
+#include "gpu/FineBucketConfig.hpp"
 #include "gpu/FeistelCipherGpu.cuh"
 #include "gpu/T2Offsets.cuh"
 #include "gpu/T3Kernel.cuh"
 #include "gpu/T3Offsets.cuh"
+#include "gpu/FineBucketDirect.hpp"
 #include "host/PoolSizing.hpp"
 
 #include <climits>
@@ -47,16 +49,18 @@ T3MatchParams make_t3_params(int k, int strength)
 
 namespace {
 
-constexpr int kT3FineBits = 8;
+// Fine bits are runtime-configurable via POS2GPU_T3_FINE_BITS.
 
 struct T3Derived {
     uint32_t num_sections;
     uint32_t num_match_keys;
     uint32_t num_buckets;
+    int      fine_bits;
     uint64_t fine_entries;
     size_t   bucket_bytes;
     size_t   fine_bytes;
     size_t   temp_needed;
+    bool     direct_enabled;
     uint32_t target_mask;
     int      num_test_bits;
     uint64_t l_count_max;
@@ -68,11 +72,16 @@ T3Derived derive_t3(T3MatchParams const& params)
     d.num_sections    = 1u << params.num_section_bits;
     d.num_match_keys  = 1u << params.num_match_key_bits;
     d.num_buckets     = d.num_sections * d.num_match_keys;
-    uint64_t const fine_count = 1ull << kT3FineBits;
+    d.fine_bits = fine_bucket_bits(3, params.num_match_target_bits);
+    uint64_t const fine_count = 1ull << d.fine_bits;
+    if (uint64_t(d.num_buckets) * fine_count > UINT_MAX)
+        throw std::invalid_argument("fine bucket index exceeds 32-bit GPU launch count");
     d.fine_entries    = uint64_t(d.num_buckets) * fine_count + 1;
     d.bucket_bytes    = sizeof(uint64_t) * (d.num_buckets + 1);
     d.fine_bytes      = sizeof(uint64_t) * d.fine_entries;
     d.temp_needed     = d.bucket_bytes + d.fine_bytes;
+    d.direct_enabled  = fine_direct16_enabled(d.fine_bits, params.num_match_target_bits);
+    if (d.direct_enabled) d.temp_needed += fine_direct16_bytes(d.num_buckets);
     d.target_mask     = (params.num_match_target_bits >= 32)
                           ? 0xFFFFFFFFu
                           : ((1u << params.num_match_target_bits) - 1u);
@@ -106,20 +115,29 @@ void launch_t3_match_prepare(
     }
     if (*temp_bytes < d.temp_needed) throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_sorted_mi || !d_out_count) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.num_match_target_bits <= kT3FineBits) throw std::invalid_argument("invalid argument to launch wrapper");
 
     auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
     auto* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    FineBucketTimer fine_timer(3, d.fine_bits);
 
     // T3 reuses T2's offset wrappers (identical layout + algorithm).
     launch_t2_compute_bucket_offsets(
         d_sorted_mi, t2_count,
         params.num_match_target_bits,
         d.num_buckets, d_offsets, q);
+    fine_timer.mark("bucket_offsets", q);
     launch_t2_compute_fine_bucket_offsets(
         d_sorted_mi, d_offsets,
-        params.num_match_target_bits, kT3FineBits,
+        params.num_match_target_bits, d.fine_bits,
         d.num_buckets, d_fine_offsets, q);
+    fine_timer.mark("fine_offsets", q);
+    if (d.direct_enabled) {
+        auto* direct = fine_direct16_ptr(d_fine_offsets, d.num_buckets);
+        FineBucketTimer direct_timer(3, d.fine_bits);
+        fine_direct16_build(d_sorted_mi, d_fine_offsets, direct, d.num_buckets, q);
+        direct_timer.mark("direct_build", q);
+    }
     q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
 }
 
@@ -161,6 +179,7 @@ void launch_t3_match_range(
     AesHashKeys keys = make_keys(plot_id_bytes);
     FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k);
 
+    FineBucketTimer fine_timer(3, d.fine_bits);
     launch_t3_match_all_buckets(
         keys, fk,
         d_sorted_meta, d_sorted_xbits, d_sorted_mi,
@@ -168,12 +187,13 @@ void launch_t3_match_range(
         const_cast<uint64_t*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
-        params.num_match_target_bits, kT3FineBits,
+        params.num_match_target_bits, d.fine_bits,
         d.target_mask, d.num_test_bits,
         d_out_pairings, d_out_count,
         capacity, d.l_count_max,
         bucket_begin, bucket_end,
         q);
+    fine_timer.mark("match_fused", q);
 }
 
 void launch_t3_match_section_pair_range(
@@ -218,6 +238,7 @@ void launch_t3_match_section_pair_range(
     AesHashKeys keys = make_keys(plot_id_bytes);
     FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k);
 
+    FineBucketTimer fine_timer(3, d.fine_bits);
     launch_t3_match_section_pair(
         keys, fk,
         d_meta_l_slice, section_l_row_start,
@@ -227,12 +248,13 @@ void launch_t3_match_section_pair_range(
         const_cast<uint64_t*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
-        params.num_match_target_bits, kT3FineBits,
+        params.num_match_target_bits, d.fine_bits,
         d.target_mask, d.num_test_bits,
         d_out_pairings, d_out_count,
         capacity, d.l_count_max,
         bucket_begin, bucket_end,
         q);
+    fine_timer.mark("match_fused", q);
 }
 
 void launch_t3_match_section_pair_split_range(
@@ -276,6 +298,7 @@ void launch_t3_match_section_pair_split_range(
     AesHashKeys keys = make_keys(plot_id_bytes);
     FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k);
 
+    FineBucketTimer fine_timer(3, d.fine_bits);
     launch_t3_match_section_pair_split(
         keys, fk,
         d_meta_l_slice, d_xbits_l_slice, section_l_row_start,
@@ -284,12 +307,13 @@ void launch_t3_match_section_pair_split_range(
         const_cast<uint64_t*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
-        params.num_match_target_bits, kT3FineBits,
+        params.num_match_target_bits, d.fine_bits,
         d.target_mask, d.num_test_bits,
         d_out_pairings, d_out_count,
         capacity, d.l_count_max,
         bucket_begin, bucket_end,
         q);
+    fine_timer.mark("match_fused", q);
 }
 
 void launch_t3_match(

@@ -243,6 +243,35 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     pair_b_bytes = sizes.pair_b_bytes;
     xs_temp_bytes = sizes.xs_temp_bytes;
     sort_scratch_bytes = sizes.sort_scratch_bytes;
+    // Fine Bucket indices share d_sort_scratch with radix sorting, but the
+    // pool's original sizing queried sort scratch only. At Fine Bits=16,
+    // T2/T3 need ~128 MiB at k=28, strength=6, potentially exceeding it.
+    // Query the actual match-prepare requirements for the selected runtime
+    // Fine Bits, and allocate the maximum. The three phases reuse ONE buffer.
+    {
+        uint8_t dummy_plot_id[32] = {};
+        size_t t1_match_bytes = 0;
+        size_t t2_match_bytes = 0;
+        size_t t3_match_bytes = 0;
+        launch_t1_match_prepare(dummy_plot_id, make_t1_params(k, strength),
+                                nullptr, total_xs, nullptr, nullptr,
+                                &t1_match_bytes, q);
+        launch_t2_match_prepare(dummy_plot_id, make_t2_params(k, strength),
+                                nullptr, 0, nullptr, nullptr,
+                                &t2_match_bytes, q);
+        launch_t3_match_prepare(dummy_plot_id, make_t3_params(k, strength),
+                                nullptr, 0, nullptr, nullptr,
+                                &t3_match_bytes, q);
+        sort_scratch_bytes = std::max({sort_scratch_bytes,
+                                       t1_match_bytes, t2_match_bytes,
+                                       t3_match_bytes});
+        if (std::getenv("POS2GPU_POOL_DEBUG")) {
+            std::fprintf(stderr,
+                "[pool] match-index bytes: T1=%zu T2=%zu T3=%zu; shared sort_scratch=%zu\n",
+                t1_match_bytes, t2_match_bytes, t3_match_bytes,
+                sort_scratch_bytes);
+        }
+    }
     pinned_bytes = sizes.pinned_bytes;
     // Check VRAM before attempting allocation so we can give a useful
     // diagnostic instead of a generic allocation failure. The margin covers

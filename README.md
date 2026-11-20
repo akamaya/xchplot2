@@ -1,5 +1,61 @@
 # xchplot2
 
+<!-- BEGIN XCHPLOT2-FORK-OPTIMIZATION -->
+
+> [!NOTE]
+> **Experimental optimization fork.** This fork aims to maximize Chia PoS2 plot-generation performance on **Windows 11 with a 12 GB VRAM GPU at Strength 6** (currently benchmarked at k=28 on an NVIDIA RTX 4070 SUPER). It is based on [Jsewill/xchplot2](https://github.com/Jsewill/xchplot2); the original project documentation continues below.
+
+## Windows 11 / 12 GB VRAM / Strength 6 optimization
+
+**Goal:** Achieve the fastest practical, correct k=28 / Strength 6 Chia Plot2 generation on a 12 GB NVIDIA GPU running native Windows 11.
+
+### Measured progress
+
+| Iteration | Steady-state time | Notes |
+|---|---:|---|
+| Initial SYCL baseline | 68.17 s/plot | Baseline implementation |
+| Tezcan-style AES integrated into T1 | 67.84 s/plot | Standalone AES improved, but end-to-end gains were small |
+| T1 Local Compaction enabled | 58.32 s/plot | Group candidate pairs in GPU shared memory to reduce warp divergence |
+| T2/T3 two-phase path disabled | **44.57 s/plot** | Avoid candidate-buffer overflows and costly fallback recomputation |
+
+**Measured result:** approximately **34.6% less time per plot** than the initial baseline, or **1.53x throughput**. Final measured output rate: **53 TiB/month** (30-day projection). Results are specific to the test hardware, plot settings, and benchmark setup; they are not a claim of a world record.
+
+### Benchmark configuration
+
+- **GPU:** NVIDIA GeForce RTX 4070 SUPER, 12 GB VRAM (`gpu0`)
+- **OS:** Windows 11; **backend:** SYCL / AdaptiveCpp targeting CUDA
+- **Plot:** k=28, Strength 6; one GPU worker
+- **Measurement:** one warm-up plot, three measured plots
+- **Peak VRAM:** 10,474 MiB in the final run (of 11,069 MiB available at benchmark start)
+
+To reproduce the currently fastest tested configuration in PowerShell (after building):
+
+```powershell
+$env:POS2GPU_T1_COMPACT = '1'
+$env:POS2GPU_T2_TWOPHASE = '0'
+$env:POS2GPU_T3_TWOPHASE = '0'
+$env:POS2GPU_PHASE_TIMING = '1'
+
+.\build\windows-sycl\tools\xchplot2\xchplot2.exe bench `
+    -k 28 -s 6 -n 3 --warmup 1 --devices gpu0 `
+    -o D:\plots_test
+```
+
+Replace `gpu0` and the output directory with values suitable for your machine. The options above are **runtime environment variables**; they are not persisted by `git commit`.
+
+### Optimization notes and validity
+
+- [Full investigation and measurements (Markdown, Japanese)](docs/OPTIMIZATION_HISTORY_2026-11-20.md)
+- [Offline graph report (HTML, Japanese)](docs/OPTIMIZATION_REPORT_2026-11-20.html)
+- Standalone Tezcan AES tests passed their output comparisons; the earlier T1 parity run matched 4,189,913 results.
+- **Validation pending:** CPU/GPU parity with the *final* T1 Local Compaction path enabled, broader Strength/k coverage, and verification of generated plots. Treat this as an experimental branch until those checks pass.
+- The original project's standard usage, build instructions, and compatibility information remain below. This fork does not change the upstream project or imply endorsement by the upstream maintainers.
+
+---
+
+<!-- END XCHPLOT2-FORK-OPTIMIZATION -->
+
+
 GPU plotter for Chia v2 proofs of space (CHIP-48). Produces single-member
 `.gplot` files for PoS2 1.0, byte-identical to the pinned
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.

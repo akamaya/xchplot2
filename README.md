@@ -21,31 +21,50 @@
 | T2 Local Compaction + banked Tezcan | 36.75 s/plot | T2 match reduced to about 9.79 s |
 | T3 Local Compaction, Tezcan OFF | 32.11 s/plot | T3 candidate compaction |
 | **T3 Local Compaction + banked Tezcan** | **29.10 s/plot** | **T3 match + Feistel reduced to about 10.02 s** |
+| Fine Bucket 8/8/8 (search baseline) | 28.74 s/plot | 10-plot baseline for subsequent Fine Bucket comparisons |
+| Fine Bucket 8/14/14 (binary search) | 28.16 s/plot | Wider fine index reduces binary-search steps; 10 plots |
+| Fine Bucket 8/16/16 (binary search) | 27.95 s/plot | 16-bit fine index; 10 plots |
+| **Fine Bucket 8/16/16 + 16+4-bit direct lookup** | **27.27 s/plot** | **0.68 s (2.43% shorter time) vs 16-bit binary search; 10 plots** |
+| T2/T3 compact pair capacity 480/330 | — (stage timing only) | T2 -313 ms (3.44%), T3 -293 ms (3.18%); ~0.61 s combined kernel reduction; T1 stays 512 |
+| **AES V4INIT: 128-bit T0 initialization (T1–T3)** | **26.19 s/plot (best single observation)** | **Same-config A/B phase total -465.6 ms (-1.73%); 2 measured plots per mode; 114/114 full proofs PASS** |
 
-**Best measured result (2026-11-21):** **27.27 s/plot**, a **60.0% shorter time** than the initial 68.17 s/plot (approximately **2.50x plots/hour**). Latest Fine Bucket result: 10 measured plots after 1 warmup; see the [detailed record](docs/FINE_BUCKET_OPTIMIZATION_2026-11-21.md).
+**Best 10-plot steady-state measurement (2026-11-21):** **27.27 s/plot** with Fine Bucket 16+4-bit direct lookup (10 measured plots after one warmup). **Newest best single-plot observation:** **26.19 s/plot** after AES V4INIT and T2/T3 pair-cap tuning (one measured plot after one warmup). Versus the initial 68.17 s/plot, these observations are arithmetically 60.0% and 61.6% shorter, respectively; **they are from different run counts/conditions and are not a controlled end-to-end A/B comparison**.
 
-These are **opt-in experimental optimizations**, not default settings or a world-record claim. Intermediate rows include measurements from different runs; the T2 and T3 Tezcan ON/OFF comparisons used one warmup plus three measured plots in each configuration.
+The Compact, Tezcan, Fine Bucket and two-phase selections are **opt-in experimental optimizations**, not a default-setting or world-record claim. **V4INIT itself is permanently enabled in the selected SYCL Tezcan paths** (no `POS2GPU_AES_VEC_INIT` switch). Intermediate rows are historical measurements from different runs; the Fine Bucket comparison used 10 measured plots per configuration, whereas the AES V4INIT phase A/B used two runs with one measured plot each after warmup.
+
+### Latest AES V4INIT A/B — same configuration
+
+`k=28`, Strength 6, RTX 4070 SUPER, one worker, Fine Bits **8/16/16**, T1/T2/T3 Compact ON, T2/T3 Tezcan ON, two-phase OFF, Fine Direct ON, pair capacities T1/T2/T3 **512/480/330**. Two OFF→ON pairs; each run used one excluded warmup and one measured plot. Values are arithmetic averages of the two measured `[phase-timing]` entries per mode.
+
+| Stage | Previous scalar initialization | V4INIT (128-bit) | Improvement |
+|---|---:|---:|---:|
+| T1 match | 7,802.9 ms | 7,826.3 ms | -0.30% (no confirmed benefit) |
+| **T2 match** | **8,685.3 ms** | **8,505.9 ms** | **2.07% shorter** |
+| **T3 match + Feistel** | **9,066.3 ms** | **8,809.1 ms** | **2.84% shorter** |
+| **All GPU phases** | **26,916.0 ms** | **26,450.4 ms** | **465.6 ms / 1.73% shorter** |
+
+The benchmark's `steady-state` is affected by asynchronous output and the NAS; do not use the best single 26.19 s/plot as the paired performance effect. Nsight Compute verified that the initializer emits **`STS.128`**, reducing warp-level initialization store instructions from 131,072 to 32,768 (the number of transferred shared-memory wavefronts is unchanged). [Detailed V4INIT investigation](docs/AES_V4INIT_OPTIMIZATION_2026-11-21.md).
 
 ### Benchmark configuration
 
 - **GPU:** NVIDIA GeForce RTX 4070 SUPER, 12 GB VRAM (`gpu0`); one GPU plotting worker
 - **OS / backend:** Windows 11; SYCL / AdaptiveCpp targeting CUDA
 - **Workload:** k=28, Strength 6; synthetic `.gplot` benchmark output
-- **Measurement:** Fine Bucket result: one warmup + ten measured plots; earlier optimization results used one warmup + three measured plots
-- **Fastest measured stage times:** T1 match ~7.8 s; T2 match ~9.8 s; T3 match + Feistel ~10.0 s
+- **Measurement:** Fine Bucket result: one warmup + ten measured plots; AES V4INIT phase A/B: two runs per mode with one warmup + one measured plot each; early T1/T2/T3 iterations used one warmup + three measured plots.
+- **Latest V4INIT phase stage times:** T1 match ~7.83 s; T2 match ~8.51 s; T3 match + Feistel ~8.81 s (two measured plots per mode). Earlier T1/T2/T3 baseline was ~7.8 / ~9.8 / ~10.0 s.
 - **Peak device-wide VRAM use:** 10,474 MiB, with 11,069 MiB free at benchmark start and a minimum of 595 MiB remaining
 - **Steady-state spread:** 28.98窶・9.21 s/plot, standard deviation 0.11 s in the fastest three-plot run
 
 ### Reproduce the optimized configuration
 
-On the `aes-optimize` branch, after building the Windows SYCL target, run the following in **PowerShell** from the repository root:
+After building the Windows SYCL target with V4INIT adoption applied, run the following in **PowerShell** from the repository root:
 
 ```powershell
-$env:POS2GPU_T1_COMPACT='1'; $env:POS2GPU_T2_COMPACT='1'; $env:POS2GPU_T2_TEZCAN='1'; $env:POS2GPU_T2_TWOPHASE='0'; $env:POS2GPU_T3_COMPACT='1'; $env:POS2GPU_T3_TEZCAN='1'; $env:POS2GPU_T3_TWOPHASE='0'; $env:POS2GPU_PHASE_TIMING='1'
+$env:POS2GPU_T1_COMPACT='1'; $env:POS2GPU_T2_COMPACT='1'; $env:POS2GPU_T2_TEZCAN='1'; $env:POS2GPU_T2_TWOPHASE='0'; $env:POS2GPU_T3_COMPACT='1'; $env:POS2GPU_T3_TEZCAN='1'; $env:POS2GPU_T3_TWOPHASE='0'; $env:POS2GPU_T1_FINE_BITS='8'; $env:POS2GPU_T2_FINE_BITS='16'; $env:POS2GPU_T3_FINE_BITS='16'; $env:POS2GPU_FINE_DIRECT='1'; $env:POS2GPU_MATCH_DIAG='0'; $env:POS2GPU_PHASE_TIMING='1'
 .\build\windows-sycl\tools\xchplot2\xchplot2.exe bench -k 28 -s 6 -n 3 --warmup 1 --devices gpu0 -o D:\plots_test
 ```
 
-Change the output directory and device ID as needed. These environment variables affect the current PowerShell process and its child processes; they are **not** enabled by a Git commit. The benchmark creates **synthetic, non-farmable** plots and removes them on exit unless `--keep` is supplied.
+Change the output directory and device ID as needed. These environment variables affect the current PowerShell process and its child processes; they are **not** enabled by a Git commit. V4INIT is code-level adoption and needs **no separate environment variable**. The benchmark creates **synthetic, non-farmable** plots and removes them on exit unless `--keep` is supplied.
 
 ### Correctness and verification
 
@@ -55,6 +74,7 @@ Change the output directory and device ID as needed. These environment variables
 - **T3 single-GPU / sharded parity:** **6/6 PASS** at k=18/20/22, comparing the full 64-bit proof fragments.
 - **T3-optimized k=28 / Strength 6 plot:** `verify --trials 100 --full` validated **91/91 full proofs**.
 - Earlier T1 parity tests matched 4,189,913 results, but the final T1 Local Compaction path has not been documented here as independently passing broad CPU-reference parity.
+- **V4INIT + Fine Direct + Compact / Tezcan, k=28 / Strength 6:** one retained synthetic `.gplot`, `verify --full --trials 100`: **46 challenges with quality chains, 114 chains, 114/114 full proofs validated; OK**. This is a sample-based full-proof check, **not a same-input CPU/GPU byte-for-byte parity test**.
 
 Full-proof checks sample random challenges; they do **not** exhaustively certify all possible proofs, GPU models, strength settings, or streaming tiers. The optimization branch remains experimental.
 
@@ -64,6 +84,9 @@ Full-proof checks sample random challenges; they do **not** exhaustively certify
 - [T1 offline graph report (HTML, Japanese)](docs/OPTIMIZATION_REPORT_2026-11-20.html)
 - [T2 Local Compaction / Tezcan implementation and parity checks (Japanese)](docs/t2_gpu_optimization_2026-11-20.md)
 - [T3 Local Compaction / Tezcan implementation and proof verification (Japanese)](docs/t3_gpu_optimization_2026-11-20.md)
+- [Fine Bucket 16+4-bit direct lookup, 10-plot benchmarks (Japanese)](docs/FINE_BUCKET_OPTIMIZATION_2026-11-21.md)
+- [T1/T2/T3 candidate-capacity tuning, occupancy analysis (Japanese)](docs/GPU_PAIR_CAP_T1_T3_2026-11-21.md)
+- [AES V4INIT: research, SASS, 2-pair A/B and full-proof validation (Japanese)](docs/AES_V4INIT_OPTIMIZATION_2026-11-21.md)
 
 The original project's usage, build instructions, hardware compatibility and performance comparisons are preserved below. This fork does not modify or imply endorsement by the upstream project.
 
@@ -75,7 +98,7 @@ The original project's usage, build instructions, hardware compatibility and per
 
 **Latest measured configuration:** `T1/T2/T3 Fine Bits = 8/16/16` with T2/T3 **16+4-bit compressed direct lookup** (`POS2GPU_FINE_DIRECT=1`, `COMPACT=1`) on Windows 11 / RTX 4070 SUPER, k=28 / Strength 6. The 10-plot measurement (plus one excluded warmup) achieved **27.27 s/plot** versus **27.95 s/plot** for 16-bit + binary search and **28.74 s/plot** for the 8-bit baseline. The saved 16-bit group offsets (128 MiB) and 4-bit suffix-start table (256 MiB) share the same **384 MiB** pool scratch between T2 and T3. A 255+-row group falls back to exact binary search; the default remains disabled.
 
-This is a *performance result*, **not a new full-proof correctness certification**: the new direct-lookup path still needs dedicated GPU parity and `verify --full` of an actual plot. It currently applies only to the **SYCL T2/T3 all-buckets COMPACT** path, not every backend/tier.
+The Fine Bucket implementation alone initially lacked a new full-proof validation result. A later **combined** Fine Direct + Compact/Tezcan + V4INIT k=28/Strength 6 plot passed **114/114 full proofs**. A dedicated same-input CPU/GPU byte-parity test for Fine Direct alone is still not recorded. Fine Direct applies only to the **SYCL T2/T3 all-buckets COMPACT** path, not every backend/tier.
 
 See the complete design, reproducible PowerShell command, measurements, limits and verification checklist in [Fine Bucket 16+4 optimization record](docs/FINE_BUCKET_OPTIMIZATION_2026-11-21.md).
 

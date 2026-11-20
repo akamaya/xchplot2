@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cerrno>
+#include <cstdlib>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -124,7 +125,18 @@ inline void move_private_path(std::filesystem::path const& source, std::filesyst
         throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "publish private storage: " + destination.string());
 }
 
-inline int create_private_temp(std::string& path, DWORD flags = 0)
+// Only plot payloads may use SMB share permissions. Keep all other temporary
+// files (notably the secret-bearing job manifest) owner-only by default.
+// Explicitly opt in for *farmable* plot payloads, whose memo contains a master SK.
+inline bool is_unc_share_path(std::filesystem::path const& path)
+{
+    auto const& name = path.native();
+    if (name.rfind(L"\\\\?\\UNC\\", 0) == 0) return true;
+    return name.rfind(L"\\\\", 0) == 0 &&
+           name.rfind(L"\\\\?\\", 0) != 0 && name.rfind(L"\\\\.\\", 0) != 0;
+}
+
+inline int create_private_temp(std::string& path, DWORD flags = 0, bool allow_smb_share_acl = false)
 {
     std::string const prefix = path.substr(0, path.size() - 6); // caller's XXXXXX template
     std::random_device random;
@@ -132,7 +144,32 @@ inline int create_private_temp(std::string& path, DWORD flags = 0)
         path = prefix + std::to_string((std::uint64_t(random()) << 32) | random());
         auto const native = std::filesystem::path(reinterpret_cast<char8_t const*>(path.c_str()));
         HANDLE file;
-        try { file = create_private_file_handle(native, GENERIC_READ | GENERIC_WRITE, CREATE_NEW, flags, FILE_SHARE_DELETE); }
+        try {
+            if (allow_smb_share_acl && is_unc_share_path(native)) {
+                // Samba SMB shares may remap the Windows owner SID and ignore
+                // SE_DACL_PROTECTED. For trusted plot output only, use the
+                // share's server-side ACL; creation remains exclusive.
+                if (native.filename().native().find(L':') != std::wstring::npos)
+                    throw std::invalid_argument("alternate data streams are not supported: " + native.string());
+                file = ::CreateFileW(native.c_str(), GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+                    flags | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                if (file == INVALID_HANDLE_VALUE)
+                    throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                        "create SMB plot temporary file: " + native.string());
+                BY_HANDLE_FILE_INFORMATION info{};
+                if (::GetFileType(file) != FILE_TYPE_DISK ||
+                    !::GetFileInformationByHandle(file, &info) ||
+                    (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+                    ::CloseHandle(file);
+                    ::DeleteFileW(native.c_str());
+                    throw std::runtime_error("SMB plot temporary file is not a regular file");
+                }
+            } else {
+                file = create_private_file_handle(native, GENERIC_READ | GENERIC_WRITE,
+                    CREATE_NEW, flags, FILE_SHARE_DELETE);
+            }
+        }
         catch (std::system_error const& error) { if (error.code().value() == ERROR_FILE_EXISTS || error.code().value() == ERROR_ALREADY_EXISTS) continue; throw; }
         struct Cleanup {
             HANDLE file;

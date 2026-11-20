@@ -504,7 +504,12 @@ size_t write_plot_file_parallel(
     std::vector<char> iobuf(size_t{4} << 20);
     std::string partial = filename + ".partial.XXXXXX";
 #ifdef _WIN32
-    int const fd = create_private_temp(partial);
+    // Bench/test outputs without a memo contain no master key, so the SMB
+    // share may apply its own ACL. Farmable plots embed a master secret key
+    // in the memo and require an explicit trust decision for SMB output.
+    char const* trust_smb = std::getenv("POS2GPU_TRUST_SMB_PLOT_OUTPUT");
+    bool const trusted = trust_smb && trust_smb[0] == '1' && trust_smb[1] == '\0';
+    int const fd = create_private_temp(partial, 0, memo.empty() || trusted);
 #else
     int const fd = ::mkstemp(partial.data());
 #endif

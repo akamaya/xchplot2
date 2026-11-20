@@ -20,6 +20,7 @@
 
 #include "gpu/AesGpu.cuh"
 #include "gpu/AesHashGpu.cuh"
+#include "gpu/FineBucketConfig.hpp"
 #include "gpu/T1Kernel.cuh"
 #include "gpu/T1Offsets.cuh"
 
@@ -45,12 +46,13 @@ T1MatchParams make_t1_params(int k, int strength)
 
 namespace {
 
-constexpr int kT1FineBits = 8;
+// Fine bits are runtime-configurable via POS2GPU_T1_FINE_BITS.
 
 struct T1Derived {
     uint32_t num_sections;
     uint32_t num_match_keys;
     uint32_t num_buckets;
+    int      fine_bits;
     uint64_t fine_entries;
     size_t   bucket_bytes;
     size_t   fine_bytes;
@@ -65,7 +67,10 @@ T1Derived derive_t1(T1MatchParams const& params)
     d.num_sections    = 1u << params.num_section_bits;
     d.num_match_keys  = 1u << params.num_match_key_bits;
     d.num_buckets     = d.num_sections * d.num_match_keys;
-    uint64_t const fine_count = 1ull << kT1FineBits;
+    d.fine_bits = fine_bucket_bits(1, params.num_match_target_bits);
+    uint64_t const fine_count = 1ull << d.fine_bits;
+    if (uint64_t(d.num_buckets) * fine_count > UINT_MAX)
+        throw std::invalid_argument("fine bucket index exceeds 32-bit GPU launch count");
     d.fine_entries    = uint64_t(d.num_buckets) * fine_count + 1;
     d.bucket_bytes    = sizeof(uint64_t) * (d.num_buckets + 1);
     d.fine_bytes      = sizeof(uint64_t) * d.fine_entries;
@@ -102,19 +107,22 @@ void launch_t1_match_prepare(
     }
     if (*temp_bytes < d.temp_needed) throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_sorted_xs || !d_out_count)  throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.num_match_target_bits <= kT1FineBits) throw std::invalid_argument("invalid argument to launch wrapper");
 
     auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
     auto* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    FineBucketTimer fine_timer(1, d.fine_bits);
 
     launch_compute_bucket_offsets(
         d_sorted_xs, total,
         params.num_match_target_bits,
         d.num_buckets, d_offsets, q);
+    fine_timer.mark("bucket_offsets", q);
     launch_compute_fine_bucket_offsets(
         d_sorted_xs, d_offsets,
-        params.num_match_target_bits, kT1FineBits,
+        params.num_match_target_bits, d.fine_bits,
         d.num_buckets, d_fine_offsets, q);
+    fine_timer.mark("fine_offsets", q);
     q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
 }
 
@@ -157,18 +165,20 @@ void launch_t1_match_range(
     int const num_test_bits     = params.num_match_key_bits;
     int const num_info_bits     = params.k;
 
+    FineBucketTimer fine_timer(1, d.fine_bits);
     launch_t1_match_all_buckets(
         keys, d_sorted_xs,
         const_cast<uint64_t const*>(d_offsets),
         const_cast<uint64_t const*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
-        params.num_match_target_bits, kT1FineBits,
+        params.num_match_target_bits, d.fine_bits,
         extra_rounds_bits, d.target_mask,
         num_test_bits, num_info_bits,
         d_out_meta, d_out_mi, d_out_count,
         capacity, d.l_count_max,
         bucket_begin, bucket_end, q);
+    fine_timer.mark("match_fused", q);
 }
 
 void launch_t1_match(

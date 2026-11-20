@@ -6,11 +6,15 @@
 // upload analogous to the CUDA cudaMemcpyToSymbolAsync path.
 
 #include "gpu/MatchKernelCommon.cuh"
+#include "gpu/FineBucketDirect.hpp"
+#include "gpu/MatchDiag.hpp"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T3Offsets.cuh"
 #include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
+#include <chrono>
+#include <new>
 
 #include <cstdint>
 #include <cstdio>
@@ -593,6 +597,146 @@ bool t3_twophase_enabled()
 
 } // namespace
 
+// Diagnostics only: sample the SAME T3 compact workgroups for four stages:
+//   AES target, AES+search/scan, +pairing AES, +accepted-pair Feistel.
+// No mutation of production match output. Stage differences are GPU kernel
+// runtime estimates (not cycle-accurate isolated instruction costs).
+// The separate scan is deliberately uncapped; this is the actual sampled
+// candidate distribution, not the production path's 513-count saturation.
+template<bool WithSearch, bool CollectStats,
+         bool WithPairing = false, bool WithFeistel = false>
+static void launch_t3_match_diag_probe(
+    AesHashKeys keys,
+    FeistelKey fk,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_xbits,
+    uint32_t const* d_sorted_mi,
+    uint64_t const* d_offsets,
+    uint64_t const* d_fine_offsets,
+    uint32_t num_match_keys,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    bool use_tezcan,
+    uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    uint32_t group_stride,
+    uint32_t* d_digest,
+    MatchDiagStats* d_stats,
+    sycl::queue& q)
+{
+    constexpr size_t threads = 256;
+    size_t const n_buckets = size_t(bucket_end - bucket_begin);
+    size_t const original_groups = size_t((l_count_max + threads - 1) / threads);
+    size_t const sampled_groups = (original_groups + group_stride - 1) / group_stride;
+    if (!sampled_groups || !n_buckets) return;
+    uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> sT_local{sycl::range<1>{16 * 256}, h};
+        h.parallel_for(
+            sycl::nd_range<2>{sycl::range<2>{n_buckets, sampled_groups * threads},
+                              sycl::range<2>{1, threads}},
+            [=, keys_copy = keys, fk_copy = fk](sycl::nd_item<2> it) {
+                uint32_t* sT = &sT_local[0];
+                uint32_t local_id = uint32_t(it.get_local_id(1));
+                #pragma unroll 1
+                for (uint32_t i = local_id; i < 16 * 256; i += uint32_t(threads)) {
+                    if (use_tezcan) sT[i] = d_aes_tables[i / 16];
+                    else if (i < 4 * 256) sT[i] = d_aes_tables[i];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                uint32_t bucket_id = bucket_begin + uint32_t(it.get_group(0));
+                uint32_t section_l = bucket_id / num_match_keys;
+                uint32_t match_key_r = bucket_id % num_match_keys;
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
+                uint32_t r_bucket = section_r * num_match_keys + match_key_r;
+                uint64_t l_start = d_offsets[section_l * num_match_keys];
+                uint64_t l_end = d_offsets[(section_l + 1) * num_match_keys];
+                uint64_t l = l_start + uint64_t(it.get_group(1)) *
+                              uint64_t(group_stride) * uint64_t(threads) + local_id;
+
+                uint32_t target_l = 0;
+                uint64_t first = 0;
+                uint32_t count = 0;
+                uint32_t pair_digest = 0;
+                if (l < l_end) {
+                    uint64_t meta_l = d_sorted_meta[l];
+                    target_l = (use_tezcan
+                        ? t3c_tezcan_target(keys_copy, 3u, match_key_r, meta_l,
+                                           sT, 0, local_id & 15u)
+                        : pos2gpu::matching_target_smem(
+                            keys_copy, 3u, match_key_r, meta_l, sT, 0)) & target_mask;
+                    if constexpr (WithSearch) {
+                        uint32_t shift = uint32_t(num_match_target_bits - fine_bits);
+                        uint32_t fine_key = target_l >> shift;
+                        uint64_t fine_idx = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                        uint64_t fine_hi = d_fine_offsets[fine_idx + 1];
+                        first = pos2gpu::fine_bucket_lower_bound(
+                            d_sorted_mi, d_fine_offsets[fine_idx], fine_hi,
+                            target_l, target_mask);
+                        for (uint64_t r = first; r < fine_hi; ++r) {
+                            if ((d_sorted_mi[r] & target_mask) != target_l) break;
+                            ++count;
+                        }
+                        if constexpr (WithPairing) {
+                            for (uint64_t r = first; r < fine_hi; ++r) {
+                                if ((d_sorted_mi[r] & target_mask) != target_l) break;
+                                uint64_t meta_r = d_sorted_meta[r];
+                                Result128 res = use_tezcan
+                                    ? t3c_tezcan_pairing(keys_copy, meta_l, meta_r,
+                                                         sT, 0, local_id & 15u)
+                                    : pos2gpu::pairing_smem(
+                                        keys_copy, meta_l, meta_r, sT, 0);
+                                // Consume every pairing result even when no Feistel is used.
+                                pair_digest ^= res.r[0] ^ res.r[3];
+                                if constexpr (WithFeistel) {
+                                    uint32_t test_mask = num_test_bits >= 32
+                                        ? 0xFFFFFFFFu : ((1u << num_test_bits) - 1u);
+                                    if ((res.r[3] & test_mask) == 0) {
+                                        uint32_t xb_l = d_sorted_xbits[l];
+                                        uint32_t xb_r = d_sorted_xbits[r];
+                                        uint64_t all_x_bits = (uint64_t(xb_l) << k) | uint64_t(xb_r);
+                                        uint64_t fragment = pos2gpu::feistel_encrypt(
+                                            fk_copy, all_x_bits);
+                                        pair_digest ^= uint32_t(fragment) ^ uint32_t(fragment >> 32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Prevent the compiler from deleting AES/search/pairing/Feistel
+                // as unused work. One output slot per sampled workgroup.
+                uint32_t digest = target_l;
+                if constexpr (WithSearch)
+                    digest ^= uint32_t(first) ^ (count * 0x9e3779b9u);
+                if constexpr (WithPairing)
+                    digest ^= pair_digest;
+                uint32_t group_digest = sycl::reduce_over_group(
+                    it.get_group(), digest, sycl::plus<uint32_t>{});
+                if (local_id == 0) {
+                    d_digest[size_t(it.get_group(0)) * sampled_groups +
+                             size_t(it.get_group(1))] = group_digest;
+                }
+                if constexpr (CollectStats) {
+                    unsigned long long group_total = sycl::reduce_over_group(
+                        it.get_group(), static_cast<unsigned long long>(count),
+                        sycl::plus<unsigned long long>{});
+                    unsigned long long group_max_lane = sycl::reduce_over_group(
+                        it.get_group(), static_cast<unsigned long long>(count),
+                        sycl::maximum<unsigned long long>{});
+                    if (local_id == 0)
+                        record_match_diag_group(d_stats, group_total, group_max_lane);
+                }
+            });
+    }).wait();
+}
+
 static void launch_t3_match_all_buckets_compact(
     AesHashKeys keys,
     FeistelKey fk,
@@ -617,6 +761,12 @@ static void launch_t3_match_all_buckets_compact(
     uint32_t bucket_end,
     sycl::queue& q)
 {
+    // Only this SYCL all-buckets COMPACT kernel uses the compressed suffix index.
+    uint8_t const* d_direct_offsets = pos2gpu::fine_direct16_enabled(
+        fine_bits, num_match_target_bits)
+        ? pos2gpu::fine_direct16_ptr(const_cast<uint64_t*>(d_fine_offsets), num_buckets)
+        : nullptr;
+
     (void)num_buckets;  // only the [begin, end) sub-range is iterated
     if (bucket_end <= bucket_begin) return;
     uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
@@ -634,6 +784,15 @@ static void launch_t3_match_all_buckets_compact(
 
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
+
+    MatchDiagOptions const diag = MatchDiagOptions::read();
+    MatchDiagStats* d_match_diag_stats = nullptr;
+    if (diag.enabled) {
+        d_match_diag_stats = sycl::malloc_device<MatchDiagStats>(1, q);
+        if (!d_match_diag_stats) throw std::bad_alloc();
+        q.memset(d_match_diag_stats, 0, sizeof(MatchDiagStats)).wait();
+    }
+    auto const production_start = std::chrono::steady_clock::now();
 
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> sT_local{
@@ -689,10 +848,11 @@ static void launch_t3_match_all_buckets_compact(
                     uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
                     uint32_t fine_key = target_l >> fine_shift;
                     uint64_t fine_idx = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                    fine_hi = d_fine_offsets[fine_idx + 1];
-                    first = pos2gpu::fine_bucket_lower_bound(
-                        d_sorted_mi, d_fine_offsets[fine_idx], fine_hi,
-                        target_l, target_mask);
+                    auto const range = pos2gpu::fine_direct16_find(
+                        d_sorted_mi, d_fine_offsets, d_direct_offsets,
+                        fine_idx, target_l, target_mask);
+                    first = range.first;
+                    fine_hi = range.end;
                     for (uint64_t r = first; r < fine_hi; ++r) {
                         if ((d_sorted_mi[r] & target_mask) != target_l) break;
                         if (++count > pair_cap) break;
@@ -726,6 +886,11 @@ static void launch_t3_match_all_buckets_compact(
                 it.barrier(sycl::access::fence_space::local_space);
                 uint32_t n = total_local[0];
                 if (n > pair_cap) {
+                    if (d_match_diag_stats && local_id == 0) {
+                        using Atomic = sycl::atomic_ref<unsigned long long,
+                            sycl::memory_order::relaxed, sycl::memory_scope::device>;
+                        Atomic{d_match_diag_stats->fallback_groups}.fetch_add(1ULL);
+                    }
                     // Uniform group-wide fallback: reprocess ALL matches.
                     // Count may be truncated at pair_cap+1 during enumeration.
                     if (l < l_end) {
@@ -750,6 +915,89 @@ static void launch_t3_match_all_buckets_compact(
                 }
             });
     }).wait();
+    auto const production_end = std::chrono::steady_clock::now();
+    if (diag.enabled) {
+        using Clock = std::chrono::steady_clock;
+        MatchDiagStats host_stats{};
+        uint32_t first_digest = 0;
+        size_t const sampled_groups =
+            ((size_t(l_count_max + 255) / 256) + diag.stride - 1) / diag.stride;
+        size_t const total_sampled_groups =
+            size_t(bucket_end - bucket_begin) * sampled_groups;
+        auto* d_digest = sycl::malloc_device<uint32_t>(total_sampled_groups, q);
+        if (!d_digest) {
+            sycl::free(d_match_diag_stats, q);
+            throw std::bad_alloc();
+        }
+        auto run_stage = [&](int stage) {
+            if (stage == 0)
+                launch_t3_match_diag_probe<false, false>(
+                    keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
+                    d_offsets, d_fine_offsets, num_match_keys, k,
+                    num_section_bits, num_match_target_bits, fine_bits,
+                    target_mask, num_test_bits, use_tezcan, l_count_max,
+                    bucket_begin, bucket_end, diag.stride, d_digest,
+                    d_match_diag_stats, q);
+            else if (stage == 1)
+                launch_t3_match_diag_probe<true, false>(
+                    keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
+                    d_offsets, d_fine_offsets, num_match_keys, k,
+                    num_section_bits, num_match_target_bits, fine_bits,
+                    target_mask, num_test_bits, use_tezcan, l_count_max,
+                    bucket_begin, bucket_end, diag.stride, d_digest,
+                    d_match_diag_stats, q);
+            else if (stage == 2)
+                launch_t3_match_diag_probe<true, false, true>(
+                    keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
+                    d_offsets, d_fine_offsets, num_match_keys, k,
+                    num_section_bits, num_match_target_bits, fine_bits,
+                    target_mask, num_test_bits, use_tezcan, l_count_max,
+                    bucket_begin, bucket_end, diag.stride, d_digest,
+                    d_match_diag_stats, q);
+            else
+                launch_t3_match_diag_probe<true, false, true, true>(
+                    keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
+                    d_offsets, d_fine_offsets, num_match_keys, k,
+                    num_section_bits, num_match_target_bits, fine_bits,
+                    target_mask, num_test_bits, use_tezcan, l_count_max,
+                    bucket_begin, bucket_end, diag.stride, d_digest,
+                    d_match_diag_stats, q);
+        };
+        double stage_ms[4] = {0, 0, 0, 0};
+        // JIT warmup of all variants, then alternating traversal to reduce
+        // order effects. Timers include kernel-launch overhead, consistently.
+        for (int stage = 0; stage < 4; ++stage) run_stage(stage);
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            for (int step = 0; step < 4; ++step) {
+                int stage = repeat == 0 ? step : 3 - step;
+                auto begin = Clock::now();
+                run_stage(stage);
+                auto end = Clock::now();
+                stage_ms[stage] +=
+                    std::chrono::duration<double, std::milli>(end - begin).count() / 2.0;
+            }
+        }
+        // Full, uncapped candidate histogram on sampled workgroups.
+        launch_t3_match_diag_probe<true, true>(
+            keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
+            d_offsets, d_fine_offsets, num_match_keys, k,
+            num_section_bits, num_match_target_bits, fine_bits,
+            target_mask, num_test_bits, use_tezcan, l_count_max,
+            bucket_begin, bucket_end, diag.stride, d_digest,
+            d_match_diag_stats, q);
+        q.memcpy(&first_digest, d_digest, sizeof(first_digest)).wait();
+        q.memcpy(&host_stats, d_match_diag_stats, sizeof(host_stats)).wait();
+        double fused_ms = std::chrono::duration<double, std::milli>(
+            production_end - production_start).count();
+        print_match_diag_stats(3, diag.stride, stage_ms[0], stage_ms[1],
+                               stage_ms[2], fused_ms, host_stats, first_digest);
+        std::fprintf(stderr,
+            "[match-diag] T3 aes_search_pair_feistel=%.3fms "
+            "feistel_delta=%.3fms (accepted candidates only)\n",
+            stage_ms[3], stage_ms[3] - stage_ms[2]);
+        sycl::free(d_digest, q);
+        sycl::free(d_match_diag_stats, q);
+    }
 }
 
 void launch_t3_match_all_buckets(

@@ -20,6 +20,7 @@
 #include "host/HostGuard.hpp"      // pinned-host redzones — see header
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/FineBucketConfig.hpp"
 #include "gpu/XsKernel.cuh"
 #include "gpu/XsKernels.cuh"   // launch_xs_gen / launch_xs_pack (stage 4e)
 #include "gpu/T1Kernel.cuh"
@@ -595,6 +596,8 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           nullptr, nullptr, d_count, cap,
                           nullptr, &t1_temp_bytes, q);
+    if (t1_temp_bytes > pool.sort_scratch_bytes)
+        throw std::runtime_error("T1 fine index exceeds pooled sort scratch");
     // The queue is out-of-order: wait so the counter zeroing can't be
     // scheduled after the match kernel that increments it.
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
@@ -639,6 +642,8 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
                           nullptr, nullptr, nullptr, d_count, cap,
                           nullptr, &t2_temp_bytes, q);
+    if (t2_temp_bytes > pool.sort_scratch_bytes)
+        throw std::runtime_error("T2 fine index exceeds pooled sort scratch");
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t2 = begin_phase("T2 match");
     launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
@@ -678,6 +683,8 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
                           nullptr, t2_count,
                           d_t3, d_count, cap,
                           nullptr, &t3_temp_bytes, q);
+    if (t3_temp_bytes > pool.sort_scratch_bytes)
+        throw std::runtime_error("T3 fine index exceeds pooled sort scratch");
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t3 = begin_phase("T3 match + Feistel");
     launch_t3_match(cfg.plot_id.data(), t3p,
@@ -2874,7 +2881,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             //   [0 .. num_buckets]      = bucket offsets (u64)
             //   [num_buckets+1 .. + fine_count + 1] = fine offsets (u64)
             // fine_count = num_buckets * 2^kT2FineBits with kT2FineBits=8.
-            constexpr int kT2FineBitsLocal = 8;
+            int const kT2FineBitsLocal = fine_bucket_bits(2, t2p.num_match_target_bits);
+            FineBucketTimer fine_timer(2, kT2FineBitsLocal);
             uint32_t const num_buckets_t2 = num_buckets_t2_early;
             uint32_t const fine_count =
                 num_buckets_t2 * (1u << kT2FineBitsLocal);
@@ -2908,11 +2916,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     : h_fine_off[uint64_t(b) << kT2FineBitsLocal];
             }
 
+            fine_timer.mark("fine_offsets_host", q);
             q.memcpy(d_t2_match_temp, h_bucket_off.data(),
                      (num_buckets_t2 + 1) * sizeof(uint64_t)).wait();
             q.memcpy(static_cast<uint64_t*>(d_t2_match_temp) + (num_buckets_t2 + 1),
                      h_fine_off.data(),
                      (fine_count + 1) * sizeof(uint64_t)).wait();
+            fine_timer.mark("fine_offsets_upload", q);
             q.memset(d_counter, 0, sizeof(uint64_t)).wait();
         } else {
             launch_t2_match_prepare(cfg.plot_id.data(), t2p,
@@ -4113,7 +4123,8 @@ t3_match_entry:
         // (264 MB at k=26 / 1 GB at k=28) that previously bounded
         // T3 match phase from above.
         if (scratch.tiny_mode) {
-            constexpr int kT3FineBitsLocal = 8;
+            int const kT3FineBitsLocal = fine_bucket_bits(3, t3p.num_match_target_bits);
+            FineBucketTimer fine_timer(3, kT3FineBitsLocal);
             uint32_t const num_buckets_t3_p =
                 (1u << t3p.num_section_bits) * (1u << t3p.num_match_key_bits);
             uint32_t const fine_count =
@@ -4149,11 +4160,13 @@ t3_match_entry:
                     : h_fine_off[uint64_t(b) << kT3FineBitsLocal];
             }
 
+            fine_timer.mark("fine_offsets_host", q);
             q.memcpy(d_t3_match_temp, h_bucket_off.data(),
                      (num_buckets_t3_p + 1) * sizeof(uint64_t)).wait();
             q.memcpy(static_cast<uint64_t*>(d_t3_match_temp) + (num_buckets_t3_p + 1),
                      h_fine_off.data(),
                      (fine_count + 1) * sizeof(uint64_t)).wait();
+            fine_timer.mark("fine_offsets_upload", q);
             q.memset(d_counter, 0, sizeof(uint64_t)).wait();
         } else {
             launch_t3_match_prepare(cfg.plot_id.data(), t3p,

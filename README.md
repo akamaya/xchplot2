@@ -3,53 +3,69 @@
 <!-- BEGIN XCHPLOT2-FORK-OPTIMIZATION -->
 
 > [!NOTE]
-> **Experimental optimization fork.** This fork aims to maximize Chia PoS2 plot-generation performance on **Windows 11 with a 12 GB VRAM GPU at Strength 6** (currently benchmarked at k=28 on an NVIDIA RTX 4070 SUPER). It is based on [Jsewill/xchplot2](https://github.com/Jsewill/xchplot2); the original project documentation continues below.
+> **Experimental optimization fork.** This fork targets fast, correct Chia PoS2 plot generation on **native Windows 11 with a 12 GB VRAM NVIDIA GPU at k=28 / Strength 6**. Measurements below use an RTX 4070 SUPER with SYCL / AdaptiveCpp (CUDA backend). Based on [Jsewill/xchplot2](https://github.com/Jsewill/xchplot2); the original project documentation continues below.
 
 ## Windows 11 / 12 GB VRAM / Strength 6 optimization
 
-**Goal:** Achieve the fastest practical, correct k=28 / Strength 6 Chia Plot2 generation on a 12 GB NVIDIA GPU running native Windows 11.
+**Goal:** Maximize practical k=28 / Strength 6 throughput within the available VRAM of a 12 GB GPU, without sacrificing proof correctness.
 
 ### Measured progress
 
-| Iteration | Steady-state time | Notes |
+| Iteration | Steady-state time | What changed |
 |---|---:|---|
 | Initial SYCL baseline | 68.17 s/plot | Baseline implementation |
-| Tezcan-style AES integrated into T1 | 67.84 s/plot | Standalone AES improved, but end-to-end gains were small |
-| T1 Local Compaction enabled | 58.32 s/plot | Group candidate pairs in GPU shared memory to reduce warp divergence |
-| T2/T3 two-phase path disabled | **44.57 s/plot** | Avoid candidate-buffer overflows and costly fallback recomputation |
+| T1 Tezcan AES only | 67.84 s/plot | Fast AES alone gave little end-to-end improvement |
+| T1 Local Compaction | 58.32 s/plot | Work-group candidate compaction reduced warp divergence |
+| T2/T3 two-phase disabled | 44.57 s/plot | Avoided costly scratch-overflow fallback/recomputation |
+| T2 Local Compaction, Tezcan OFF | 39.72 s/plot | T2 candidate compaction |
+| T2 Local Compaction + banked Tezcan | 36.75 s/plot | T2 match reduced to about 9.79 s |
+| T3 Local Compaction, Tezcan OFF | 32.11 s/plot | T3 candidate compaction |
+| **T3 Local Compaction + banked Tezcan** | **29.10 s/plot** | **T3 match + Feistel reduced to about 10.02 s** |
 
-**Measured result:** approximately **34.6% less time per plot** than the initial baseline, or **1.53x throughput**. Final measured output rate: **53 TiB/month** (30-day projection). Results are specific to the test hardware, plot settings, and benchmark setup; they are not a claim of a world record.
+**Best measured result (2026-11-20):** **29.10 s/plot**, down **57.3%** from the initial 68.17 s/plot (**2.34x throughput**). The measured end-to-end rate was **81.2 TiB/month** (30-day projection), up from 64.3 TiB/month after T2 optimization.
+
+These are **opt-in experimental optimizations**, not default settings or a world-record claim. Intermediate rows include measurements from different runs; the T2 and T3 Tezcan ON/OFF comparisons used one warmup plus three measured plots in each configuration.
 
 ### Benchmark configuration
 
-- **GPU:** NVIDIA GeForce RTX 4070 SUPER, 12 GB VRAM (`gpu0`)
-- **OS:** Windows 11; **backend:** SYCL / AdaptiveCpp targeting CUDA
-- **Plot:** k=28, Strength 6; one GPU worker
-- **Measurement:** one warm-up plot, three measured plots
-- **Peak VRAM:** 10,474 MiB in the final run (of 11,069 MiB available at benchmark start)
+- **GPU:** NVIDIA GeForce RTX 4070 SUPER, 12 GB VRAM (`gpu0`); one GPU plotting worker
+- **OS / backend:** Windows 11; SYCL / AdaptiveCpp targeting CUDA
+- **Workload:** k=28, Strength 6; synthetic `.gplot` benchmark output
+- **Measurement:** one warmup plot followed by three measured plots
+- **Fastest measured stage times:** T1 match ~7.8 s; T2 match ~9.8 s; T3 match + Feistel ~10.0 s
+- **Peak device-wide VRAM use:** 10,474 MiB, with 11,069 MiB free at benchmark start and a minimum of 595 MiB remaining
+- **Steady-state spread:** 28.98窶・9.21 s/plot, standard deviation 0.11 s in the fastest three-plot run
 
-To reproduce the currently fastest tested configuration in PowerShell (after building):
+### Reproduce the optimized configuration
+
+On the `aes-optimize` branch, after building the Windows SYCL target, run the following in **PowerShell** from the repository root:
 
 ```powershell
-$env:POS2GPU_T1_COMPACT = '1'
-$env:POS2GPU_T2_TWOPHASE = '0'
-$env:POS2GPU_T3_TWOPHASE = '0'
-$env:POS2GPU_PHASE_TIMING = '1'
-
-.\build\windows-sycl\tools\xchplot2\xchplot2.exe bench `
-    -k 28 -s 6 -n 3 --warmup 1 --devices gpu0 `
-    -o D:\plots_test
+$env:POS2GPU_T1_COMPACT='1'; $env:POS2GPU_T2_COMPACT='1'; $env:POS2GPU_T2_TEZCAN='1'; $env:POS2GPU_T2_TWOPHASE='0'; $env:POS2GPU_T3_COMPACT='1'; $env:POS2GPU_T3_TEZCAN='1'; $env:POS2GPU_T3_TWOPHASE='0'; $env:POS2GPU_PHASE_TIMING='1'
+.\build\windows-sycl\tools\xchplot2\xchplot2.exe bench -k 28 -s 6 -n 3 --warmup 1 --devices gpu0 -o D:\plots_test
 ```
 
-Replace `gpu0` and the output directory with values suitable for your machine. The options above are **runtime environment variables**; they are not persisted by `git commit`.
+Change the output directory and device ID as needed. These environment variables affect the current PowerShell process and its child processes; they are **not** enabled by a Git commit. The benchmark creates **synthetic, non-farmable** plots and removes them on exit unless `--keep` is supplied.
 
-### Optimization notes and validity
+### Correctness and verification
 
-- [Full investigation and measurements (Markdown, Japanese)](docs/OPTIMIZATION_HISTORY_2026-11-20.md)
-- [Offline graph report (HTML, Japanese)](docs/OPTIMIZATION_REPORT_2026-11-20.html)
-- Standalone Tezcan AES tests passed their output comparisons; the earlier T1 parity run matched 4,189,913 results.
-- **Validation pending:** CPU/GPU parity with the *final* T1 Local Compaction path enabled, broader Strength/k coverage, and verification of generated plots. Treat this as an experimental branch until those checks pass.
-- The original project's standard usage, build instructions, and compatibility information remain below. This fork does not change the upstream project or imply endorsement by the upstream maintainers.
+- **T2 CPU/GPU parity:** **30/30 PASS** at k=18, covering Strength 2窶・ and multiple plot IDs/seeds.
+- **T2 single-GPU / sharded parity:** **6/6 PASS** at k=18/20/22.
+- **T2-generated k=28 / Strength 6 plot:** `verify --trials 100 --full` validated **126/126 full proofs**.
+- **T3 single-GPU / sharded parity:** **6/6 PASS** at k=18/20/22, comparing the full 64-bit proof fragments.
+- **T3-optimized k=28 / Strength 6 plot:** `verify --trials 100 --full` validated **91/91 full proofs**.
+- Earlier T1 parity tests matched 4,189,913 results, but the final T1 Local Compaction path has not been documented here as independently passing broad CPU-reference parity.
+
+Full-proof checks sample random challenges; they do **not** exhaustively certify all possible proofs, GPU models, strength settings, or streaming tiers. The optimization branch remains experimental.
+
+### Detailed optimization records
+
+- [T1 investigation and benchmark history (Japanese)](docs/OPTIMIZATION_HISTORY_2026-11-20.md)
+- [T1 offline graph report (HTML, Japanese)](docs/OPTIMIZATION_REPORT_2026-11-20.html)
+- [T2 Local Compaction / Tezcan implementation and parity checks (Japanese)](docs/t2_gpu_optimization_2026-11-20.md)
+- [T3 Local Compaction / Tezcan implementation and proof verification (Japanese)](docs/t3_gpu_optimization_2026-11-20.md)
+
+The original project's usage, build instructions, hardware compatibility and performance comparisons are preserved below. This fork does not modify or imply endorsement by the upstream project.
 
 ---
 

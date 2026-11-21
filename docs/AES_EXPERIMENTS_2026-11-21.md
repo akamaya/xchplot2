@@ -6,7 +6,7 @@ xchplot2 の Windows 11 / AdaptiveCpp SYCL (CUDA backend) における T1/T2/T3 
 
 - GPU：**NVIDIA GeForce RTX 4070 SUPER（12 GB）**。原則 `262144` AES states、256 AES round-key *pairs* = **512 AES rounds**、または16 pairs = **32 AES rounds**。BitSlice初期試験のみ `65536` states。
 - 既存高速実装：**Rotate16**。AES T0を16複製（16 KiB shared memory）、T1/T2/T3相当の値を32bit回転で再構成。元の4テーブルT-table版を出力一致の基準とした。
-- **今回列挙する失敗候補は、本番コードへ採用しない**。例外的に採用した `V4INIT`（初期化128bit化）は別資料 [`AES_V4INIT_OPTIMIZATION_2026-11-21.md`](AES_V4INIT_OPTIMIZATION_2026-11-21.md) に記載。
+- **採用：** 既存の16複製T0、V4INIT（128bit初期化）、今回の **Shared16 direct-address（T2/T3のみ）**。その他の候補は不採用または改善未確認。V4INITの詳細は [`AES_V4INIT_OPTIMIZATION_2026-11-21.md`](AES_V4INIT_OPTIMIZATION_2026-11-21.md) を参照。
 - 以下の数値は過去の対話・ベンチログ・実験READMEから回収した記録。**元のログが現在のリポジトリで公開されていない値は「記録値」として扱い、厳密な再現・統計保証はしない**。条件が違う表の数値を直接比較しない。
 
 ### 結果一覧
@@ -20,6 +20,11 @@ xchplot2 の Windows 11 / AdaptiveCpp SYCL (CUDA backend) における T1/T2/T3 
 | Odd Bank / 複製数12～20 | 512 rounds：**1.661～1.796 ms**（7候補） | **全候補不採用** | 記録なし |
 | 4つのT-table × 複製 | 512 rounds：最速T4_R8 **1.495 ms** 対 Rotate16 **1.029 ms** | **全候補不採用** | 記録なし |
 | Packed S-box | 512 rounds：SP16 **2.042 ms** / SP32 **1.857 ms** 対 Rotate16 **1.031 ms** | **両候補不採用** | 記録なし |
+| Direct Address（Shared16） | 512 rounds：約1.02～1.03ms。長時間A/Bで平均約1.26%短縮 | **T2/T3採用**、T1は従来版 | **phase合計1.03%短縮** |
+| Shared16各種命令順序変更 | Parity PASS、追加改善の再現性なし | 不採用 | 記録なし |
+| Shared/Global固定50:50 | 512 rounds：1.329 / 1.554ms | 不採用 | 記録なし |
+| index bit分割Hybrid | 512 rounds：2.091～2.480ms | 不採用 | 記録なし |
+| PairTable（256KiB） | 512 rounds：17.72～19.54ms | 不採用 | 記録なし |
 
 > 時間の表示は原則として実験プログラムが報告した経過時間。**512 rounds** は `sycl_aes_bench.exe ... 256`、**32 rounds** は `... 16` を意味する。ホストからの起動・同期等を含む計測値なので、純GPU命令のレイテンシを示すものではない。
 
@@ -166,7 +171,7 @@ Pythonの式検査はランダムなAES状態とキー **100,000件**で一致�
 
 ## 8. 既に採用した方式との境界
 
-- **採用：** AES T0の16複製Rotate16（既存）、`V4INIT` 128bit共有メモリ初期化（T1～T3、12箇所）。V4INITは**AES計算中の約2 Wavefront/Shared Loadという問題自体は変更しない**。
+- **採用：** AES T0の16複製Rotate16（既存）、`V4INIT` 128bit共有メモリ初期化（T1～T3、12箇所）、および**Direct Address（T2/T3 Tezcan経路のみ）**。これらはAES計算中の約2 Wavefront/Shared Loadという問題自体は変更しない。
 - **別の採用済み最適化：** Local Compaction、T2/T3 Fine Bucket 16+4直接参照、候補容量 T1=512/T2=480/T3=330。AES単体ベンチ値と、実Plotの改善率を混同しない。
 - V4INIT実Plotの同設定A/B：`phase-timing` OFF平均 **26,916.0 ms** / ON **26,450.4 ms**（**465.6 ms、1.73%短縮**）。k28 Strength6の合成Plotは `verify --full --trials 100` で **114/114 full proofs validated**。詳細は上記V4INIT資料。
 - **未採用技術を再試験する条件：** 基準・GPU・round数・state数・ビルドSHA・温度/クロック等を揃え、変更した仮説を明示すること。以前の「GlobalT0は低速」「Rotate32はoccupancy低下」を理由なく繰り返さない。
@@ -189,3 +194,90 @@ cmake --build .\build\windows-sycl --config Release --target sycl_aes_bench -j 1
 ## 10. 今後の運用ルール
 
 **採用/不採用に関係なく、各実験が終わった時点で必ず `docs/` に追記してからコミットする。** 新規実験は [`EXPERIMENT_RECORD_TEMPLATE.md`](EXPERIMENT_RECORD_TEMPLATE.md) を複製し、仮説、比較対象、機材・設定、ビルドSHA、各回の数値・ウォームアップ、パリティ、Nsight測定、採否と理由、未測定項目、次回の再検討条件を記録する。失敗実験こそ重複を避けるために残す。
+---
+
+## 11. Shared16 Direct Address・命令順序変更（T2/T3のみ採用）
+
+**仮説：** 1 AES roundあたり16回のLDSと16KiBのT0複製を維持したまま、状態wordからbyte値を取り出して添字をスケーリングする代わりに、shared-memoryの**バイトオフセット**を直接計算する。レーン/複製を`replica=0..15`とすると：
+
+```cpp
+// 元は t[((word >> (8 * byte)) & 255u) * 16 + replica]
+byte0_offset = ((word <<  6) & 0x3fc0u) | (replica << 2);
+byte1_offset = ((word >>  2) & 0x3fc0u) | (replica << 2);
+byte2_offset = ((word >> 10) & 0x3fc0u) | (replica << 2);
+byte3_offset = ((word >> 18) & 0x3fc0u) | (replica << 2);
+```
+
+**結果：** 300 samples × 6組の交互マイクロベンチでは、すべての組で改善し平均**約1.26%**短縮（当時の記録値）。ただし少数サンプルでは差がばらつく。262,144 states / 512 AES roundsの通常測定例は`shared16=1.0345 ms`、`shared16-addr=1.0318 ms`、別の回では`1.0341 ms`→`1.0242 ms`。各回の基準値が異なるので跨って単純比較しない。
+
+NCUで4 AES roundsの静的SASS命令数**340→276**、動的命令数**357,269,504→290,160,640**（約18.8%減）を観測。一方、Shared LDSの動的命令数はどちらも**67,108,864**、wavefrontはどちらも約**134.25M**。L1/TEXはほぼ飽和したまま。**SASS命令数が18.8%減っても実行時間は18.8%短縮しない**。
+
+`shared16-early`、`shared16-word`、`shared16-prmt`、`shared16-bfe`、`shared16-addr-lop3`、`shared16-addr-bfi`、`shared16-addr-xor-early`、`shared16-addr-xor-tail`などはParity PASSだが、Direct Addressに対する再現性ある追加改善は未確認。個別の揃った測定値がないので作らない。
+
+**判定：** Direct Addressのみ本番Plot A/Bへ進め、ほかの派生は不採用。
+
+## 12. Shared/Globalの50:50 Hybrid（不採用）
+
+`hybrid50-16k`は元16KiBのsharedテーブルを保持し16参照のうち8つをglobalへ、`hybrid50-8k`はsharedを8KiBにして同様に8つをglobalへ割り当てる固定分割。どちらもParity PASS（mismatches=0）。
+
+| モード | 32 AES rounds | 512 AES rounds |
+|---|---:|---:|
+| `shared16`（同一測定回） | **0.0871 ms** | **1.0249 ms** |
+| `hybrid50-16k` | 0.1040 ms | 1.3289 ms |
+| `hybrid50-8k` | 0.1245 ms | 1.5542 ms |
+
+**判定：** 全候補不採用。Global側のランダムアクセスが負担となった可能性があるが、Hybrid専用のNCUカウンタを取得していないので断定しない。
+
+## 13. T0 indexのbitでShared/Globalを分離（不採用）
+
+256エントリのT0をMSB（0..127 / 128..255）またはLSB（偶奇）で半分に分け、128エントリ×16複製=8KiBをShared、残りをGlobalへ。`512`接尾辞は512-thread/block版。すべてParity PASS（mismatches=0）。
+
+| モード | 32 AES rounds | 512 AES rounds |
+|---|---:|---:|
+| `shared16`（同一測定回） | **0.0844 ms** | **1.0345 ms** |
+| `hybridbit-msb` | 0.1593 ms | 2.0906 ms |
+| `hybridbit-lsb` | 0.1672 ms | 2.3661 ms |
+| `hybridbit-msb512` | 0.1643 ms | 2.1884 ms |
+| `hybridbit-lsb512` | 0.1833 ms | 2.4801 ms |
+
+**判定：** 全候補不採用。Warp内でShared/Globalの参照先が混在することによる命令発行の増加などが候補だが、NCU未測定につき原因は仮説。
+
+## 14. 2参照を結合した256KiB PairTable（不採用）
+
+`PairTable[(a << 8)|b] = T0[a] ^ rotl8(T0[b])`を65,536エントリ×4BのGlobalテーブルに事前計算して、16 LDS/AES roundを8 LDGに変更。256KiB自体はL2容量に入るが、32レーンにランダムな16bit indexを与えるためセクタアクセスは分散する。生成時間はベンチ計測対象外。全モードParity PASS。
+
+| モード | 32 AES rounds | 512 AES rounds |
+|---|---:|---:|
+| `shared16-addr`（同一測定回） | **0.0841 ms** | **1.0242 ms** |
+| `pair-global`（標準キャッシュ） | 1.2666 ms | **19.5448 ms** |
+| `pair-global-ca`（L1+L2） | 1.2661 ms | **17.7223 ms** |
+| `pair-global-cg`（L2） | 1.2663 ms | **17.7616 ms** |
+
+**判定：** 約17.3～19.1倍遅いため不採用。`ca`/`cg`の違いは小さい。L1/L2ヒット率やセクタ数・帯域のNCU測定はないため、具体的な律速は未確定。**キャッシュに収まる=速いではない**ことを示す実測。
+
+## 15. 本番Plot・Direct Address ABBA比較（T2/T3採用）
+
+- **環境：** Windows 11 / RTX 4070 SUPER / AdaptiveCpp SYCL CUDA backend、2026-11-21 JST。
+- **条件：** k28、Strength6、GPU0、NAS出力、`XCHPLOT2_BACKEND=sycl`、`POS2GPU_FINE_DIRECT=1`、Fine bits T1/T2/T3=8/16/16、Compact全ON、T2/T3 Tezcan全ON、T2/T3 TwoPhase全OFF、`POS2GPU_PHASE_TIMING=1`。
+- **比較：** 2種類のコンパイル時固定バイナリ。**実験時はT1/T2/T3すべてを切り替え**、AESラウンド内の実行時分岐なし。Baseline→Optimized→Optimized→BaselineのABBA順で、各回warmup1 Plotを除外し測定2 Plot。各方式4 Plotを集計。
+- **実験ログ：** `bench_local/aes_prod_addr_ab_20261121-221513/`（手元に保管、ログ本体はGit未収録）。
+
+| フェーズ | Baseline平均 | Direct Address平均 | 改善率（短縮率） |
+|---|---:|---:|---:|
+| T1 match | 7,827.4 ms | 7,839.5 ms | **-0.15%** |
+| T2 match | 8,510.5 ms | **8,392.3 ms** | **1.39%** |
+| T3 match + Feistel | 8,812.8 ms | **8,672.5 ms** | **1.59%** |
+| **phase合計** | **26,488.5 ms** | **26,216.7 ms** | **1.03%**（約272ms） |
+
+各回の測定2 Plot平均（phase合計）：Baseline 1回目 **26,477.1ms** / Optimized 1回目 **26,212.0ms** / Optimized 2回目 **26,221.4ms** / Baseline 2回目 **26,500.0ms**。Baselineへ戻すと再び時間が増加する。NAS書き込みやGPU状態を含む`steady-state`値は参考に留め、上表の`phase-timing`を主な判断材料にした。
+
+**正式採用：** T2/T3の**Tezcan AESのみ**Direct Addressに置換する。改善がなかった**T1は従来のアドレス計算を維持**。Shared16（16KiB）、LDS 16/round、V4INIT、4-tableの非Tezcan経路、Fine Bucket、Native CUDAは変更しない。実験時のcompile-time ON/OFF分岐は本番に残さない。
+
+**正当性：** 実験時のCPUでの10万ランダム状態による演算一致を確認。ユーザーはDirect Address版で生成したPlotについて`verify --full --trials 100`のPASSを報告した（検証ログの証明個数は未提供なので記載しない）。**最終コードはT1を元の実装にしたT2/T3限定構成**なので、この最終構成の実Plot時間・proof検証はまだ未実施。上の**1.03%は実験版（T1/T2/T3すべてON）の実測**であり、最終T2/T3限定版の測定値ではない。
+
+## 16. 結論・再試験ルール
+
+- **採用：** Shared16（16KiB）、V4INIT（128bit初期化）、Direct Address（T2/T3 Tezcan）。
+- **不採用：** BitSlice、ILP2/4/8、Rotate32・GlobalT0・512threads、Odd Bank、4-table、Packed S-box、Hybrid50、HybridBit、PairTable、および追加改善を確認できなかったDirect Address派生。
+- **未確定：** 384-thread/Unroll8の小改善、T2/T3限定最終実装でのPlot再測定・proof再検証。
+- 失敗候補を再試験するときは、前回から何を変えるのか、Parity、同条件A/B、必要に応じてNCUの測定項目を明確にする。AES単体ベンチだけで実Plot採否を決めない。

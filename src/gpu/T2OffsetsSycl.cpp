@@ -9,6 +9,7 @@
 #include "gpu/T2Offsets.cuh"
 #include "host/PoolSizing.hpp"
 
+#include "gpu/AesDirectAddressSycl.hpp"
 #include <sycl/sycl.hpp>
 #include <chrono>
 #include <new>
@@ -27,19 +28,8 @@ namespace pos2gpu {
 static inline AesState t2c_tezcan_round(
     AesState s, const AesState& key, const uint32_t* t, uint32_t bank)
 {
-    AesState out;
-    #pragma unroll
-    for (int c = 0; c < 4; ++c) {
-        uint32_t a = t[(s.w[c] & 255u) * 16 + bank];
-        uint32_t b = t[((s.w[(c+1)&3] >> 8) & 255u) * 16 + bank];
-        uint32_t d = t[((s.w[(c+2)&3] >> 16) & 255u) * 16 + bank];
-        uint32_t e = t[(s.w[(c+3)&3] >> 24) * 16 + bank];
-        b = (b << 8) | (b >> 24);
-        d = (d << 16) | (d >> 16);
-        e = (e >> 8) | (e << 24);
-        out.w[c] = a ^ b ^ d ^ e ^ key.w[c];
-    }
-    return out;
+    // Byte-offset address arithmetic: same T0 values and shared layout.
+    return aes_direct_addr_t0_round(s, key, t, bank);
 }
 
 static inline AesState t2c_tezcan_rounds(

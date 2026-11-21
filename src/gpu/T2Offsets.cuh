@@ -10,6 +10,7 @@
 #pragma once
 
 #include "gpu/AesHashGpu.cuh"
+#include "gpu/FineBucketIndex.hpp"
 
 #include <cstdint>
 
@@ -32,7 +33,7 @@ void launch_t2_compute_fine_bucket_offsets(
     int num_match_target_bits,
     int fine_bits,
     uint32_t num_buckets,
-    uint64_t* d_fine_offsets,
+    FineBucketOffset* d_fine_offsets,
     sycl::queue& q);
 
 // Fused T2 match. table_id=2, no strength scaling on AES rounds. Emits
@@ -57,7 +58,7 @@ void launch_t2_match_all_buckets(
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -98,7 +99,7 @@ void launch_t2_match_section_pair_split(
     uint32_t const* d_mi_r_slice,
     uint64_t section_r_row_start,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,

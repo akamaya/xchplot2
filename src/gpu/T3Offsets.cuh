@@ -8,6 +8,7 @@
 #pragma once
 
 #include "gpu/AesHashGpu.cuh"
+#include "gpu/FineBucketIndex.hpp"
 #include "gpu/FeistelCipherGpu.cuh"
 #include "gpu/T3Kernel.cuh"  // T3PairingGpu
 
@@ -38,7 +39,7 @@ void launch_t3_match_all_buckets(
     uint32_t const* d_sorted_xbits,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -78,7 +79,7 @@ void launch_t3_match_section_pair(
     uint32_t const* d_sorted_xbits,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -120,7 +121,7 @@ void launch_t3_match_section_pair_split(
     uint32_t const* d_mi_r_slice,
     uint64_t section_r_row_start,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,

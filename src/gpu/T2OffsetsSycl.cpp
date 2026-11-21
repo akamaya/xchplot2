@@ -103,7 +103,7 @@ void launch_t2_compute_fine_bucket_offsets(
     int num_match_target_bits,
     int fine_bits,
     uint32_t num_buckets,
-    uint64_t* d_fine_offsets,
+    FineBucketOffset* d_fine_offsets,
     sycl::queue& q)
 {
     constexpr size_t threads      = 256;
@@ -135,10 +135,10 @@ void launch_t2_compute_fine_bucket_offsets(
                 if (t < fine_key) lo = mid + 1;
                 else              hi = mid;
             }
-            d_fine_offsets[tid] = lo;
+            d_fine_offsets[tid] = static_cast<FineBucketOffset>(lo);
 
             if (tid == total - 1) {
-                d_fine_offsets[total] = d_bucket_offsets[num_buckets];
+                d_fine_offsets[total] = static_cast<FineBucketOffset>(d_bucket_offsets[num_buckets]);
             }
         }).wait();
 }
@@ -175,7 +175,7 @@ namespace {
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     int k,
     int num_section_bits,
@@ -427,7 +427,7 @@ static void launch_t2_match_diag_probe(
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     int num_section_bits,
     int num_match_target_bits,
@@ -545,7 +545,7 @@ static void launch_t2_match_all_buckets_compact(
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -569,7 +569,7 @@ static void launch_t2_match_all_buckets_compact(
     // Only this SYCL all-buckets COMPACT kernel uses the compressed suffix index.
     uint8_t const* d_direct_offsets = pos2gpu::fine_direct16_enabled(
         fine_bits, num_match_target_bits)
-        ? pos2gpu::fine_direct16_ptr(const_cast<uint64_t*>(d_fine_offsets), num_buckets)
+        ? pos2gpu::fine_direct16_ptr(const_cast<FineBucketOffset*>(d_fine_offsets), num_buckets)
         : nullptr;
 
     (void)num_buckets; // only the [begin, end) sub-range is iterated
@@ -804,7 +804,7 @@ static void launch_t2_match_all_buckets_tezcan(
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -937,7 +937,7 @@ void launch_t2_match_all_buckets(
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -1117,7 +1117,7 @@ static void launch_t2_match_section_pair_split_compact(
     uint32_t const* d_mi_r_slice,
     uint64_t section_r_row_start,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -1302,7 +1302,7 @@ static void launch_t2_match_section_pair_split_tezcan(
     uint32_t const* d_mi_r_slice,
     uint64_t section_r_row_start,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,
@@ -1447,7 +1447,7 @@ void launch_t2_match_section_pair_split(
     uint32_t const* d_mi_r_slice,
     uint64_t section_r_row_start,
     uint64_t const* d_offsets,
-    uint64_t const* d_fine_offsets,
+    FineBucketOffset const* d_fine_offsets,
     uint32_t num_match_keys,
     uint32_t num_buckets,
     int k,

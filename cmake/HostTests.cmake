@@ -1,3 +1,8 @@
+# Validate 32-bit T2/T3 fine-index size, layout, and overflow guard.
+add_executable(fine_bucket_index_test tools/parity/fine_bucket_index_test.cpp)
+target_include_directories(fine_bucket_index_test PRIVATE src)
+target_compile_features(fine_bucket_index_test PRIVATE cxx_std_20)
+
 # Shared by the full build and the dependency-free host-only build.
 find_package(Threads REQUIRED)
 # temp_file_test — TempFile is pure POSIX (mkstemp/pread/pwrite/fallocate/

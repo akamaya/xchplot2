@@ -1,12 +1,13 @@
 // FineBucketDirect.hpp — experimental 16+4 exact target lookup for T2/T3.
 // POS2GPU_FINE_DIRECT=1; requires fine_bits=16 and target_bits=20.
-// Layout: legacy u64 fine_offsets[256*65536+1], then u8 suffix_start[256*2^20].
+// Layout: u32 fine_offsets[256*65536+1], then u8 suffix_start[256*2^20].
 // Each 16-bit group stores 16 lower_bound relative offsets (0..254).
 // A group containing >=255 rows uses 0xFF for all suffixes and falls back
 // to the original exact lower_bound. No pair can be lost due to skew.
 #pragma once
 
 #include "gpu/MatchKernelCommon.cuh"
+#include "gpu/FineBucketIndex.hpp"
 #include <sycl/sycl.hpp>
 #include <cstddef>
 #include <cstdint>
@@ -30,7 +31,7 @@ inline size_t fine_direct16_bytes(uint32_t num_buckets)
     return size_t(num_buckets) << 20; // 16 suffix offsets per each 16-bit group
 }
 
-inline uint8_t* fine_direct16_ptr(uint64_t* fine_offsets, uint32_t num_buckets)
+inline uint8_t* fine_direct16_ptr(FineBucketOffset* fine_offsets, uint32_t num_buckets)
 {
     return reinterpret_cast<uint8_t*>(fine_offsets + (uint64_t(num_buckets) << 16) + 1);
 }
@@ -40,7 +41,7 @@ inline uint8_t* fine_direct16_ptr(uint64_t* fine_offsets, uint32_t num_buckets)
 // This first implementation favors correctness/simplicity over build speed;
 // profile the 'direct_build' phase before adopting it.
 inline void fine_direct16_build(
-    uint32_t const* sorted_mi, uint64_t const* fine_offsets,
+    uint32_t const* sorted_mi, FineBucketOffset const* fine_offsets,
     uint8_t* direct, uint32_t num_buckets, sycl::queue& q)
 {
     size_t const groups = size_t(num_buckets) << 16;
@@ -68,7 +69,7 @@ struct FineDirect16Range {
 };
 
 POS2_DEVICE_INLINE FineDirect16Range fine_direct16_find(
-    uint32_t const* sorted_mi, uint64_t const* fine_offsets,
+    uint32_t const* sorted_mi, FineBucketOffset const* fine_offsets,
     uint8_t const* direct, uint64_t fine_idx,
     uint32_t target, uint32_t target_mask)
 {

@@ -15,6 +15,7 @@
 #include "gpu/T2Kernel.cuh"
 #include "gpu/T2Offsets.cuh"
 #include "gpu/FineBucketDirect.hpp"
+#include "gpu/FineBucketIndex.hpp"
 #include "host/PoolSizing.hpp"
 
 #include <climits>
@@ -70,13 +71,11 @@ T2Derived derive_t2(T2MatchParams const& params)
     d.num_match_keys  = 1u << params.num_match_key_bits;
     d.num_buckets     = d.num_sections * d.num_match_keys;
     d.fine_bits = fine_bucket_bits(2, params.num_match_target_bits);
-    uint64_t const fine_count = 1ull << d.fine_bits;
-    if (uint64_t(d.num_buckets) * fine_count > UINT_MAX)
-        throw std::invalid_argument("fine bucket index exceeds 32-bit GPU launch count");
-    d.fine_entries    = uint64_t(d.num_buckets) * fine_count + 1;
-    d.bucket_bytes    = sizeof(uint64_t) * (d.num_buckets + 1);
-    d.fine_bytes      = sizeof(uint64_t) * d.fine_entries;
-    d.temp_needed     = d.bucket_bytes + d.fine_bytes;
+    FineBucketTempLayout const layout = fine_bucket_temp_layout(d.num_buckets, d.fine_bits);
+    d.fine_entries    = layout.fine_entries;
+    d.bucket_bytes    = layout.bucket_bytes;
+    d.fine_bytes      = layout.fine_bytes;
+    d.temp_needed     = layout.total_bytes();
     d.direct_enabled  = fine_direct16_enabled(d.fine_bits, params.num_match_target_bits);
     if (d.direct_enabled) d.temp_needed += fine_direct16_bytes(d.num_buckets);
     d.target_mask     = (params.num_match_target_bits >= 32)
@@ -106,6 +105,7 @@ void launch_t2_match_prepare(
     if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
 
+    validate_fine_bucket_input_count(t1_count);
     T2Derived const d = derive_t2(params);
 
     if (d_temp_storage == nullptr) {
@@ -116,7 +116,7 @@ void launch_t2_match_prepare(
     if (!d_sorted_mi || !d_out_count) throw std::invalid_argument("invalid argument to launch wrapper");
 
     auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
-    auto* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+    auto* d_fine_offsets = fine_bucket_offset_ptr(d_temp_storage, d.bucket_bytes);
 
     FineBucketTimer fine_timer(2, d.fine_bits);
 
@@ -155,7 +155,7 @@ void launch_t2_match_range(
     uint32_t bucket_end,
     sycl::queue& q)
 {
-    (void)t1_count;
+    validate_fine_bucket_input_count(t1_count);
     if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
@@ -176,7 +176,7 @@ void launch_t2_match_range(
     if (blocks_x_u64 > UINT_MAX) throw std::invalid_argument("invalid argument to launch wrapper");
 
     auto const* d_offsets      = reinterpret_cast<uint64_t const*>(d_temp_storage);
-    auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+    auto const* d_fine_offsets = fine_bucket_offset_ptr(d_temp_storage, d.bucket_bytes);
 
     AesHashKeys keys = make_keys(plot_id_bytes);
 
@@ -187,7 +187,7 @@ void launch_t2_match_range(
         // offset arrays (historical — they're treated as const inside
         // the kernel). Cast away const at the ABI boundary only.
         const_cast<uint64_t*>(d_offsets),
-        const_cast<uint64_t*>(d_fine_offsets),
+        const_cast<FineBucketOffset*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
         params.num_match_target_bits, d.fine_bits,
@@ -237,7 +237,7 @@ void launch_t2_match_section_pair_split_range(
     if (blocks_x_u64 > UINT_MAX) throw std::invalid_argument("invalid argument to launch wrapper");
 
     auto const* d_offsets      = reinterpret_cast<uint64_t const*>(d_temp_storage);
-    auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+    auto const* d_fine_offsets = fine_bucket_offset_ptr(d_temp_storage, d.bucket_bytes);
 
     AesHashKeys keys = make_keys(plot_id_bytes);
 
@@ -247,7 +247,7 @@ void launch_t2_match_section_pair_split_range(
         d_meta_l_slice, section_l_row_start,
         d_meta_r_slice, d_mi_r_slice, section_r_row_start,
         const_cast<uint64_t*>(d_offsets),
-        const_cast<uint64_t*>(d_fine_offsets),
+        const_cast<FineBucketOffset*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
         params.num_match_target_bits, d.fine_bits,

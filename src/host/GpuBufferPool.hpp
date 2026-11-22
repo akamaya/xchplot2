@@ -76,6 +76,7 @@ struct GpuBufferPool {
         uint64_t total_xs = 0, cap = 0;
         size_t storage_bytes = 0, pair_a_bytes = 0, pair_b_bytes = 0;
         size_t xs_temp_bytes = 0, sort_scratch_bytes = 0, pinned_bytes = 0;
+        bool compact_d = false; // opt-in Candidate D layout
         uint64_t device_bytes() const noexcept
         { return storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t); }
     };
@@ -97,7 +98,8 @@ struct GpuBufferPool {
     int  strength = 0;
     bool testnet = false;
     bool t2_xbits_reuse = false; // captured at pool construction
-    bool xs_pair_a_alias = false; // C active only when B ON and Xs scratch fits
+    bool xs_pair_a_alias = false; // C-style T2 placement; also true for D
+    bool compact_d = false; // D moves Xs scratch out of pair_a entirely
 
     // Derived sizes (for diagnostics / assertions).
     uint64_t total_xs           = 0;

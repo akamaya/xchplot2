@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace pos2gpu {
 
@@ -180,6 +181,75 @@ void launch_construct_xs_profiled(
             t_sort, total_ms > 0.0 ? 100.0 * t_sort / total_ms : 0.0,
             t_pack, total_ms > 0.0 ? 100.0 * t_pack / total_ms : 0.0,
             total_ms);
+    }
+}
+
+// VRAM Candidate D: Xs keys_a and vals_a occupy the first 8*N bytes of
+// storage, the CUB scratch occupies the storage suffix, and keys_b/vals_b
+// occupy the first 8*N bytes of pair_b. Pack overwrites the no-longer-live
+// storage inputs. This preserves the same CUB sort, stable ordering and
+// XsCandidateGpu layout as the legacy path, with no host transfer.
+void launch_construct_xs_compact_d(
+    uint8_t const* plot_id_bytes, int k, bool testnet,
+    XsCandidateGpu* d_out, void* d_storage, size_t storage_bytes,
+    void* d_pair_b, size_t pair_b_bytes, sycl::queue& q)
+{
+    if (testnet || k < 18 || k > 28 || (k & 1) || !plot_id_bytes ||
+        !d_out || !d_storage || !d_pair_b ||
+        reinterpret_cast<void*>(d_out) != d_storage)
+        throw std::invalid_argument("invalid Candidate D Xs arguments");
+
+    uint64_t const n = uint64_t{1} << k;
+    size_t const span = static_cast<size_t>(n) * sizeof(uint32_t);
+    size_t cub_bytes = 0;
+    launch_sort_pairs_u32_u32(
+        nullptr, cub_bytes, nullptr, nullptr, nullptr, nullptr,
+        n, 0, k, q);
+    if (storage_bytes < 2 * span || storage_bytes - 2 * span < cub_bytes ||
+        pair_b_bytes < 2 * span)
+        throw std::runtime_error("Candidate D Xs region capacity mismatch");
+
+    auto* storage = static_cast<uint8_t*>(d_storage);
+    auto* pair_b = static_cast<uint8_t*>(d_pair_b);
+    auto* keys_a = reinterpret_cast<uint32_t*>(storage);
+    auto* vals_a = reinterpret_cast<uint32_t*>(storage + span);
+    auto* keys_b = reinterpret_cast<uint32_t*>(pair_b);
+    auto* vals_b = reinterpret_cast<uint32_t*>(pair_b + span);
+    void* const cub_scratch = storage + 2 * span;
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    bool const timing = [] {
+        auto const* p = std::getenv("POS2GPU_PHASE_TIMING");
+        return p && p[0] == '1';
+    }();
+    auto tick = now();
+    if (timing) q.wait();
+    launch_xs_gen(keys, keys_a, vals_a, n, k, 0u, q);
+    double ms_gen = 0, ms_sort = 0, ms_pack = 0;
+    if (timing) {
+        q.wait(); auto t = now();
+        ms_gen = std::chrono::duration<double, std::milli>(t - tick).count();
+        tick = t;
+    }
+    launch_sort_pairs_u32_u32(cub_scratch, cub_bytes,
+                               keys_a, keys_b, vals_a, vals_b, n, 0, k, q);
+    if (timing) {
+        q.wait(); auto t = now();
+        ms_sort = std::chrono::duration<double, std::milli>(t - tick).count();
+        tick = t;
+    }
+    launch_xs_pack(keys_b, vals_b, d_out, n, q);
+    if (timing) {
+        q.wait(); auto t = now();
+        ms_pack = std::chrono::duration<double, std::milli>(t - tick).count();
+        auto total = ms_gen + ms_sort + ms_pack;
+        std::fprintf(stderr,
+            "[xs-timing] gen=%.1fms(%.0f%%) sort=%.1fms(%.0f%%) "
+            "pack=%.1fms(%.0f%%) total=%.1fms [D]\n",
+            ms_gen, total > 0 ? 100 * ms_gen / total : 0,
+            ms_sort, total > 0 ? 100 * ms_sort / total : 0,
+            ms_pack, total > 0 ? 100 * ms_pack / total : 0, total);
     }
 }
 

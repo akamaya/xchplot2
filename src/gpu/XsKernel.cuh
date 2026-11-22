@@ -62,4 +62,12 @@ void launch_construct_xs_profiled(
     sycl::queue& q,
     void* split_keys_a = nullptr);
 
+// Candidate D: all input/sort scratch lives in d_storage while both sorted
+// output streams use d_pair_b. Once sort completes, pack overwrites the
+// now-dead input arrays with XsCandidateGpu inside the storage prefix.
+void launch_construct_xs_compact_d(
+    uint8_t const* plot_id_bytes, int k, bool testnet,
+    XsCandidateGpu* d_out, void* d_storage, size_t storage_bytes,
+    void* d_pair_b, size_t pair_b_bytes, sycl::queue& q);
+
 } // namespace pos2gpu

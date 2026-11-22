@@ -8,6 +8,7 @@
 
 #include "host/GpuBufferPool.hpp"
 #include "host/MatchScratchAlias.hpp"
+#include "host/CompactDLayout.hpp"
 #include "host/T2XbitsReuse.hpp"
 #include "host/XsPairAAlias.hpp"
 
@@ -172,16 +173,35 @@ GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
         static_cast<size_t>(result.total_xs) * sizeof(XsCandidateGpu),
         static_cast<size_t>(result.cap) * 3 * sizeof(uint32_t));
 
+    // Candidate D: Xs sort's two input arrays and CUB scratch use
+    // d_storage, its output arrays use pair_b; none uses pair_a. The T1
+    // match-info output is parked after the Xs candidate prefix, while
+    // T1's u32/u64 sort directly emits sorted metadata into pair_b.
+    size_t xs_cub_bytes = 0;
+    launch_sort_pairs_u32_u32(
+        nullptr, xs_cub_bytes,
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        result.total_xs, 0, k, q);
+    result.compact_d = compact_d_layout_fits(
+        compact_d_requested(), t2_xbits_reuse_enabled(),
+        xs_pair_a_alias_requested(), static_cast<size_t>(result.total_xs),
+        static_cast<size_t>(result.cap), result.storage_bytes,
+        static_cast<size_t>(result.cap) * sizeof(uint64_t), xs_cub_bytes);
+
     // d_pair_a holds the *match output* of the current phase: T1 SoA
     // (meta·8 B + mi·4 B = 12 B), T2 SoA (meta·8 B + mi·4 B + xbits·4 B =
     // 16 B), then T3 (T3PairingGpu, 8 B). Worst case is T2 at 16 B/entry.
     // Candidate C may use d_pair_a for Xs scratch before T1 match.
     result.pair_a_bytes = std::max({
-        static_cast<size_t>(result.cap) * sizeof(T1PairingGpu),
         static_cast<size_t>(result.cap) *
-            (t2_xbits_reuse_enabled()
-                ? (sizeof(uint64_t) + sizeof(uint32_t))
-                : sizeof(T2PairingGpu)),
+            (result.compact_d ? sizeof(uint64_t) : sizeof(T1PairingGpu)),
+        static_cast<size_t>(result.cap) *
+            (result.compact_d
+                ? sizeof(uint64_t)
+                : t2_xbits_reuse_enabled()
+                    ? (sizeof(uint64_t) + sizeof(uint32_t))
+                    : sizeof(T2PairingGpu)),
         static_cast<size_t>(result.cap) * sizeof(T3PairingGpu),
         static_cast<size_t>(result.cap) * sizeof(uint64_t),
     });
@@ -215,9 +235,11 @@ GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
         xs_pair_a_alias_requested(), t2_xbits_reuse_enabled(),
         static_cast<size_t>(result.cap), static_cast<size_t>(result.total_xs),
         result.storage_bytes, result.pair_a_bytes, result.xs_temp_bytes);
-    result.pair_b_bytes = xs_pair_a_pair_b_bytes(
-        static_cast<size_t>(result.cap), result.xs_temp_bytes,
-        t2_xbits_reuse_enabled(), use_xs_pair_a);
+    result.pair_b_bytes = result.compact_d
+        ? static_cast<size_t>(result.cap) * sizeof(uint64_t)
+        : xs_pair_a_pair_b_bytes(
+            static_cast<size_t>(result.cap), result.xs_temp_bytes,
+            t2_xbits_reuse_enabled(), use_xs_pair_a);
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
     size_t s_pairs = 0;
@@ -231,7 +253,16 @@ GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
         nullptr, s_keys,
         static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
         result.cap, 0, 2 * k, q);
-    result.sort_scratch_bytes = std::max(s_pairs, s_keys);
+    size_t s_t1_meta = 0;
+    if (result.compact_d) {
+        // D's T1 sort carries u64 metadata directly as the radix value.
+        launch_sort_pairs_u32_u64(
+            nullptr, s_t1_meta,
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
+            result.cap, 0, k, q);
+    }
+    result.sort_scratch_bytes = std::max({s_pairs, s_keys, s_t1_meta});
 
     result.pinned_bytes = result.cap * sizeof(uint64_t);
 
@@ -254,7 +285,8 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     pair_b_bytes = sizes.pair_b_bytes;
     xs_temp_bytes = sizes.xs_temp_bytes;
     sort_scratch_bytes = sizes.sort_scratch_bytes;
-    xs_pair_a_alias = xs_pair_a_alias_fits(
+    compact_d = sizes.compact_d;
+    xs_pair_a_alias = compact_d || xs_pair_a_alias_fits(
         xs_pair_a_alias_requested(), t2_xbits_reuse,
         static_cast<size_t>(cap), static_cast<size_t>(total_xs),
         storage_bytes, pair_a_bytes, xs_temp_bytes);
@@ -282,10 +314,14 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
                                 nullptr, 0, nullptr, nullptr,
                                 &t3_match_bytes, q);
         auto const t1_idle = match_scratch_idle_suffix(
-            storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
+            storage_bytes,
+            static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu) +
+                (compact_d ? static_cast<size_t>(cap) * sizeof(uint32_t) : 0));
         auto const t2_idle = match_scratch_idle_suffix(
-            storage_bytes, xs_pair_a_t2_match_live_prefix(
-                static_cast<size_t>(cap), xs_pair_a_alias));
+            storage_bytes, compact_d
+                ? static_cast<size_t>(cap) * 3 * sizeof(uint32_t)
+                : xs_pair_a_t2_match_live_prefix(
+                    static_cast<size_t>(cap), xs_pair_a_alias));
         // T3 additionally keeps sorted T2 xbits in d_storage's vals_in slot.
         auto const t3_idle = match_scratch_idle_suffix(
             storage_bytes, t3_match_live_prefix_bytes(
@@ -312,6 +348,9 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     }
     pinned_bytes = sizes.pinned_bytes;
     if (std::getenv("POS2GPU_POOL_DEBUG")) {
+        std::fprintf(stderr,
+            "[pool] Candidate D=%d; pair_a=%zu pair_b=%zu storage=%zu bytes\n",
+            int(compact_d), pair_a_bytes, pair_b_bytes, storage_bytes);
         std::fprintf(stderr,
             "[pool] Xs pair_a alias=%d; xs_temp=%zu pair_a=%zu "
             "pair_b=%zu bytes; saved=%zu bytes vs B\n",

@@ -364,3 +364,7 @@ attributions. Built with SI.
 If you appreciate this, and want to give back, feel free.
 
 xch1d80tfje65xy97fpxg7kl89wugnd6svlv5uag2qays0um5ay5sn0qz8vph8
+
+### Candidate D VRAM optimization
+
+- [Candidate D: additional VRAM saving and validated benchmark](docs/CANDIDATE_D_VRAM_2026-11-23.md)

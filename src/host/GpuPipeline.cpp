@@ -476,8 +476,8 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // C: Xs scratch borrows pair_a before T1 writes match output.
     // pair_a is allocated here rather than after launching Xs; the size
     // planner enables C only when the full split-Xs scratch fits.
-    void*           d_xs_temp      = pool.xs_pair_a_alias
-        ? pool.ensure_pair_a() : pool.d_pair_b;
+    void*           d_xs_temp      = pool.compact_d ? nullptr
+        : pool.xs_pair_a_alias ? pool.ensure_pair_a() : pool.d_pair_b;
     void*           d_sort_scratch = pool.d_sort_scratch;
     // Lazy pinned-host alloc: skips ~600 ms × (kNumPinnedBuffers-1)
     // on single-plot runs (only slot 0 gets allocated). See
@@ -489,10 +489,13 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // sorted match-info keys from the first u32[cap]. Sort phases run after
     // each match and may overwrite the borrowed memory only once it is dead.
     auto const t1_match_idle = match_scratch_idle_suffix(
-        pool.storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
+        pool.storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu) +
+            (pool.compact_d ? static_cast<size_t>(cap) * sizeof(uint32_t) : 0));
     auto const t2_match_idle = match_scratch_idle_suffix(
-        pool.storage_bytes, xs_pair_a_t2_match_live_prefix(
-            static_cast<size_t>(cap), pool.xs_pair_a_alias));
+        pool.storage_bytes, pool.compact_d
+            ? static_cast<size_t>(cap) * 3 * sizeof(uint32_t)
+            : xs_pair_a_t2_match_live_prefix(
+                static_cast<size_t>(cap), pool.xs_pair_a_alias));
     auto const t3_match_idle = match_scratch_idle_suffix(
         pool.storage_bytes, t3_match_live_prefix_bytes(
             static_cast<size_t>(cap), pool.t2_xbits_reuse));
@@ -581,12 +584,20 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // Xs phase events stubbed in slice 17b — pass nullptr for the (no-op)
     // profiling event slots. The launch_construct_xs_profiled signature still
     // accepts cudaEvent_t for API compatibility but ignores the values.
-    launch_construct_xs_profiled(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                                       d_xs, d_xs_temp, &xs_temp_bytes,
-                                       nullptr, nullptr, q,
-                                       d_xs_split_keys_a);
-    // On C, T1 writes directly over the Xs scratch in pair_a. Because
-    // SYCL queues may be out-of-order, wait until Xs pack is finished.
+    if (pool.compact_d) {
+        launch_construct_xs_compact_d(
+            cfg.plot_id.data(), cfg.k, cfg.testnet, d_xs,
+            pool.d_storage, pool.storage_bytes, pool.d_pair_b,
+            pool.pair_b_bytes, q);
+    } else {
+        launch_construct_xs_profiled(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                                           d_xs, d_xs_temp, &xs_temp_bytes,
+                                           nullptr, nullptr, q,
+                                           d_xs_split_keys_a);
+    }
+    // Both C and D require the Xs pack to finish before T1 match.
+    // The CUB wrapper only synchronizes the radix sort BEFORE the SYCL
+    // pack kernel; an out-of-order SYCL queue must be explicitly drained.
     if (pool.xs_pair_a_alias) q.wait_and_throw();
     // Overlap d_pair_a's lazy malloc_device (~400-500 ms for 4.36 GB at
     // k=28) with Xs gen's GPU execution. In production
@@ -608,8 +619,12 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // (cap·8 B) then mi[cap] (cap·4 B). Total cap·12 B, fits in d_pair_a's
     // cap·16 B budget.
     uint64_t*     d_t1_meta = static_cast<uint64_t*>(d_pair_a_raw);
-    uint32_t*     d_t1_mi   = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
+    uint32_t*     d_t1_mi = pool.compact_d
+        ? reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(pool.d_storage) +
+            total_xs * sizeof(XsCandidateGpu))
+        : reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
     // T2 match output is SoA, carved out of d_pair_a. Layout: meta[cap]
     // (cap·8 B), then mi[cap] (cap·4 B), then xbits[cap] (cap·4 B). Total
     // cap·16 B, matching d_pair_a's size.
@@ -620,7 +635,9 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
         ? d_vals_in
         : reinterpret_cast<uint32_t*>(
             static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
-    uint32_t*     d_t2_xbits = pool.xs_pair_a_alias
+    uint32_t*     d_t2_xbits = pool.compact_d
+        ? d_vals_out  // storage slot 2; parked in pair_b after T2 match
+        : pool.xs_pair_a_alias
         ? reinterpret_cast<uint32_t*>(
             static_cast<uint8_t*>(d_pair_a_raw) +
             pool.cap * sizeof(uint64_t))
@@ -664,14 +681,21 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // input rather than extracting from a packed struct.
     int p_t1_sort = begin_phase("T1 sort");
     {
-        launch_init_u32_identity(d_vals_in, t1_count, q);
         size_t sort_bytes = pool.sort_scratch_bytes;
-        launch_sort_pairs_u32_u32(
-            d_sort_scratch, sort_bytes,
-            d_t1_mi, d_keys_out, d_vals_in, d_vals_out,
-            t1_count, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
-
-        launch_gather_u64(d_t1_meta, d_vals_out, d_t1_meta_sorted, t1_count, q);
+        if (pool.compact_d) {
+            // No cap-sized index arrays: carry T1's u64 meta directly.
+            // Input: storage tail + pair_a; output: storage slot 0 + pair_b.
+            launch_sort_pairs_u32_u64(
+                d_sort_scratch, sort_bytes, d_t1_mi, d_keys_out,
+                d_t1_meta, d_t1_meta_sorted, t1_count, 0, cfg.k, q);
+        } else {
+            launch_init_u32_identity(d_vals_in, t1_count, q);
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, sort_bytes,
+                d_t1_mi, d_keys_out, d_vals_in, d_vals_out,
+                t1_count, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+            launch_gather_u64(d_t1_meta, d_vals_out, d_t1_meta_sorted, t1_count, q);
+        }
     }
     end_phase(p_t1_sort);
 
@@ -708,15 +732,34 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
         // then overwrite with sorted T2 meta after CUB has completed.
         uint32_t* t2_vals_in = pool.xs_pair_a_alias
             ? static_cast<uint32_t*>(pool.d_pair_b) : d_vals_in;
-        launch_init_u32_identity(t2_vals_in, t2_count, q);
-        size_t sort_bytes = pool.sort_scratch_bytes;
-        launch_sort_pairs_u32_u32(
-            d_sort_scratch, sort_bytes,
-            d_t2_mi, d_keys_out, t2_vals_in, d_vals_out,
-            t2_count, 0, cfg.k, q);
-
-        launch_permute_t2(d_t2_meta, d_t2_xbits, d_vals_out,
-                          d_t2_meta_sorted, d_t2_xbits_sorted, t2_count, q);
+        if (pool.compact_d) {
+            // The T2 outputs occupy all 3 storage slots at match exit.
+            // Park xbits in pair_b's upper half now that sorted T1 meta
+            // is dead. Free storage slot 2 for CUB's sorted indices.
+            uint32_t* parked_xbits = static_cast<uint32_t*>(pool.d_pair_b) + cap;
+            q.memcpy(parked_xbits, d_t2_xbits,
+                     t2_count * sizeof(uint32_t)).wait_and_throw();
+            launch_init_u32_identity(t2_vals_in, t2_count, q);
+            size_t sort_bytes = pool.sort_scratch_bytes;
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, sort_bytes, d_t2_mi, d_keys_out,
+                t2_vals_in, d_vals_out, t2_count, 0, cfg.k, q);
+            // Gather xbits before overwriting pair_b with sorted meta;
+            // T2 mi in storage slot 1 is dead after the radix sort.
+            launch_gather_u32(parked_xbits, d_vals_out,
+                              d_t2_xbits_sorted, t2_count, q);
+            launch_gather_u64(d_t2_meta, d_vals_out,
+                              d_t2_meta_sorted, t2_count, q);
+        } else {
+            launch_init_u32_identity(t2_vals_in, t2_count, q);
+            size_t sort_bytes = pool.sort_scratch_bytes;
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, sort_bytes,
+                d_t2_mi, d_keys_out, t2_vals_in, d_vals_out,
+                t2_count, 0, cfg.k, q);
+            launch_permute_t2(d_t2_meta, d_t2_xbits, d_vals_out,
+                              d_t2_meta_sorted, d_t2_xbits_sorted, t2_count, q);
+        }
     }
     end_phase(p_t2_sort);
 

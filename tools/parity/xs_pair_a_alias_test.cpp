@@ -1,4 +1,5 @@
 #include "host/MatchScratchAlias.hpp"
+#include "host/CompactDLayout.hpp"
 #include "host/T2XbitsReuse.hpp"
 #include "host/XsPairAAlias.hpp"
 
@@ -66,6 +67,34 @@ int main()
         t3_match_live_prefix_bytes(cap, true));
     static_assert(match_scratch_backing_bytes(68*MiB, 16, 320*MiB,
         320*MiB, t1_idle, t2_idle, t3_idle, true) == 68*MiB);
+    // Candidate D: Xs raw inputs and scratch live in storage;
+    // Xs sorted outputs live in pair_b. T1 mi lives after Xs.
+    static_assert(compact_d_layout_fits(true, true, true, n, cap,
+                                        storage, 8*cap, 23*MiB));
+    static_assert(!compact_d_layout_fits(false, true, true, n, cap,
+                                         storage, 8*cap, 23*MiB));
+    static_assert(!compact_d_layout_fits(true, false, true, n, cap,
+                                         storage, 8*cap, 23*MiB));
+    static_assert(!compact_d_layout_fits(true, true, false, n, cap,
+                                         storage, 8*cap, 23*MiB));
+    static_assert(!compact_d_layout_fits(true, true, true, n, cap,
+                                         storage, 8*n-1, 23*MiB));
+    constexpr Span xs_input{0, 8*n};
+    constexpr Span t1_mi{8*n, 8*n + 4*cap};
+    static_assert(separate(xs_input, t1_mi));
+    static_assert(t1_mi.end <= storage);
+    constexpr Span st_t1_keys{0, 4*cap};
+    constexpr Span st_t2_mi{4*cap, 8*cap};
+    constexpr Span st_t2_xbits{8*cap, 12*cap};
+    static_assert(separate(st_t1_keys, st_t2_mi));
+    static_assert(separate(st_t2_mi, st_t2_xbits));
+    constexpr Span b_t2_index{0, 4*cap};
+    constexpr Span b_t2_park{4*cap, 8*cap};
+    static_assert(separate(b_t2_index, b_t2_park));
+    // After copying the xbits park, T2 sort indices use slot 2;
+    // gathered sorted xbits use slot 1; sorted keys remain in slot 0.
+    static_assert(separate(st_t1_keys, st_t2_mi));
+    static_assert(separate(st_t2_mi, st_t2_xbits));
     assert(xs_pair_a_pair_b_bytes(cap, xs_temp, true, true) == 2080*MiB);
     std::cout << "xs_pair_a_alias_test: PASS (Xs/T2/T3 lifetime and size planning)\n";
 }

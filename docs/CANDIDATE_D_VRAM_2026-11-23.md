@@ -1,7 +1,7 @@
 # Candidate D: pooled GPU VRAM reuse (experimental, 2026-11-23)
 
-This patch is **NOT yet GPU-benchmarked or full-proof verified**. Only enable it
-for A/B and correctness tests. It changes no streaming-tier code. The existing
+Candidate D has been GPU-benchmarked on RTX 4070 SUPER and passed
+**214/214 sampled full-proof validations**. See measured results below. It changes no streaming-tier code. The existing
 A+B+C baseline remains the default (`POS2GPU_COMPACT_D` unset or `=0`).
 
 ## Goal and buffer layout (k28)
@@ -14,8 +14,8 @@ A+B+C baseline remains the default (`POS2GPU_COMPACT_D` unset or `=0`).
 | d_sort_scratch | ~68 MiB | ~320 MiB |
 | **Total** | **~8388 MiB** | **~7600 MiB** |
 
-Expected net saving **~788 MiB** allocated VRAM (the actual value may change
-with CUB sorting scratch, configuration, and backend). This is **pool allocation
+The observed k28/s6 GPU pool reduction is **788.28 MiB** of allocated VRAM
+(the amount can differ by configuration and backend). This is **pool allocation
 accounting**, not observed device-wide peak VRAM. Host pinned buffers unchanged.
 
 ## Phases and alias safety

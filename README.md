@@ -31,15 +31,14 @@
 | **Candidate A: Fine index scratch aliases `d_storage`** | **26.25 s/plot (10 plots)** | **251.72 MiB** less allocated VRAM; OFF 26.21 / ON 26.25 s/plot; 183/183 full proofs PASS |
 | **Candidate B: T2 xbits buffer reuse** | **26.28 s/plot (10 plots)** | **1,040 MiB** further saving; OFF 26.25 / ON 26.28 s/plot; 223/223 full proofs PASS |
 | **Candidate C: Xs scratch aliases `d_pair_a`** | **26.15 s/plot (10 plots)** | **1,040 MiB** further saving; OFF 26.20 / ON 26.15 s/plot; 236/236 full proofs PASS |
+| **Candidate D: pooled Xs/T1/T2 buffer remapping** | **26.08 s/plot (10 plots)** | **788.28 MiB** further saving; D OFF/ON 26.08 / 26.08 s/plot; 214/214 full proofs PASS |
 
-**Latest best 10-plot steady-state measurement (2026-11-23):** **26.15 s/plot**
-with Candidates A+B+C enabled, after one excluded warmup (RTX 4070 SUPER,
-k28/s6). This is a single A/B batch observation, **not a claim of proven
-speedup**: the controlled Candidate C test measured 26.20 s/plot with C OFF,
-and 26.15 s/plot with C ON (about 0.19% difference). The original 2026-11-21
-Fine Bucket result was 27.27 s/plot (10 plots), and the AES V4INIT best
-single-plot observation was 26.19 s/plot; these are historical results under
-different measurement conditions, not directly comparable speedup estimates.
+**Latest measured 10-plot steady-state (2026-11-23):** **26.08 s/plot**
+with Candidates A+B+C+D enabled, after one excluded warmup (RTX 4070 SUPER,
+k28/s6). The same-build D OFF/ON comparison measured 26.08 / 26.08 s/plot;
+no throughput regression was observed at the 0.01-second reporting precision.
+Candidate C previously measured 26.15 s/plot in a separate batch; results
+from different batches do not establish a speedup.
 
 The Compact, Tezcan, Fine Bucket and two-phase selections are **opt-in experimental optimizations**, not a default-setting or world-record claim. **V4INIT itself is permanently enabled in the selected SYCL Tezcan paths** (no `POS2GPU_AES_VEC_INIT` switch). Intermediate rows are historical measurements from different runs; the Fine Bucket comparison used 10 measured plots per configuration, whereas the AES V4INIT phase A/B used two runs with one measured plot each after warmup.
 
@@ -78,6 +77,32 @@ C also passed all three host tests: `xs_pair_a_alias_test`,
 a safe fallback instead of claiming the C allocation saving. See the documents
 linked under **Detailed optimization records** for lifetime and fallback rules.
 <!-- END XCHPLOT2-VRAM-ABC-20261123 -->
+
+### Candidate D: additional 788.28 MiB GPU pool VRAM saving (2026-11-23)
+
+Candidate D (`POS2GPU_COMPACT_D=1`) reuses Xs/T1/T2 buffer lifetimes
+in the pooled GPU pipeline. It changes `d_pair_a` from 3,120 to 2,080 MiB,
+while shared sort/Fine scratch increases from 68.28 to 320 MiB.
+
+| Metric | D OFF: A+B+C | D ON: A+B+C+D |
+|---|---:|---:|
+| **Total allocated GPU pool** | **8,388.28 MiB** | **7,600.00 MiB** |
+| Added VRAM saving | -- | **788.28 MiB (9.40%)** |
+| 10-plot steady-state | 26.08 s/plot | **26.08 s/plot** |
+| Excluded warmup | 1 plot | 1 plot |
+
+The comparison used **RTX 4070 SUPER 12 GB (`gpu0`)**, Windows 11,
+**k=28, strength 6**, one GPU worker, Fine Bits 8/16/16, Fine Direct,
+Compact and Tezcan ON, two-phase OFF. Two retained Candidate D plots
+passed `verify --full --trials 100`: **214/214 full proofs validated**.
+The 10-plot throughput runs were non-kept.
+
+The 788.28 MiB improvement measures **sum of GPU pool allocations, not
+observed whole-device peak VRAM**. No throughput regression was observed
+at 0.01 s/plot report precision; smaller effects are not ruled out.
+Candidate D remains **opt-in**; unset `POS2GPU_COMPACT_D` or set it to
+`0` to use A+B+C. See the [Candidate D detailed test record](docs/CANDIDATE_D_VRAM_2026-11-23.md).
+
 
 ### Latest AES V4INIT A/B — same configuration
 
@@ -145,6 +170,7 @@ Full-proof checks sample random challenges; they do **not** exhaustively certify
 - [Candidate A: Fine match scratch alias, 251.72 MiB reduction](docs/FINE_BUCKET_SCRATCH_ALIAS_2026-11-23.md)
 - [Candidate B: T2 xbits reuse, 1,040 MiB reduction](docs/T2_XBITS_REUSE_2026-11-23.md)
 - [Candidate C: Xs scratch / pair_a alias, 1,040 MiB reduction](docs/XS_PAIR_A_ALIAS_2026-11-23.md)
+- [Candidate D: additional VRAM saving and validated benchmark](docs/CANDIDATE_D_VRAM_2026-11-23.md)
 
 The original project's usage, build instructions, hardware compatibility and performance comparisons are preserved below. This fork does not modify or imply endorsement by the upstream project.
 
@@ -364,7 +390,3 @@ attributions. Built with SI.
 If you appreciate this, and want to give back, feel free.
 
 xch1d80tfje65xy97fpxg7kl89wugnd6svlv5uag2qays0um5ay5sn0qz8vph8
-
-### Candidate D VRAM optimization
-
-- [Candidate D: additional VRAM saving and validated benchmark](docs/CANDIDATE_D_VRAM_2026-11-23.md)

@@ -8,6 +8,7 @@
 
 #include "host/GpuBufferPool.hpp"
 #include "host/MatchScratchAlias.hpp"
+#include "host/T2XbitsReuse.hpp"
 
 #ifndef _WIN32
 #include <dlfcn.h>   // runtime lookup of hipMemGetInfo on AMD — see device_memory_probe
@@ -176,7 +177,10 @@ GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
     // It does NOT alias the Xs construction scratch — that's d_pair_b.
     result.pair_a_bytes = std::max({
         static_cast<size_t>(result.cap) * sizeof(T1PairingGpu),
-        static_cast<size_t>(result.cap) * sizeof(T2PairingGpu),
+        static_cast<size_t>(result.cap) *
+            (t2_xbits_reuse_enabled()
+                ? (sizeof(uint64_t) + sizeof(uint32_t))
+                : sizeof(T2PairingGpu)),
         static_cast<size_t>(result.cap) * sizeof(T3PairingGpu),
         static_cast<size_t>(result.cap) * sizeof(uint64_t),
     });
@@ -230,7 +234,8 @@ GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
 }
 
 GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_device_bytes)
-    : k(k_), strength(strength_), testnet(testnet_)
+    : k(k_), strength(strength_), testnet(testnet_),
+      t2_xbits_reuse(t2_xbits_reuse_enabled())
 {
     if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
     if (k < 18 || k > 28 || (k & 1)) throw std::invalid_argument("k must be even in [18, 28]");
@@ -244,6 +249,9 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     pair_b_bytes = sizes.pair_b_bytes;
     xs_temp_bytes = sizes.xs_temp_bytes;
     sort_scratch_bytes = sizes.sort_scratch_bytes;
+    if (t2_xbits_reuse && !t2_xbits_reuse_layout_fits(
+            static_cast<size_t>(cap), pair_b_bytes, storage_bytes))
+        throw std::runtime_error("T2 xbits reuse: insufficient pool layout");
     // The Fine Bucket match-index scratch aliases the idle suffix of
     // d_storage during each match. Only match-index requests that do not fit
     // their phase's free suffix need dedicated d_sort_scratch storage.
@@ -265,15 +273,19 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
                                 &t3_match_bytes, q);
         auto const t1_idle = match_scratch_idle_suffix(
             storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
-        auto const t23_idle = match_scratch_idle_suffix(
+        auto const t2_idle = match_scratch_idle_suffix(
             storage_bytes, static_cast<size_t>(cap) * sizeof(uint32_t));
+        // T3 additionally keeps sorted T2 xbits in d_storage's vals_in slot.
+        auto const t3_idle = match_scratch_idle_suffix(
+            storage_bytes, t3_match_live_prefix_bytes(
+                static_cast<size_t>(cap), t2_xbits_reuse));
         bool const alias_enabled = match_scratch_alias_enabled();
         size_t const previous_bytes = std::max({sort_scratch_bytes,
                                                  t1_match_bytes, t2_match_bytes,
                                                  t3_match_bytes});
         sort_scratch_bytes = match_scratch_backing_bytes(
             sort_scratch_bytes, t1_match_bytes, t2_match_bytes, t3_match_bytes,
-            t1_idle, t23_idle, alias_enabled);
+            t1_idle, t2_idle, t3_idle, alias_enabled);
         if (std::getenv("POS2GPU_POOL_DEBUG")) {
             std::fprintf(stderr,
                 "[pool] match-index bytes: T1=%zu T2=%zu T3=%zu; "
@@ -282,12 +294,19 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
                 t1_match_bytes, t2_match_bytes, t3_match_bytes,
                 sort_scratch_bytes,
                 int(match_scratch_can_alias(alias_enabled, t1_idle, t1_match_bytes)),
-                int(match_scratch_can_alias(alias_enabled, t23_idle, t2_match_bytes)),
-                int(match_scratch_can_alias(alias_enabled, t23_idle, t3_match_bytes)),
+                int(match_scratch_can_alias(alias_enabled, t2_idle, t2_match_bytes)),
+                int(match_scratch_can_alias(alias_enabled, t3_idle, t3_match_bytes)),
                 previous_bytes - sort_scratch_bytes);
         }
     }
     pinned_bytes = sizes.pinned_bytes;
+    if (std::getenv("POS2GPU_POOL_DEBUG")) {
+        std::fprintf(stderr,
+            "[pool] T2 xbits reuse=%d; pair_a=%zu bytes; "
+            "saving=%zu bytes vs legacy pair_a\n",
+            int(t2_xbits_reuse), pair_a_bytes,
+            t2_xbits_reuse ? static_cast<size_t>(cap) * sizeof(uint32_t) : 0);
+    }
     // Check VRAM before attempting allocation so we can give a useful
     // diagnostic instead of a generic allocation failure. The margin covers
     // GPU driver/context state, sort scratch, AES T-tables, and other small

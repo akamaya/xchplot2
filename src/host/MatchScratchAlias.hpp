@@ -34,17 +34,28 @@ constexpr bool match_scratch_can_alias(bool enabled,
 constexpr std::size_t match_scratch_backing_bytes(
     std::size_t sort_bytes,
     std::size_t t1_need, std::size_t t2_need, std::size_t t3_need,
-    MatchScratchRegion t1_region, MatchScratchRegion t23_region,
-    bool enabled) noexcept
+    MatchScratchRegion t1_region, MatchScratchRegion t2_region,
+    MatchScratchRegion t3_region, bool enabled) noexcept
 {
     std::size_t out = sort_bytes != 0 ? sort_bytes : std::size_t{1};
     if (!match_scratch_can_alias(enabled, t1_region, t1_need) && t1_need > out)
         out = t1_need;
-    if (!match_scratch_can_alias(enabled, t23_region, t2_need) && t2_need > out)
+    if (!match_scratch_can_alias(enabled, t2_region, t2_need) && t2_need > out)
         out = t2_need;
-    if (!match_scratch_can_alias(enabled, t23_region, t3_need) && t3_need > out)
+    if (!match_scratch_can_alias(enabled, t3_region, t3_need) && t3_need > out)
         out = t3_need;
     return out;
+}
+
+// Preserve Candidate A's original two-region API for other callers/tests.
+constexpr std::size_t match_scratch_backing_bytes(
+    std::size_t sort_bytes,
+    std::size_t t1_need, std::size_t t2_need, std::size_t t3_need,
+    MatchScratchRegion t1_region, MatchScratchRegion t23_region,
+    bool enabled) noexcept
+{
+    return match_scratch_backing_bytes(sort_bytes, t1_need, t2_need, t3_need,
+                                       t1_region, t23_region, t23_region, enabled);
 }
 
 // Opt out for a controlled A/B from one executable. Read at pool construction

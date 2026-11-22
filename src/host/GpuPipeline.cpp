@@ -12,6 +12,7 @@
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
 #include "host/MatchScratchAlias.hpp"
+#include "host/T2XbitsReuse.hpp"
 #include "host/VramBudget.hpp"
 #include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
@@ -484,8 +485,11 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // each match and may overwrite the borrowed memory only once it is dead.
     auto const t1_match_idle = match_scratch_idle_suffix(
         pool.storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
-    auto const t23_match_idle = match_scratch_idle_suffix(
+    auto const t2_match_idle = match_scratch_idle_suffix(
         pool.storage_bytes, static_cast<size_t>(cap) * sizeof(uint32_t));
+    auto const t3_match_idle = match_scratch_idle_suffix(
+        pool.storage_bytes, t3_match_live_prefix_bytes(
+            static_cast<size_t>(cap), pool.t2_xbits_reuse));
     bool const alias_match_scratch = match_scratch_alias_enabled();
     auto select_match_temp = [&](size_t required, MatchScratchRegion region) -> void* {
         if (match_scratch_can_alias(alias_match_scratch, region, required))
@@ -507,6 +511,10 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     uint32_t* d_keys_out = storage_u32 + 0 * cap;
     uint32_t* d_vals_in  = storage_u32 + 1 * cap;
     uint32_t* d_vals_out = storage_u32 + 2 * cap;
+    // T2 sort consumes vals_in before the permute. When B is enabled,
+    // reuse that dead slot as the sorted T2 xbits which T3 later reads.
+    if (pool.t2_xbits_reuse)
+        d_t2_xbits_sorted = d_vals_in;
 
     // ---- per-phase wall-time profiling ----
     // Enabled when either cfg.profile is set (xchplot2 -P / --profile) or
@@ -599,8 +607,15 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     uint64_t*     d_t2_meta  = static_cast<uint64_t*>(d_pair_a_raw);
     uint32_t*     d_t2_mi    = reinterpret_cast<uint32_t*>(
         static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
-    uint32_t*     d_t2_xbits = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * (sizeof(uint64_t) + sizeof(uint32_t)));
+    // While matching T2, pair_b's first cap*8 bytes hold sorted T1
+    // metadata. Its final cap*4 bytes are otherwise idle until T2 Sort.
+    uint32_t*     d_t2_xbits = pool.t2_xbits_reuse
+        ? reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(pool.d_pair_b) +
+            t2_xbits_unsorted_offset(static_cast<size_t>(cap)))
+        : reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_pair_a_raw) +
+            pool.cap * (sizeof(uint64_t) + sizeof(uint32_t)));
     T3PairingGpu* d_t3       = static_cast<T3PairingGpu*>(d_pair_a_raw);
 
     // ---------- Phase T1 ----------
@@ -654,7 +669,7 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
                           nullptr, nullptr, nullptr, d_count, cap,
                           nullptr, &t2_temp_bytes, q);
-    void* const t2_match_temp = select_match_temp(t2_temp_bytes, t23_match_idle);
+    void* const t2_match_temp = select_match_temp(t2_temp_bytes, t2_match_idle);
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t2 = begin_phase("T2 match");
     launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
@@ -694,7 +709,7 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
                           nullptr, t2_count,
                           d_t3, d_count, cap,
                           nullptr, &t3_temp_bytes, q);
-    void* const t3_match_temp = select_match_temp(t3_temp_bytes, t23_match_idle);
+    void* const t3_match_temp = select_match_temp(t3_temp_bytes, t3_match_idle);
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t3 = begin_phase("T3 match + Feistel");
     launch_t3_match(cfg.plot_id.data(), t3p,

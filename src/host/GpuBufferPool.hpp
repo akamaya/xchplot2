@@ -96,6 +96,7 @@ struct GpuBufferPool {
     int  k = 0;
     int  strength = 0;
     bool testnet = false;
+    bool t2_xbits_reuse = false; // captured at pool construction
 
     // Derived sizes (for diagnostics / assertions).
     uint64_t total_xs           = 0;

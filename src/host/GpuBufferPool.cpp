@@ -7,6 +7,7 @@
 // CUDA host code share the same primary CUDA context).
 
 #include "host/GpuBufferPool.hpp"
+#include "host/MatchScratchAlias.hpp"
 
 #ifndef _WIN32
 #include <dlfcn.h>   // runtime lookup of hipMemGetInfo on AMD — see device_memory_probe
@@ -243,11 +244,11 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     pair_b_bytes = sizes.pair_b_bytes;
     xs_temp_bytes = sizes.xs_temp_bytes;
     sort_scratch_bytes = sizes.sort_scratch_bytes;
-    // Fine Bucket indices share d_sort_scratch with radix sorting, but the
-    // pool's original sizing queried sort scratch only. At Fine Bits=16,
-    // T2/T3 need ~128 MiB at k=28, strength=6, potentially exceeding it.
-    // Query the actual match-prepare requirements for the selected runtime
-    // Fine Bits, and allocate the maximum. The three phases reuse ONE buffer.
+    // The Fine Bucket match-index scratch aliases the idle suffix of
+    // d_storage during each match. Only match-index requests that do not fit
+    // their phase's free suffix need dedicated d_sort_scratch storage.
+    // Sort and match never run concurrently in this pool path; this avoids a
+    // separate ~320 MiB Fine16 Direct allocation on the k28 u32 path.
     {
         uint8_t dummy_plot_id[32] = {};
         size_t t1_match_bytes = 0;
@@ -262,14 +263,28 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
         launch_t3_match_prepare(dummy_plot_id, make_t3_params(k, strength),
                                 nullptr, 0, nullptr, nullptr,
                                 &t3_match_bytes, q);
-        sort_scratch_bytes = std::max({sort_scratch_bytes,
-                                       t1_match_bytes, t2_match_bytes,
-                                       t3_match_bytes});
+        auto const t1_idle = match_scratch_idle_suffix(
+            storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
+        auto const t23_idle = match_scratch_idle_suffix(
+            storage_bytes, static_cast<size_t>(cap) * sizeof(uint32_t));
+        bool const alias_enabled = match_scratch_alias_enabled();
+        size_t const previous_bytes = std::max({sort_scratch_bytes,
+                                                 t1_match_bytes, t2_match_bytes,
+                                                 t3_match_bytes});
+        sort_scratch_bytes = match_scratch_backing_bytes(
+            sort_scratch_bytes, t1_match_bytes, t2_match_bytes, t3_match_bytes,
+            t1_idle, t23_idle, alias_enabled);
         if (std::getenv("POS2GPU_POOL_DEBUG")) {
             std::fprintf(stderr,
-                "[pool] match-index bytes: T1=%zu T2=%zu T3=%zu; shared sort_scratch=%zu\n",
+                "[pool] match-index bytes: T1=%zu T2=%zu T3=%zu; "
+                "shared sort_scratch=%zu; alias T1=%d T2=%d T3=%d; "
+                "saved=%zu bytes\n",
                 t1_match_bytes, t2_match_bytes, t3_match_bytes,
-                sort_scratch_bytes);
+                sort_scratch_bytes,
+                int(match_scratch_can_alias(alias_enabled, t1_idle, t1_match_bytes)),
+                int(match_scratch_can_alias(alias_enabled, t23_idle, t2_match_bytes)),
+                int(match_scratch_can_alias(alias_enabled, t23_idle, t3_match_bytes)),
+                previous_bytes - sort_scratch_bytes);
         }
     }
     pinned_bytes = sizes.pinned_bytes;

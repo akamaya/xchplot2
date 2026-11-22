@@ -11,6 +11,7 @@
 
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
+#include "host/MatchScratchAlias.hpp"
 #include "host/VramBudget.hpp"
 #include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
@@ -476,11 +477,23 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // on single-plot runs (only slot 0 gets allocated). See
     // GpuBufferPool::ensure_pinned header comment for rationale.
     uint64_t*       h_pinned_t3    = sink || device_output ? nullptr : pool.ensure_pinned(pinned_index);
-    // T1/T2/T3 match kernels report 0 scratch bytes, but some CUDA paths
-    // reject a nullptr d_temp_storage with cudaErrorInvalidArgument even
-    // when bytes==0. Point them at d_sort_scratch (idle during match) to
-    // give the kernel a valid non-null handle.
-    void*           d_match_temp   = pool.d_sort_scratch;
+    // Match-index scratch is built/read entirely within each Match phase.
+    // Borrow the d_storage suffix not used by that phase's live input.
+    // T1 still reads Xs[total_xs] from the prefix; T2/T3 still read the
+    // sorted match-info keys from the first u32[cap]. Sort phases run after
+    // each match and may overwrite the borrowed memory only once it is dead.
+    auto const t1_match_idle = match_scratch_idle_suffix(
+        pool.storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
+    auto const t23_match_idle = match_scratch_idle_suffix(
+        pool.storage_bytes, static_cast<size_t>(cap) * sizeof(uint32_t));
+    bool const alias_match_scratch = match_scratch_alias_enabled();
+    auto select_match_temp = [&](size_t required, MatchScratchRegion region) -> void* {
+        if (match_scratch_can_alias(alias_match_scratch, region, required))
+            return static_cast<uint8_t*>(pool.d_storage) + region.offset;
+        if (required > pool.sort_scratch_bytes)
+            throw std::runtime_error("Fine Bucket match index exceeds pooled fallback scratch");
+        return d_sort_scratch;
+    };
 
     // Sort key/val arrays alias d_storage. Safe because Xs is fully consumed
     // by T1 match (stream-synchronised) before we enter T1 sort.
@@ -596,15 +609,14 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           nullptr, nullptr, d_count, cap,
                           nullptr, &t1_temp_bytes, q);
-    if (t1_temp_bytes > pool.sort_scratch_bytes)
-        throw std::runtime_error("T1 fine index exceeds pooled sort scratch");
+    void* const t1_match_temp = select_match_temp(t1_temp_bytes, t1_match_idle);
     // The queue is out-of-order: wait so the counter zeroing can't be
     // scheduled after the match kernel that increments it.
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t1 = begin_phase("T1 match");
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           d_t1_meta, d_t1_mi, d_count, cap,
-                          d_match_temp, &t1_temp_bytes, q);
+                          t1_match_temp, &t1_temp_bytes, q);
     end_phase(p_t1);
 
     // No explicit sync: the next cudaMemcpy (non-async, default stream)
@@ -642,13 +654,12 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
                           nullptr, nullptr, nullptr, d_count, cap,
                           nullptr, &t2_temp_bytes, q);
-    if (t2_temp_bytes > pool.sort_scratch_bytes)
-        throw std::runtime_error("T2 fine index exceeds pooled sort scratch");
+    void* const t2_match_temp = select_match_temp(t2_temp_bytes, t23_match_idle);
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t2 = begin_phase("T2 match");
     launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
                           d_t2_meta, d_t2_mi, d_t2_xbits, d_count, cap,
-                          d_match_temp, &t2_temp_bytes, q);
+                          t2_match_temp, &t2_temp_bytes, q);
     end_phase(p_t2);
 
     uint64_t t2_count = 0;
@@ -683,15 +694,14 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
                           nullptr, t2_count,
                           d_t3, d_count, cap,
                           nullptr, &t3_temp_bytes, q);
-    if (t3_temp_bytes > pool.sort_scratch_bytes)
-        throw std::runtime_error("T3 fine index exceeds pooled sort scratch");
+    void* const t3_match_temp = select_match_temp(t3_temp_bytes, t23_match_idle);
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t3 = begin_phase("T3 match + Feistel");
     launch_t3_match(cfg.plot_id.data(), t3p,
                           d_t2_meta_sorted, d_t2_xbits_sorted,
                           d_keys_out, t2_count,
                           d_t3, d_count, cap,
-                          d_match_temp, &t3_temp_bytes, q);
+                          t3_match_temp, &t3_temp_bytes, q);
     end_phase(p_t3);
 
     uint64_t t3_count = 0;

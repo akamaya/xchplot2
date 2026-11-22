@@ -17,6 +17,7 @@
 #include "gpu/T3Kernel.cuh"
 #include "gpu/T3Offsets.cuh"
 #include "gpu/FineBucketDirect.hpp"
+#include "gpu/FineBucketDirect20.hpp"
 #include "gpu/FineBucketIndex.hpp"
 #include "host/PoolSizing.hpp"
 
@@ -62,6 +63,7 @@ struct T3Derived {
     size_t   fine_bytes;
     size_t   temp_needed;
     bool     direct_enabled;
+    bool     direct20_enabled;
     uint32_t target_mask;
     int      num_test_bits;
     uint64_t l_count_max;
@@ -79,8 +81,11 @@ T3Derived derive_t3(T3MatchParams const& params)
     d.bucket_bytes    = layout.bucket_bytes;
     d.fine_bytes      = layout.fine_bytes;
     d.temp_needed     = layout.total_bytes();
-    d.direct_enabled  = fine_direct16_enabled(d.fine_bits, params.num_match_target_bits);
-    if (d.direct_enabled) d.temp_needed += fine_direct16_bytes(d.num_buckets);
+    d.direct20_enabled = fine_direct20_enabled(d.fine_bits, params.num_match_target_bits);
+    d.direct_enabled  = !d.direct20_enabled &&
+        fine_direct16_enabled(d.fine_bits, params.num_match_target_bits);
+    if (d.direct20_enabled) d.temp_needed += fine_direct20_bytes(d.num_buckets);
+    else if (d.direct_enabled) d.temp_needed += fine_direct16_bytes(d.num_buckets);
     d.target_mask     = (params.num_match_target_bits >= 32)
                           ? 0xFFFFFFFFu
                           : ((1u << params.num_match_target_bits) - 1u);
@@ -132,7 +137,12 @@ void launch_t3_match_prepare(
         params.num_match_target_bits, d.fine_bits,
         d.num_buckets, d_fine_offsets, q);
     fine_timer.mark("fine_offsets", q);
-    if (d.direct_enabled) {
+    if (d.direct20_enabled) {
+        auto* direct = fine_direct20_ptr(d_fine_offsets, d.num_buckets);
+        FineBucketTimer direct_timer(3, d.fine_bits);
+        fine_direct20_build(d_sorted_mi, d_fine_offsets, direct, d.num_buckets, q);
+        direct_timer.mark("direct20_build", q);
+    } else if (d.direct_enabled) {
         auto* direct = fine_direct16_ptr(d_fine_offsets, d.num_buckets);
         FineBucketTimer direct_timer(3, d.fine_bits);
         fine_direct16_build(d_sorted_mi, d_fine_offsets, direct, d.num_buckets, q);

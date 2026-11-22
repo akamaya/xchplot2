@@ -32,8 +32,10 @@
 | **Candidate B: T2 xbits buffer reuse** | **26.28 s/plot (10 plots)** | **1,040 MiB** further saving; OFF 26.25 / ON 26.28 s/plot; 223/223 full proofs PASS |
 | **Candidate C: Xs scratch aliases `d_pair_a`** | **26.15 s/plot (10 plots)** | **1,040 MiB** further saving; OFF 26.20 / ON 26.15 s/plot; 236/236 full proofs PASS |
 | **Candidate D: pooled Xs/T1/T2 buffer remapping** | **26.08 s/plot (10 plots)** | **788.28 MiB** further saving; D OFF/ON 26.08 / 26.08 s/plot; 214/214 full proofs PASS |
+| **T1 Direct24 exact match** | **25.96 s/plot (10 plots)** | Direct24 build ~18.8 ms, 89/89 full proofs PASS; pool 8,336 MiB |
+| **T1 Direct24 + T2/T3 Direct20 exact match** | **25.56 s/plot (10 plots)** | ~0.40 s faster vs T1 Direct24-only; 87/87 full proofs PASS; pool 8,368 MiB |
 
-**Latest measured 10-plot steady-state (2026-11-23):** **26.08 s/plot**
+**Earlier Candidate D 10-plot steady-state (2026-11-23):** **26.08 s/plot**
 with Candidates A+B+C+D enabled, after one excluded warmup (RTX 4070 SUPER,
 k28/s6). The same-build D OFF/ON comparison measured 26.08 / 26.08 s/plot;
 no throughput regression was observed at the 0.01-second reporting precision.
@@ -103,6 +105,81 @@ at 0.01 s/plot report precision; smaller effects are not ruled out.
 Candidate D remains **opt-in**; unset `POS2GPU_COMPACT_D` or set it to
 `0` to use A+B+C. See the [Candidate D detailed test record](docs/CANDIDATE_D_VRAM_2026-11-23.md).
 
+
+<!-- BEGIN XCHPLOT2-EXACT-INDEX-20261123 -->
+### Full-key exact-match indexes: T1 Direct24 + T2/T3 Direct20 (2026-11-23)
+
+Experimental **SYCL compact-match only** optimization for RTX 4070 SUPER
+12 GB (`gpu0`) on Windows 11, `k=28`, strength 6. The indexes provide
+absolute 32-bit start offsets per complete match target instead of per-target
+binary search or 16+4-bit compressed lookup.
+
+- **T1 Direct24:** 16 match buckets x 2^24 targets, plus one sentinel:
+  1,024 MiB of `uint32_t` offsets. Fine18 offsets (32 MiB) are used
+  **only to build** the Direct24 index, not for T1 matching. Enable with
+  `POS2GPU_T1_DIRECT24=1`, `POS2GPU_T1_FINE_BITS=18` and
+  `POS2GPU_T1_COMPACT=1`.
+- **T2/T3 Direct20:** 256 match buckets x 2^20 targets, plus sentinel:
+  1,024 MiB of offsets per phase. Fine16 (64 MiB) remains during index
+  construction. The T2 and T3 indexes **share** the same phase-reused GPU
+  sort/match scratch with T1; the three allocations do not accumulate.
+  Enable with `POS2GPU_T23_DIRECT20=1`,
+  `POS2GPU_T2_FINE_BITS=16`, `POS2GPU_T3_FINE_BITS=16`,
+  `POS2GPU_T2_COMPACT=1`, `POS2GPU_T3_COMPACT=1`.
+
+Both builders scan the sorted target values within Fine18/Fine16 groups,
+handle empty keys and duplicates via repeated lower-bound offsets, and
+retain a skew-safe bounded-binary-search fallback. The full-key range
+is `[direct[(bucket<<bits)|target], direct[((bucket<<bits)|target)+1])`.
+The prior search paths remain available with the new flags disabled.
+
+#### Measured results (one excluded warmup, 10 measured plots per run)
+
+| Index configuration | Steady-state | GPU pool allocation |
+|---|---:|---:|
+| Candidate D + T1 Fine8 + T2/T3 Fine16 direct 16+4 | 26.07 s/plot | 7,600 MiB |
+| Candidate D + T1 Fine18 + T2/T3 direct 16+4 | 26.02 s/plot | 7,600 MiB |
+| Candidate D + **T1 Direct24**, T2/T3 direct 16+4 | **25.96 s/plot** | **8,336 MiB** |
+| Candidate D + **T1 Direct24 + T2/T3 Direct20** | **25.56 s/plot** | **8,368 MiB** |
+
+The first two results come from a Fine8/Fine18/Fine8 comparison (26.07,
+26.02, 26.09 s/plot). Each Direct24 and Direct20 measurement uses a
+separate 10-plot run; **these are cross-run comparisons, not same-run
+paired A/B tests**, and small differences may reflect run-to-run variability.
+All measurements use Candidate D and the Tezcan/compact production flags
+with two-phase matching disabled.
+
+With T1 Direct24, the `direct24_build` stage stabilized at about **18.8 ms**
+per plot after JIT warmup. T1 matching improved from about **7.78 s**
+(Fine18) to **7.70 s** (Direct24). Adding T2/T3 Direct20 reduced T2's
+`match_fused` from about **8.35 s** to **8.14 s** and T3's from
+about **8.63 s** to **8.42 s**. T2/T3 Direct20 builds cost about
+**10.0/9.8 ms**, versus about **6.8/6.7 ms** for 16+4-bit compressed
+index builds. Full configuration versus T1-only Direct24 improved
+the reported steady-state by about **0.40 s/plot (1.54%)**.
+
+**VRAM accounting:** Candidate D base is 7,600 MiB of GPU pool allocations.
+Direct24 increases pooled sort/match scratch from 320 to 1,056 MiB,
+adding 736 MiB. Enabling T2/T3 Direct20 expands that shared scratch
+to 1,088 MiB, adding **32 MiB** (not another 2 GiB). The final
+pool allocation is **8,368 MiB (~8.17 GiB)**, consisting of
+`d_storage=3,120 MiB`, `d_pair_a=2,080 MiB`, `d_pair_b=2,080 MiB`
+and `d_sort_scratch=1,088 MiB`. This is **allocated pool memory,
+not observed whole-device peak VRAM**; pinned host memory is separate.
+
+**Retained-plot correctness:** T1 Direct24 alone: `verify --full --trials 100`,
+**89/89 full proofs valid**. T1 Direct24 + T2/T3 Direct20:
+`verify --full --trials 100`, **87/87 full proofs valid**.
+Both runs returned `OK (full proof validation)`. These are sampled
+correctness tests, not an exhaustive proof or a multi-device parity test.
+
+**Scope:** Experimental opt-in; existing defaults unchanged.
+The exact-index acceleration is implemented for the SYCL compact T1/T2/T3
+paths and has not been validated for all plot sizes, strength settings,
+backends, tiers or simultaneous workers. If memory admission fails on a
+12 GB GPU, disable the new exact-index flags and retain Candidate D.
+
+<!-- END XCHPLOT2-EXACT-INDEX-20261123 -->
 
 ### Latest AES V4INIT A/B — same configuration
 

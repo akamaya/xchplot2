@@ -4,6 +4,7 @@
 
 #include "gpu/MatchKernelCommon.cuh"
 #include "gpu/FineBucketDirect.hpp"
+#include "gpu/FineBucketDirect20.hpp"
 #include "gpu/MatchDiag.hpp"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T2Offsets.cuh"
@@ -567,8 +568,12 @@ static void launch_t2_match_all_buckets_compact(
     sycl::queue& q)
 {
     // Only this SYCL all-buckets COMPACT kernel uses the compressed suffix index.
-    uint8_t const* d_direct_offsets = pos2gpu::fine_direct16_enabled(
-        fine_bits, num_match_target_bits)
+    bool const use_direct20 = pos2gpu::fine_direct20_enabled(
+        fine_bits, num_match_target_bits);
+    FineBucketOffset const* d_direct20 = use_direct20
+        ? pos2gpu::fine_direct20_ptr(d_fine_offsets, num_buckets) : nullptr;
+    uint8_t const* d_direct_offsets = (!use_direct20 &&
+        pos2gpu::fine_direct16_enabled(fine_bits, num_match_target_bits))
         ? pos2gpu::fine_direct16_ptr(const_cast<FineBucketOffset*>(d_fine_offsets), num_buckets)
         : nullptr;
 
@@ -656,16 +661,24 @@ static void launch_t2_match_all_buckets_compact(
                         ? t2c_tezcan_target(keys_copy, 2u, match_key_r, meta_l, sT, 0, static_cast<uint32_t>(local_id) & 15u)
                         : pos2gpu::matching_target_smem(keys_copy, 2u, match_key_r, meta_l, sT, 0))
                         & target_mask;
-                    uint32_t shift = uint32_t(num_match_target_bits - fine_bits);
-                    uint32_t fine_key = target_l >> shift;
-                    uint64_t fi = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                    auto const range = pos2gpu::fine_direct16_find(
-                        d_sorted_mi, d_fine_offsets, d_direct_offsets,
-                        fi, target_l, target_mask);
-                    first = range.first;
-                    fine_hi = range.end;
+                    if (use_direct20) {
+                        uint64_t const exact_key =
+                            (uint64_t(r_bucket) << 20) | target_l;
+                        first = d_direct20[exact_key];
+                        fine_hi = d_direct20[exact_key + 1];
+                    } else {
+                        uint32_t const fine_key =
+                            target_l >> uint32_t(num_match_target_bits - fine_bits);
+                        uint64_t const fine_idx =
+                            (uint64_t(r_bucket) << fine_bits) | fine_key;
+                        auto const range = pos2gpu::fine_direct16_find(
+                            d_sorted_mi, d_fine_offsets, d_direct_offsets,
+                            fine_idx, target_l, target_mask);
+                        first = range.first;
+                        fine_hi = range.end;
+                    }
                     for (uint64_t r = first; r < fine_hi; ++r) {
-                        if ((d_sorted_mi[r] & target_mask) != target_l) break;
+                        if (!use_direct20 && (d_sorted_mi[r] & target_mask) != target_l) break;
                         if (++count > pair_cap) break;
                     }
                 }
@@ -718,7 +731,7 @@ static void launch_t2_match_all_buckets_compact(
                     // nothing, and no lane needs a later barrier.
                     if (l < l_end) {
                         for (uint64_t r = first; r < fine_hi; ++r) {
-                            if ((d_sorted_mi[r] & target_mask) != target_l) break;
+                            if (!use_direct20 && (d_sorted_mi[r] & target_mask) != target_l) break;
                             emit(meta_l, d_sorted_meta[r]);
                         }
                     }

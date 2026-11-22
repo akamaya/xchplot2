@@ -27,10 +27,57 @@
 | **Fine Bucket 8/16/16 + 16+4-bit direct lookup** | **27.27 s/plot** | **0.68 s (2.43% shorter time) vs 16-bit binary search; 10 plots** |
 | T2/T3 compact pair capacity 480/330 | — (stage timing only) | T2 -313 ms (3.44%), T3 -293 ms (3.18%); ~0.61 s combined kernel reduction; T1 stays 512 |
 | **AES V4INIT: 128-bit T0 initialization (T1–T3)** | **26.19 s/plot (best single observation)** | **Same-config A/B phase total -465.6 ms (-1.73%); 2 measured plots per mode; 114/114 full proofs PASS** |
+| Fine Bucket T2/T3 index u64 -> u32 | 26.21 s/plot (10 plots) | 64 MiB smaller Fine16 Direct index; 64-bit reference 26.28 s/plot; speed difference within noise |
+| **Candidate A: Fine index scratch aliases `d_storage`** | **26.25 s/plot (10 plots)** | **251.72 MiB** less allocated VRAM; OFF 26.21 / ON 26.25 s/plot; 183/183 full proofs PASS |
+| **Candidate B: T2 xbits buffer reuse** | **26.28 s/plot (10 plots)** | **1,040 MiB** further saving; OFF 26.25 / ON 26.28 s/plot; 223/223 full proofs PASS |
+| **Candidate C: Xs scratch aliases `d_pair_a`** | **26.15 s/plot (10 plots)** | **1,040 MiB** further saving; OFF 26.20 / ON 26.15 s/plot; 236/236 full proofs PASS |
 
-**Best 10-plot steady-state measurement (2026-11-21):** **27.27 s/plot** with Fine Bucket 16+4-bit direct lookup (10 measured plots after one warmup). **Newest best single-plot observation:** **26.19 s/plot** after AES V4INIT and T2/T3 pair-cap tuning (one measured plot after one warmup). Versus the initial 68.17 s/plot, these observations are arithmetically 60.0% and 61.6% shorter, respectively; **they are from different run counts/conditions and are not a controlled end-to-end A/B comparison**.
+**Latest best 10-plot steady-state measurement (2026-11-23):** **26.15 s/plot**
+with Candidates A+B+C enabled, after one excluded warmup (RTX 4070 SUPER,
+k28/s6). This is a single A/B batch observation, **not a claim of proven
+speedup**: the controlled Candidate C test measured 26.20 s/plot with C OFF,
+and 26.15 s/plot with C ON (about 0.19% difference). The original 2026-11-21
+Fine Bucket result was 27.27 s/plot (10 plots), and the AES V4INIT best
+single-plot observation was 26.19 s/plot; these are historical results under
+different measurement conditions, not directly comparable speedup estimates.
 
 The Compact, Tezcan, Fine Bucket and two-phase selections are **opt-in experimental optimizations**, not a default-setting or world-record claim. **V4INIT itself is permanently enabled in the selected SYCL Tezcan paths** (no `POS2GPU_AES_VEC_INIT` switch). Intermediate rows are historical measurements from different runs; the Fine Bucket comparison used 10 measured plots per configuration, whereas the AES V4INIT phase A/B used two runs with one measured plot each after warmup.
+
+<!-- BEGIN XCHPLOT2-VRAM-ABC-20261123 -->
+### Fine Bucket 32-bit and GPU pool VRAM optimizations (2026-11-22 to 2026-11-23)
+
+All measurements below used a single **RTX 4070 SUPER 12 GiB**, native Windows 11,
+SYCL/AdaptiveCpp CUDA, `k=28`, strength 6, one warmup followed by **10 measured plots**
+per A/B mode. The optimization flags were explicitly set for every run.
+The A/B comparisons are separate experiment batches, not a single paired
+four-step timing sequence; small timing differences do not establish a speedup.
+
+| Step | Incremental reduction in GPU pool allocation | Cumulative reduction vs 32-bit baseline | 10-plot steady-state, optimization enabled |
+|---|---:|---:|---:|
+| 32-bit Fine Bucket index | 64 MiB vs 64-bit index | Baseline for A/B/C | 26.21 s/plot |
+| Candidate A: reuse `d_storage` for Fine match index | 251.72 MiB | 251.72 MiB | 26.25 s/plot |
+| Candidate B: relocate T2 xbits | 1,040 MiB | 1,291.72 MiB | 26.28 s/plot |
+| **Candidate C: alias Xs scratch with `d_pair_a`** | **1,040 MiB** | **2,331.72 MiB (about 2.28 GiB)** | **26.15 s/plot** |
+
+**Allocation accounting, not device-wide peak VRAM telemetry.** The 2,331.72 MiB
+is the **A+B+C** reduction relative to the 32-bit-index baseline; the earlier
+64 MiB index reduction is listed separately. GPU pool reductions apply to the
+**pooled GPU pipeline** under the tested flags, not all streaming paths or GPUs.
+At k28, B and C each remove `cap * 4 = 1,090,519,040 bytes (1,040 MiB)`;
+A removes 263,948,813 bytes of separately allocated Fine scratch.
+
+**Correctness checks:** A: 183/183, B: 223/223, C: 236/236 full proofs validated
+(two retained `.gplot` files and 100 trials each per experiment).
+These are sampled full-proof checks, not exhaustive CPU/GPU byte parity.
+C also passed all three host tests: `xs_pair_a_alias_test`,
+`t2_xbits_reuse_test`, and `match_scratch_alias_test`.
+
+**Switches:** `POS2GPU_MATCH_INDEX_ALIAS=1` (A),
+`POS2GPU_T2_XBITS_REUSE=1` (B),
+`POS2GPU_XS_PAIR_A_ALIAS=1` (C). C requires B; missing required space causes
+a safe fallback instead of claiming the C allocation saving. See the documents
+linked under **Detailed optimization records** for lifetime and fallback rules.
+<!-- END XCHPLOT2-VRAM-ABC-20261123 -->
 
 ### Latest AES V4INIT A/B — same configuration
 
@@ -50,21 +97,25 @@ The benchmark's `steady-state` is affected by asynchronous output and the NAS; d
 - **GPU:** NVIDIA GeForce RTX 4070 SUPER, 12 GB VRAM (`gpu0`); one GPU plotting worker
 - **OS / backend:** Windows 11; SYCL / AdaptiveCpp targeting CUDA
 - **Workload:** k=28, Strength 6; synthetic `.gplot` benchmark output
-- **Measurement:** Fine Bucket result: one warmup + ten measured plots; AES V4INIT phase A/B: two runs per mode with one warmup + one measured plot each; early T1/T2/T3 iterations used one warmup + three measured plots.
+- **Measurement:** Current A/B/C memory experiments: one warmup + ten measured plots per mode; 2026-11-21 Fine Bucket result: one warmup + ten measured plots; AES V4INIT phase A/B: two runs per mode with one warmup + one measured plot each; early T1/T2/T3 iterations used one warmup + three measured plots.
 - **Latest V4INIT phase stage times:** T1 match ~7.83 s; T2 match ~8.51 s; T3 match + Feistel ~8.81 s (two measured plots per mode). Earlier T1/T2/T3 baseline was ~7.8 / ~9.8 / ~10.0 s.
-- **Peak device-wide VRAM use:** 10,474 MiB, with 11,069 MiB free at benchmark start and a minimum of 595 MiB remaining
+- **Historical peak device-wide VRAM use (before A/B/C):** 10,474 MiB, with 11,069 MiB free at benchmark start and a minimum of 595 MiB remaining. The 2.28 GiB A/B/C savings above are *pool allocation accounting*, not an updated peak-VRAM measurement.
 - **Steady-state spread:** 28.98窶・9.21 s/plot, standard deviation 0.11 s in the fastest three-plot run
 
-### Reproduce the optimized configuration
+### Reproduce the current A+B+C measured configuration
 
-After building the Windows SYCL target with V4INIT adoption applied, run the following in **PowerShell** from the repository root:
+On Windows 11 with the compiled `build/windows-sycl` GPU target, run the
+following **single PowerShell command** from any directory. It explicitly
+sets each benchmark flag so it does not depend on previous shell state.
+The benchmark uses `gpu0` (RTX 4070 SUPER) and the existing NAS output directory.
 
 ```powershell
-$env:POS2GPU_T1_COMPACT='1'; $env:POS2GPU_T2_COMPACT='1'; $env:POS2GPU_T2_TEZCAN='1'; $env:POS2GPU_T2_TWOPHASE='0'; $env:POS2GPU_T3_COMPACT='1'; $env:POS2GPU_T3_TEZCAN='1'; $env:POS2GPU_T3_TWOPHASE='0'; $env:POS2GPU_T1_FINE_BITS='8'; $env:POS2GPU_T2_FINE_BITS='16'; $env:POS2GPU_T3_FINE_BITS='16'; $env:POS2GPU_FINE_DIRECT='1'; $env:POS2GPU_MATCH_DIAG='0'; $env:POS2GPU_PHASE_TIMING='1'
-.\build\windows-sycl\tools\xchplot2\xchplot2.exe bench -k 28 -s 6 -n 3 --warmup 1 --devices gpu0 -o D:\plots_test
+cd C:\dev\xchplot2; $env:POS2GPU_T1_COMPACT='1'; $env:POS2GPU_T2_COMPACT='1'; $env:POS2GPU_T3_COMPACT='1'; $env:POS2GPU_T2_TEZCAN='1'; $env:POS2GPU_T3_TEZCAN='1'; $env:POS2GPU_T2_TWOPHASE='0'; $env:POS2GPU_T3_TWOPHASE='0'; $env:POS2GPU_T1_FINE_BITS='8'; $env:POS2GPU_T2_FINE_BITS='16'; $env:POS2GPU_T3_FINE_BITS='16'; $env:POS2GPU_FINE_DIRECT='1'; $env:POS2GPU_MATCH_DIAG='0'; $env:POS2GPU_PHASE_TIMING='1'; $env:POS2GPU_POOL_DEBUG='1'; $env:POS2GPU_MATCH_INDEX_ALIAS='1'; $env:POS2GPU_T2_XBITS_REUSE='1'; $env:POS2GPU_XS_PAIR_A_ALIAS='1'; .\build\windows-sycl\tools\xchplot2\xchplot2.exe bench -k 28 -s 6 -n 10 --warmup 1 --devices gpu0 -o \\NAS-UGREEN\personal_folder\plots_test
 ```
 
-Change the output directory and device ID as needed. These environment variables affect the current PowerShell process and its child processes; they are **not** enabled by a Git commit. V4INIT is code-level adoption and needs **no separate environment variable**. The benchmark creates **synthetic, non-farmable** plots and removes them on exit unless `--keep` is supplied.
+Environment variables are per-process. These pooled buffer aliases are
+experimental; they do **not** accelerate the streaming tier. `bench` builds
+synthetic, non-farmable plots and deletes them unless `--keep` is specified.
 
 ### Correctness and verification
 
@@ -75,6 +126,8 @@ Change the output directory and device ID as needed. These environment variables
 - **T3-optimized k=28 / Strength 6 plot:** `verify --trials 100 --full` validated **91/91 full proofs**.
 - Earlier T1 parity tests matched 4,189,913 results, but the final T1 Local Compaction path has not been documented here as independently passing broad CPU-reference parity.
 - **V4INIT + Fine Direct + Compact / Tezcan, k=28 / Strength 6:** one retained synthetic `.gplot`, `verify --full --trials 100`: **46 challenges with quality chains, 114 chains, 114/114 full proofs validated; OK**. This is a sample-based full-proof check, **not a same-input CPU/GPU byte-for-byte parity test**.
+
+Candidate A/B/C also passed 183/183, 223/223 and 236/236 sampled full proofs, respectively, under the tested pooled k28/s6 configurations.
 
 Full-proof checks sample random challenges; they do **not** exhaustively certify all possible proofs, GPU models, strength settings, or streaming tiers. The optimization branch remains experimental.
 
@@ -88,6 +141,10 @@ Full-proof checks sample random challenges; they do **not** exhaustively certify
 - [Fine Bucket 16+4-bit direct lookup, 10-plot benchmarks (Japanese)](docs/FINE_BUCKET_OPTIMIZATION_2026-11-21.md)
 - [T1/T2/T3 candidate-capacity tuning, occupancy analysis (Japanese)](docs/GPU_PAIR_CAP_T1_T3_2026-11-21.md)
 - [AES V4INIT: research, SASS, 2-pair A/B and full-proof validation (Japanese)](docs/AES_V4INIT_OPTIMIZATION_2026-11-21.md)
+- [Fine Bucket 32-bit index: 64 MiB reduction and 10-plot A/B](docs/FINE_BUCKET_U32_2026-11-22.md)
+- [Candidate A: Fine match scratch alias, 251.72 MiB reduction](docs/FINE_BUCKET_SCRATCH_ALIAS_2026-11-23.md)
+- [Candidate B: T2 xbits reuse, 1,040 MiB reduction](docs/T2_XBITS_REUSE_2026-11-23.md)
+- [Candidate C: Xs scratch / pair_a alias, 1,040 MiB reduction](docs/XS_PAIR_A_ALIAS_2026-11-23.md)
 
 The original project's usage, build instructions, hardware compatibility and performance comparisons are preserved below. This fork does not modify or imply endorsement by the upstream project.
 
@@ -307,6 +364,3 @@ attributions. Built with SI.
 If you appreciate this, and want to give back, feel free.
 
 xch1d80tfje65xy97fpxg7kl89wugnd6svlv5uag2qays0um5ay5sn0qz8vph8
-
-### Fine Bucket 32bit Index Experiment
-- [Results: 64 MiB memory reduction, negligible performance change](docs/FINE_BUCKET_U32_2026-11-22.md)

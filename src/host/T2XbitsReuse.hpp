@@ -33,12 +33,21 @@ constexpr std::size_t t3_match_live_prefix_bytes(std::size_t cap,
 
 constexpr bool t2_xbits_reuse_layout_fits(std::size_t cap,
                                            std::size_t pair_b_bytes,
+                                           std::size_t storage_bytes,
+                                           bool xs_pair_a_alias) noexcept
+{
+    // With C enabled B's unsorted xbits no longer occupies pair_b's tail;
+    // both sorted-meta and T1 sorted-meta need only 8*cap.
+    return cap <= (std::numeric_limits<std::size_t>::max)() / 12
+        && pair_b_bytes >= cap * (xs_pair_a_alias ? 8 : 12)
+        && storage_bytes >= cap * 12;
+}
+
+constexpr bool t2_xbits_reuse_layout_fits(std::size_t cap,
+                                           std::size_t pair_b_bytes,
                                            std::size_t storage_bytes) noexcept
 {
-    // Avoid overflow in all later offset/footprint calculations.
-    return cap <= (std::numeric_limits<std::size_t>::max)() / 12
-        && pair_b_bytes >= cap * 12
-        && storage_bytes >= cap * 12;
+    return t2_xbits_reuse_layout_fits(cap, pair_b_bytes, storage_bytes, false);
 }
 
 // OFF for same-executable A/B. Read once when the pool is constructed and

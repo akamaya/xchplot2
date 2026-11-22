@@ -16,14 +16,14 @@
 //                               d_storage doesn't allocate for it —
 //                               saves cap·4 B (~1.09 GiB at k=28) vs
 //                               the old 4-slot layout.
-//   d_pair_a       (~4.4 GB)  — T1/T2/T3 match output (reused across phases).
-//                               Sized to the largest match-output: cap·16 B
-//                               for T2 (meta+mi+xbits SoA). Does NOT alias the
-//                               Xs phase scratch — that lives in d_pair_b.
-//   d_pair_b       (~4.4 GB)  — *_sorted / frags_out (reused across phases),
-//                               AND the Xs construction scratch. Sized to
-//                               max(largest sorted-output, xs_temp_bytes);
-//                               at k=28 xs_temp dominates.
+//   d_pair_a       (~3.27 GB with B) — Xs scratch when C is active, then
+//                               T1/T2/T3 match output, reused sequentially.
+//                               The T2 mi output moves to d_storage with C,
+//                               making room for T2 xbits in pair_a.
+//   d_pair_b       (~2.18 GB with A+B+C at k28) — sorted T1/T2 meta,
+//                               T3 fragments and T2 sort identity input.
+//                               Without C it also holds Xs scratch and B's
+//                               unsorted T2 xbits, requiring ~3.27 GB.
 //   d_sort_scratch (~MB)      — Radix sort scratch. After ping-pong refactor:
 //                               CUB DoubleBuffer mode shrinks this from ~2 GB
 //                               to ~MB; SortSycl already ping-pongs over the
@@ -97,13 +97,14 @@ struct GpuBufferPool {
     int  strength = 0;
     bool testnet = false;
     bool t2_xbits_reuse = false; // captured at pool construction
+    bool xs_pair_a_alias = false; // C active only when B ON and Xs scratch fits
 
     // Derived sizes (for diagnostics / assertions).
     uint64_t total_xs           = 0;
     uint64_t cap                = 0;
     size_t   storage_bytes      = 0;
     size_t   pair_a_bytes       = 0; // max(T1/T2/T3 match-output footprints)
-    size_t   pair_b_bytes       = 0; // max(*_sorted footprints, xs_temp_bytes)
+    size_t   pair_b_bytes       = 0; // max(*_sorted footprints, xs_temp unless C active)
     size_t   xs_temp_bytes      = 0; // scratch size the Xs phase asks for
     size_t   sort_scratch_bytes = 0;
     size_t   pinned_bytes       = 0; // per pinned buffer

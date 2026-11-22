@@ -9,6 +9,7 @@
 #include "host/GpuBufferPool.hpp"
 #include "host/MatchScratchAlias.hpp"
 #include "host/T2XbitsReuse.hpp"
+#include "host/XsPairAAlias.hpp"
 
 #ifndef _WIN32
 #include <dlfcn.h>   // runtime lookup of hipMemGetInfo on AMD — see device_memory_probe
@@ -174,7 +175,7 @@ GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
     // d_pair_a holds the *match output* of the current phase: T1 SoA
     // (meta·8 B + mi·4 B = 12 B), T2 SoA (meta·8 B + mi·4 B + xbits·4 B =
     // 16 B), then T3 (T3PairingGpu, 8 B). Worst case is T2 at 16 B/entry.
-    // It does NOT alias the Xs construction scratch — that's d_pair_b.
+    // Candidate C may use d_pair_a for Xs scratch before T1 match.
     result.pair_a_bytes = std::max({
         static_cast<size_t>(result.cap) * sizeof(T1PairingGpu),
         static_cast<size_t>(result.cap) *
@@ -207,12 +208,16 @@ GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
     launch_construct_xs(dummy_plot_id, k, testnet,
                                    nullptr, nullptr, &result.xs_temp_bytes, q,
                                    xs_split_sentinel);
-    result.pair_b_bytes = std::max({
-        static_cast<size_t>(result.cap) * sizeof(uint64_t),                          // sorted T1 meta
-        static_cast<size_t>(result.cap) * (sizeof(uint64_t) + sizeof(uint32_t)),     // sorted T2 meta+xbits
-        static_cast<size_t>(result.cap) * sizeof(uint64_t),                          // T3 frags out
-        result.xs_temp_bytes,                                                        // Xs aliased scratch (3·N·u32 + cub)
-    });
+    // Candidate C: Xs scratch moves to d_pair_a if it fits; T2 mi goes
+    // into storage slot 1, and unsorted xbits into pair_a's final slot.
+    // pair_b then needs only 8*cap for sorted meta/fragments.
+    bool const use_xs_pair_a = xs_pair_a_alias_fits(
+        xs_pair_a_alias_requested(), t2_xbits_reuse_enabled(),
+        static_cast<size_t>(result.cap), static_cast<size_t>(result.total_xs),
+        result.storage_bytes, result.pair_a_bytes, result.xs_temp_bytes);
+    result.pair_b_bytes = xs_pair_a_pair_b_bytes(
+        static_cast<size_t>(result.cap), result.xs_temp_bytes,
+        t2_xbits_reuse_enabled(), use_xs_pair_a);
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
     size_t s_pairs = 0;
@@ -249,8 +254,13 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     pair_b_bytes = sizes.pair_b_bytes;
     xs_temp_bytes = sizes.xs_temp_bytes;
     sort_scratch_bytes = sizes.sort_scratch_bytes;
+    xs_pair_a_alias = xs_pair_a_alias_fits(
+        xs_pair_a_alias_requested(), t2_xbits_reuse,
+        static_cast<size_t>(cap), static_cast<size_t>(total_xs),
+        storage_bytes, pair_a_bytes, xs_temp_bytes);
     if (t2_xbits_reuse && !t2_xbits_reuse_layout_fits(
-            static_cast<size_t>(cap), pair_b_bytes, storage_bytes))
+            static_cast<size_t>(cap), pair_b_bytes, storage_bytes,
+            xs_pair_a_alias))
         throw std::runtime_error("T2 xbits reuse: insufficient pool layout");
     // The Fine Bucket match-index scratch aliases the idle suffix of
     // d_storage during each match. Only match-index requests that do not fit
@@ -274,7 +284,8 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
         auto const t1_idle = match_scratch_idle_suffix(
             storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
         auto const t2_idle = match_scratch_idle_suffix(
-            storage_bytes, static_cast<size_t>(cap) * sizeof(uint32_t));
+            storage_bytes, xs_pair_a_t2_match_live_prefix(
+                static_cast<size_t>(cap), xs_pair_a_alias));
         // T3 additionally keeps sorted T2 xbits in d_storage's vals_in slot.
         auto const t3_idle = match_scratch_idle_suffix(
             storage_bytes, t3_match_live_prefix_bytes(
@@ -301,6 +312,11 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     }
     pinned_bytes = sizes.pinned_bytes;
     if (std::getenv("POS2GPU_POOL_DEBUG")) {
+        std::fprintf(stderr,
+            "[pool] Xs pair_a alias=%d; xs_temp=%zu pair_a=%zu "
+            "pair_b=%zu bytes; saved=%zu bytes vs B\n",
+            int(xs_pair_a_alias), xs_temp_bytes, pair_a_bytes, pair_b_bytes,
+            xs_pair_a_alias ? static_cast<size_t>(cap) * sizeof(uint32_t) : 0);
         std::fprintf(stderr,
             "[pool] T2 xbits reuse=%d; pair_a=%zu bytes; "
             "saving=%zu bytes vs legacy pair_a\n",
@@ -366,8 +382,9 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
             dbg_mem.total_bytes/1e9, dbg_mem.free_bytes/1e9);
         std::fprintf(stderr,
             "[pool] sizes: storage=%.2fGB pair_a=%.2fGB pair_b=%.2fGB "
-            "xs_temp(alias→pair_b)=%.2fGB sort_scratch=%.2fGB pinned=%.2fGB\n",
+            "xs_temp(alias→%s)=%.2fGB sort_scratch=%.2fGB pinned=%.2fGB\n",
             storage_bytes/1e9, pair_a_bytes/1e9, pair_b_bytes/1e9,
+            xs_pair_a_alias ? "pair_a" : "pair_b",
             xs_temp_bytes/1e9, sort_scratch_bytes/1e9, pinned_bytes/1e9);
     }
 

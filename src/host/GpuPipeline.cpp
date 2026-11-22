@@ -13,6 +13,7 @@
 #include "host/GpuBufferPool.hpp"
 #include "host/MatchScratchAlias.hpp"
 #include "host/T2XbitsReuse.hpp"
+#include "host/XsPairAAlias.hpp"
 #include "host/VramBudget.hpp"
 #include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
@@ -458,9 +459,9 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
 
     uint64_t*       d_count        = pool.d_counter;
     // Xs phase needs ~3.22 GB scratch at k=28 in split-keys_a mode
-    // (3 × total_xs × u32 + cub); d_pair_b is idle through the whole
-    // Xs phase (not touched until T1 sort permute writes to it), so
-    // we alias it rather than allocating separately.
+    // (3 × total_xs × u32 + cub). Without C, idle d_pair_b hosts the
+    // scratch. With C, d_pair_a hosts Xs scratch before T1 match, and
+    // pair_b shrinks to 8*cap.
     //
     // Split-keys_a: the Xs sort's keys_a (total_xs · u32 = 1 GiB at
     // k=28) lives in d_storage's tail — bytes [total_xs·8, storage_bytes)
@@ -472,7 +473,11 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // pair_b xs-scratch region — see GpuBufferPool.cpp for sizing.
     void* const d_xs_split_keys_a = static_cast<uint8_t*>(pool.d_storage)
                                     + pool.total_xs * sizeof(XsCandidateGpu);
-    void*           d_xs_temp      = pool.d_pair_b;
+    // C: Xs scratch borrows pair_a before T1 writes match output.
+    // pair_a is allocated here rather than after launching Xs; the size
+    // planner enables C only when the full split-Xs scratch fits.
+    void*           d_xs_temp      = pool.xs_pair_a_alias
+        ? pool.ensure_pair_a() : pool.d_pair_b;
     void*           d_sort_scratch = pool.d_sort_scratch;
     // Lazy pinned-host alloc: skips ~600 ms × (kNumPinnedBuffers-1)
     // on single-plot runs (only slot 0 gets allocated). See
@@ -486,7 +491,8 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     auto const t1_match_idle = match_scratch_idle_suffix(
         pool.storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu));
     auto const t2_match_idle = match_scratch_idle_suffix(
-        pool.storage_bytes, static_cast<size_t>(cap) * sizeof(uint32_t));
+        pool.storage_bytes, xs_pair_a_t2_match_live_prefix(
+            static_cast<size_t>(cap), pool.xs_pair_a_alias));
     auto const t3_match_idle = match_scratch_idle_suffix(
         pool.storage_bytes, t3_match_live_prefix_bytes(
             static_cast<size_t>(cap), pool.t2_xbits_reuse));
@@ -579,6 +585,9 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
                                        d_xs, d_xs_temp, &xs_temp_bytes,
                                        nullptr, nullptr, q,
                                        d_xs_split_keys_a);
+    // On C, T1 writes directly over the Xs scratch in pair_a. Because
+    // SYCL queues may be out-of-order, wait until Xs pack is finished.
+    if (pool.xs_pair_a_alias) q.wait_and_throw();
     // Overlap d_pair_a's lazy malloc_device (~400-500 ms for 4.36 GB at
     // k=28) with Xs gen's GPU execution. In production
     // (POS2GPU_PHASE_TIMING unset), launch_construct_xs_profiled returns
@@ -605,17 +614,23 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // (cap·8 B), then mi[cap] (cap·4 B), then xbits[cap] (cap·4 B). Total
     // cap·16 B, matching d_pair_a's size.
     uint64_t*     d_t2_meta  = static_cast<uint64_t*>(d_pair_a_raw);
-    uint32_t*     d_t2_mi    = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
-    // While matching T2, pair_b's first cap*8 bytes hold sorted T1
-    // metadata. Its final cap*4 bytes are otherwise idle until T2 Sort.
-    uint32_t*     d_t2_xbits = pool.t2_xbits_reuse
-        ? reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(pool.d_pair_b) +
-            t2_xbits_unsorted_offset(static_cast<size_t>(cap)))
+    // C: store T2 match_info in storage's idle second u32 slot,
+    // leaving pair_a's last u32 slot for unsorted xbits.
+    uint32_t*     d_t2_mi    = pool.xs_pair_a_alias
+        ? d_vals_in
         : reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
+    uint32_t*     d_t2_xbits = pool.xs_pair_a_alias
+        ? reinterpret_cast<uint32_t*>(
             static_cast<uint8_t*>(d_pair_a_raw) +
-            pool.cap * (sizeof(uint64_t) + sizeof(uint32_t)));
+            pool.cap * sizeof(uint64_t))
+        : pool.t2_xbits_reuse
+            ? reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(pool.d_pair_b) +
+                t2_xbits_unsorted_offset(static_cast<size_t>(cap)))
+            : reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(d_pair_a_raw) +
+                pool.cap * (sizeof(uint64_t) + sizeof(uint32_t)));
     T3PairingGpu* d_t3       = static_cast<T3PairingGpu*>(d_pair_a_raw);
 
     // ---------- Phase T1 ----------
@@ -687,11 +702,17 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
         // it straight into CUB as the sort key input rather than
         // re-extracting from a packed struct. vals_in just needs a
         // 0..n-1 identity fill.
-        launch_init_u32_identity(d_vals_in, t2_count, q);
+        // C: d_vals_in holds T2 mi, so it cannot also hold the
+        // identity sequence. The sorted T1 metadata in pair_b is dead
+        // after T2 match: borrow its first 4*cap bytes for identity,
+        // then overwrite with sorted T2 meta after CUB has completed.
+        uint32_t* t2_vals_in = pool.xs_pair_a_alias
+            ? static_cast<uint32_t*>(pool.d_pair_b) : d_vals_in;
+        launch_init_u32_identity(t2_vals_in, t2_count, q);
         size_t sort_bytes = pool.sort_scratch_bytes;
         launch_sort_pairs_u32_u32(
             d_sort_scratch, sort_bytes,
-            d_t2_mi, d_keys_out, d_vals_in, d_vals_out,
+            d_t2_mi, d_keys_out, t2_vals_in, d_vals_out,
             t2_count, 0, cfg.k, q);
 
         launch_permute_t2(d_t2_meta, d_t2_xbits, d_vals_out,
@@ -777,7 +798,10 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // otherwise hit InsufficientVramError and fall back to streaming.
     // The final q.wait() inside the D2H block above has already drained
     // T3 sort so the buffer is safe to free.
-    pool.release_pair_a();
+    // Candidate C must allocate pair_a before Xs starts. Keep it across
+    // batch plots to avoid a malloc_device cost ahead of every Xs launch.
+    // With C off, preserve the existing inter-plot release policy.
+    if (!pool.xs_pair_a_alias) pool.release_pair_a();
 
     report_phases();
     return result;

@@ -1,3 +1,8 @@
+# Candidate C: Xs scratch and T2 mi/xbits lifetime compaction.
+add_executable(xs_pair_a_alias_test tools/parity/xs_pair_a_alias_test.cpp)
+target_include_directories(xs_pair_a_alias_test PRIVATE src)
+target_compile_features(xs_pair_a_alias_test PRIVATE cxx_std_20)
+
 # Pool-path T2 xbits relocation and its stricter T3 alias lifetime.
 add_executable(t2_xbits_reuse_test tools/parity/t2_xbits_reuse_test.cpp)
 target_include_directories(t2_xbits_reuse_test PRIVATE src)

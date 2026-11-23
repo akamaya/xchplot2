@@ -56,6 +56,13 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
     // Canonical single-member .gplot FSE compression removes duplicate
     // fragments, so also hash a deduplicated monotonic stream. Keep this
     // second hash separate rather than silently changing the raw one.
+    using Clock=std::chrono::steady_clock;
+    auto const start=Clock::now();
+    auto millis=[](Clock::time_point a,Clock::time_point b) {
+        return std::chrono::duration<double,std::milli>(b-a).count();
+    };
+    double d2h_ms=0, host_memcpy_ms=0, raw_sha_ms=0;
+    double scan_ms=0, unique_sha_ms=0;
     constexpr size_t tile_bytes=8u<<20;
     if (capture) {
         if (count > SIZE_MAX / sizeof(uint64_t))
@@ -77,18 +84,25 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
         bool first=true;
         for(uint64_t off=0;off<total_bytes;off+=tile_bytes) {
             size_t bytes=size_t(std::min<uint64_t>(tile_bytes,total_bytes-off));
+            auto segment=Clock::now();
             session.copy_d2h(pinned,src+off,bytes);
+            d2h_ms+=millis(segment,Clock::now());
             // Save the exact raw sorted stream before the in-place
             // duplicate-compaction used for the canonical unique digest.
             // Pageable host RAM is reached through this small pinned tile;
             // do not issue a multi-GiB cudaMemcpyAsync to pageable memory.
+            segment=Clock::now();
             if(capture)
                 std::memcpy(reinterpret_cast<uint8_t*>(capture->data())+size_t(off),
                             pinned,bytes);
+            host_memcpy_ms+=millis(segment,Clock::now());
+            segment=Clock::now();
             if(BCryptHashData(raw_hash,static_cast<PUCHAR>(pinned),ULONG(bytes),0)<0)
                 throw std::runtime_error("SHA-256 raw BCryptHashData failed");
+            raw_sha_ms+=millis(segment,Clock::now());
             // Compact only within this tile. The global previous-value state
             // also filters duplicates that straddle adjacent tile boundaries.
+            segment=Clock::now();
             auto* rows=static_cast<uint64_t*>(pinned);
             size_t const n=bytes/sizeof(uint64_t);
             size_t write=0;
@@ -103,9 +117,12 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
                 prev=v;
                 first=false;
             }
+            scan_ms+=millis(segment,Clock::now());
+            segment=Clock::now();
             if(write && BCryptHashData(unique_hash,reinterpret_cast<PUCHAR>(rows),
                                        ULONG(write*sizeof(uint64_t)),0)<0)
                 throw std::runtime_error("SHA-256 unique BCryptHashData failed");
+            unique_sha_ms+=millis(segment,Clock::now());
         }
         FragmentDigests result{};
         result.distinct=unique_count;
@@ -117,6 +134,11 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
         (void)BCryptDestroyHash(unique_hash);unique_hash=nullptr;
         (void)BCryptCloseAlgorithmProvider(algorithm,0);algorithm=nullptr;
         session.release_pinned(pinned);pinned=nullptr;
+        std::fprintf(stderr,
+            "[cuda-transfer] d2h=%.3f host_copy=%.3f sha_raw=%.3f "
+            "dedup_scan=%.3f sha_unique=%.3f total=%.3f ms\n",
+            d2h_ms,host_memcpy_ms,raw_sha_ms,scan_ms,unique_sha_ms,
+            millis(start,Clock::now()));
         return result;
     } catch(...) {
         if(raw_hash)(void)BCryptDestroyHash(raw_hash);

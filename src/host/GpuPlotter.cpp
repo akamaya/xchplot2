@@ -144,7 +144,9 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     // CPU path owns via cpu_fragments below.
     GpuPipelineResult pr;
     std::vector<uint64_t> cpu_fragments;
+#if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
     std::unique_ptr<NativeCudaPlotSession> native_session;
+#endif
     std::span<uint64_t const> fragments;
     if (all_gpu && opts.native_cuda_test) {
 #if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)

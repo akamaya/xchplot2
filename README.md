@@ -46,6 +46,20 @@ canonical T3 SHA256, and a hybrid reference plot. Run the
 after rebuilding both binaries; it refuses to overwrite an existing
 reference plot. This is a **correctness check**, not another OFF benchmark.
 
+### CUDA-only Stage 4: experimental native GPU -> existing CPU plot writer
+
+The Windows CUDA-core branch now has an opt-in
+`xchplot2 test GROUP_ID --native-cuda` path: Xs/T1/T2/T3 run
+without SYCL GPU orchestration and the existing CPU FSE writer
+then emits a test-only `.gplot`. It compares the captured 2+GiB raw
+fragment stream's SHA256 with the native CUDA streaming digest
+before writing. Use `--fragment-digest` with the normal hybrid
+`test -G` on the same Group ID to compare exact raw T3 streams.
+**Stage 4 is committed but not yet built or Full Proof-verified.**
+The `xchplot2` executable still links SYCL, and the `test` command
+produces dummy-memo unfarmable plots. See
+[Stage 4 validation](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
+
 ### Measured progress
 
 | Iteration | Steady-state time | What changed |

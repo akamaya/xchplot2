@@ -17,6 +17,8 @@
 #endif
 
 #include <filesystem>
+#include <algorithm>
+#include <optional>
 #include <cstdio>
 #include <cstdint>
 #include <array>
@@ -78,6 +80,9 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
 
     std::filesystem::create_directories(output_dir);
     auto full_path = std::filesystem::path(output_dir) / filename;
+    if (opts.native_cuda_test && std::filesystem::exists(full_path))
+        throw std::runtime_error("native CUDA test refuses to overwrite existing .gplot: " +
+                                 full_path.string());
 
     // Memo: caller-supplied bytes if present (real farmable plots), else
     // a 112-byte stub (test plots only — harvester will reject).
@@ -119,6 +124,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     GpuPipelineResult pr;
     std::vector<uint64_t> cpu_fragments;
     std::vector<uint64_t> native_fragments;
+    std::optional<std::array<uint8_t,32>> native_expected_raw_digest;
     std::span<uint64_t const> fragments;
     if (all_gpu && opts.native_cuda_test) {
 #if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
@@ -130,6 +136,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         auto const result=native_cuda_run_k28s6(opts.plot_id,ordinal,&native_fragments);
         if (native_fragments.size()!=result.t3_count)
             throw std::runtime_error("native CUDA T3 captured count mismatch");
+        native_expected_raw_digest=result.sha256_fragments;
         fragments=std::span<uint64_t const>(native_fragments);
         std::cerr << "[cuda-native-test] GPU T1=" << result.t1_count
                   << " T2=" << result.t2_count
@@ -168,6 +175,10 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
 
     if (opts.fragment_digest || opts.native_cuda_test) {
         auto const digest = raw_t3_fragments_sha256(fragments);
+        if (native_expected_raw_digest && digest != *native_expected_raw_digest)
+            throw std::runtime_error("native CUDA T3 capture digest differs from GPU stream");
+        if (opts.native_cuda_test && !std::is_sorted(fragments.begin(),fragments.end()))
+            throw std::runtime_error("native CUDA T3 output is not monotonically sorted");
         std::fprintf(stderr,"[fragments-hash] raw sorted T3 SHA256=");
         for(uint8_t b:digest)std::fprintf(stderr,"%02x",unsigned(b));
         std::fprintf(stderr," count=%zu\n",fragments.size());

@@ -148,10 +148,9 @@ set(ACPP_TARGETS "${ACPP_TARGETS}" CACHE STRING "AdaptiveCpp target list" FORCE)
 option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ${XCHPLOT2_BUILD_CUDA})
 # NVIDIA native match (nvcc).  SYCL still performs Xs/offset builds and the
 # pooled host orchestration; only the three hot Compact match kernels use nvcc.
-option(XCHPLOT2_NATIVE_CUDA_MATCH "Use native CUDA for k28/s6 Compact T1/T2/T3 matching" ${XCHPLOT2_BUILD_CUDA})
-if(XCHPLOT2_NATIVE_CUDA_MATCH AND NOT XCHPLOT2_BUILD_CUDA)
-    message(FATAL_ERROR "XCHPLOT2_NATIVE_CUDA_MATCH requires XCHPLOT2_BUILD_CUDA=ON")
-endif()
+# Dedicated NVIDIA CUDA-core branch: nvcc stages are always active whenever
+# the CUDA build is selected. Do not reintroduce the removed ON/OFF toggles.
+set(XCHPLOT2_NATIVE_CUDA_MATCH ${XCHPLOT2_BUILD_CUDA})
 unset(_xchplot2_nvcc_probe CACHE)
 
 # On dual-toolchain hosts (CUDA Toolkit + ROCm both installed), the SYCL

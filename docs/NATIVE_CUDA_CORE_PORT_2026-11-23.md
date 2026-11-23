@@ -128,8 +128,34 @@ standalone binary.** `COMPUTE OK` is not proof validation. Do not treat the
 runner as a finished plotter or replace a validated farming plot with
 these diagnostics. Integrating the on-disk plot writer remains separate.
 
-**Status: no Stage 3 Windows nvcc build, execution or correctness check
-has been run yet.** No performance claims can be made for Stage 3.
+**Hardware validation 2026-11-23 — RTX 4070 SUPER (CUDA ordinal 0):**
+Stage 3 built and the independent CUDA-only compute runner completed
+end-to-end without any SYCL/AdaptiveCpp runtime calls:
+
+```text
+[native-cuda-smoke] Windows CNG Feistel key schedule PASS
+[native-cuda-smoke] Xs AES: 4096/4096 parity PASS
+[native-cuda-smoke] CUDA CUB u32/u32 sort: 4096 PASS
+[native-cuda-smoke] CUDA CUB u32/u64 sort: 4096 PASS
+[native-cuda-smoke] CUDA CUB u64 sort: 4096 PASS
+[native-cuda-smoke] Candidate D pool: 8.172 GiB VRAM ... planning PASS
+[native-cuda-smoke] OK (no AdaptiveCpp/SYCL)
+[cuda-only] plot id: 0724415e7b98b5d2ef0c294663809dbad7f4112e4b6885a2bfdcf91633506d8a
+[cuda-only] T1 pairs=268396548
+[cuda-only] T2 pairs=268356064
+[cuda-only] T3 fragments=268266000
+[cuda-only] T1=268396548 T2=268356064 T3=268266000 seconds=25.987
+[cuda-only] sorted T3 fragment SHA256=ed2eb2c1849b9276423c32a85c15bb1e6b1f36420550e88b1fc59e0647f6a1f0
+[cuda-only] COMPUTE OK (not a Full Proof validation)
+```
+
+The 25.987 s is one first full compute + T3 SHA-256 observation.
+The old 25.13 s/plot was a 10-plot steady-state benchmark
+that includes actual file writing with producer/consumer overlap:
+**these timings are not directly comparable**. No claim of full
+proof correctness is made by the native compute test. Identity-parity
+against a reference plot with the **same** Plot ID and on-disk
+full-proof checking are the next validation gates.
 
 ### Build and staged checks (VS2022 Developer PowerShell)
 

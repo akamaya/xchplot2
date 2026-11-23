@@ -18,13 +18,13 @@ get_filename_component(_x2_root "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 set_source_files_properties(
     "${_x2_root}/src/gpu/NativeCudaRuntime.cpp"
     "${_x2_root}/src/gpu/NativeCudaPool.cpp"
-    "${_x2_root}/src/gpu/SortCuda.cu"
-    "${_x2_root}/src/gpu/NativeCudaPool.cpp"
     PROPERTIES LANGUAGE CUDA)
 
 add_executable(native_cuda_smoke
     smoke.cu
     "${_x2_root}/src/gpu/NativeCudaRuntime.cpp"
+    "${_x2_root}/src/gpu/NativeCudaPool.cpp"
+    "${_x2_root}/src/gpu/SortCuda.cu"
     "${_x2_root}/src/gpu/NativeCudaXs.cu"
     "${_x2_root}/src/gpu/NativeCudaIndex.cu"
     "${_x2_root}/src/gpu/NativeCudaPipeline.cu"

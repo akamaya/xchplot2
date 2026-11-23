@@ -220,6 +220,18 @@ Reproducible non-farming test Group ID: 64 zero hex digits.
 Its expected index-0/meta-0 Plot ID is
 0d5535e13cc9708d0ff0289af2fae27e564b6bcbcd9242f5140d96957744a517.
 
+The automated, non-overwriting parity driver is
+scripts/test/cuda_only_t3_parity_20261123.ps1. After building both targets,
+run from a VS2022 Developer PowerShell:
+
+~~~powershell
+cd C:\dev\xchplot2; powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test\cuda_only_t3_parity_20261123.ps1
+~~~
+
+It stops on hash/count differences, does not re-benchmark any OFF mode,
+performs 100 full-proof challenge trials only when hash parity passes,
+and leaves the reference file on the NAS for inspection.
+
 Existing hybrid GPU algorithms and plot writing remain unchanged.
 These identity/hash parity changes are committed but have not been
 rebuilt, run, or cross-compared on Windows yet. Do not claim full plot

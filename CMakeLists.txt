@@ -868,6 +868,20 @@ if(XCHPLOT2_BUILD_CUDA)
         src/gpu/SortCuda.cu)
     if(XCHPLOT2_NATIVE_CUDA_MATCH)
         list(APPEND POS2_GPU_CUDA_SRC src/gpu/NativeCudaMatch.cu src/gpu/NativeCudaIndex.cu src/gpu/NativeCudaXs.cu src/gpu/NativeCudaPipeline.cu src/gpu/NativeCudaPeer.cu src/gpu/NativeCudaTwoLevel.cu)
+        # Experimental native k28s6 compute -> existing CPU writer bridge.
+        # Windows-only: native host digest uses CNG/BCrypt; normal CLI
+        # remains on the verified SYCL-host pipeline by default.
+        if(WIN32)
+            set_source_files_properties(
+                src/gpu/NativeCudaRuntime.cpp
+                src/gpu/NativeCudaPool.cpp
+                src/gpu/NativeCudaStandalonePipeline.cpp
+                PROPERTIES LANGUAGE CUDA)
+            list(APPEND POS2_GPU_CUDA_SRC
+                src/gpu/NativeCudaRuntime.cpp
+                src/gpu/NativeCudaPool.cpp
+                src/gpu/NativeCudaStandalonePipeline.cpp)
+        endif()
     endif()
     # SortSyclCub.cpp is the SYCL-typed adapter that bridges
     # sycl::queue → CUB. SortCuda.cu used to provide the SYCL-typed

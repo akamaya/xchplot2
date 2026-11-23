@@ -378,3 +378,53 @@ cd C:\dev\xchplot2; .\build\windows-native-cuda-only-nvcc\native_cuda_smoke.exe;
 ```
 
 This standalone target tests native GPU primitives and runtime independently. It is **not** a full Plot executable and does **not** validate the Feistel/Match kernels in isolation; the previously verified hybrid CLI covers those. A complete CUDA-only Plot CLI still requires the host pipeline, buffer pool, device/queue abstraction and residual SYCL kernels to be ported before AdaptiveCpp can be removed from the main CMake project.
+
+
+## Stage 4: performance regression investigation (instrumentation only)
+
+The first native CUDA test plot completed and passed Full Proof validation:
+109/109 full proofs from 100 challenges. It reported
+`compute+capture=27.363s` for Plot ID derived from the 32-byte zero
+Group ID, T1=268455895 / T2=268506769 / T3=268596076.
+The earlier 25.13s/plot figure was hybrid steady-state throughput,
+not the same unit of work: the new number includes a new pool allocation,
+a complete roughly 2-GiB D2H transfer split into pinned 8-MiB tiles,
+a pageable-host capture, two whole-T3 Windows CNG SHA256 passes and a
+distinct-fragment scan. After the 27.363-second timer finishes, the
+test-only bridge also runs a third independent CPU SHA256, an
+`is_sorted` check and the CPU FSE/NAS writer. Do not treat the third
+hash or NAS writer as a cause of **the reported 27.363s**.
+
+To identify genuine GPU kernel regressions, the CUDA-only source now
+reports:
+
+- `[cuda-phase]`: pool setup, Xs generation/sort, T1/T2/T3
+  match+index, each inter-phase sort, and digest/capture separately.
+- `[cuda-transfer]`: pinned D2H, pageable memory copy, first CNG
+  SHA256, dedup scan and second CNG SHA256, plus total time.
+- `[host-timing]` (only on `xchplot2 test`): independently timed
+  software SHA256, sorted check and FSE/NAS file writing.
+
+These are *instrumentation changes only*. All kernels, algorithms,
+launch capacities (T1=512, T2=480, T3=330), plot format and
+full-proof verification are unchanged. This instrumentation has
+not yet been rebuilt or measured on Windows.
+
+Fast hybrid phase reference from earlier RTX 4070 SUPER k28/s6 runs:
+T1 match approximately 7.60s, T2 match 8.03s, T3 match/Feistel
+8.29s; D2H approximately 0.652s. Different Plot IDs, so compare the
+per-phase order of magnitude rather than demanding bit-exact wall times.
+
+Run the same test Group ID using the *independent* native CUDA runner
+first. This executes Xs through T3 without any file writer or NAS
+output and does not allocate the 2-GiB capture vector:
+
+~~~powershell
+cd C:\dev\xchplot2; git pull --ff-only origin cuda/nvidia-12gb-k28s6; if ($LASTEXITCODE -ne 0) { throw 'Git update failed' }; cmake --build .\build\windows-native-cuda-only-nvcc --target native_cuda_pipeline -j 16; if ($LASTEXITCODE -ne 0) { throw 'CUDA-only build failed' }; .\build\windows-native-cuda-only-nvcc\native_cuda_pipeline.exe --run --group-id ('0'*64); if ($LASTEXITCODE -ne 0) { throw 'CUDA-only run failed' }
+~~~
+
+If GPU phases have regressed, optimize the responsible native CUDA
+kernels. If GPU phases match the old hybrid run, first remove unnecessary
+full-T3 digest/scan passes and pool startup from the production
+timing, then compare properly warmed continuous throughput. Do not
+mix full-proof validation, a cold single plot, and steady-state results.

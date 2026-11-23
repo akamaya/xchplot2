@@ -49,7 +49,8 @@ struct FragmentDigests {
 };
 FragmentDigests digest_fragments(NativeCudaPool& pool,
                                  uint64_t const* fragments,uint64_t count,
-                                 std::vector<uint64_t>* capture) {
+                                 std::vector<uint64_t>* capture,
+                                 bool compute_digests) {
     auto& session=pool.session();
     // Stream sorted T3 output in 8-MiB pinned tiles. SHA256 of the raw
     // fragment bytes must match earlier validated CUDA-only results.
@@ -64,6 +65,41 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
     double d2h_ms=0, host_memcpy_ms=0, raw_sha_ms=0;
     double scan_ms=0, unique_sha_ms=0;
     constexpr size_t tile_bytes=8u<<20;
+    // Fast path: T3 raw stream goes directly to the proven group writer.
+    // Avoid two full 2-GiB SHA256 passes and a duplicate scan when no
+    // diagnostic is requested. The writer still validates sortedness,
+    // chunk representation and the resulting gplot via Full Proof.
+    if (!compute_digests) {
+        if (capture) {
+            if (count > SIZE_MAX / sizeof(uint64_t))
+                throw std::runtime_error("CUDA-only fragment capture size overflow");
+            capture->resize(static_cast<size_t>(count));
+            void* pinned = session.allocate_pinned(tile_bytes);
+            try {
+                auto const* src = reinterpret_cast<uint8_t const*>(fragments);
+                uint64_t total_bytes = count * sizeof(uint64_t);
+                for (uint64_t off=0; off<total_bytes; off+=tile_bytes) {
+                    size_t bytes=size_t(std::min<uint64_t>(tile_bytes,total_bytes-off));
+                    auto t=Clock::now();
+                    session.copy_d2h(pinned,src+off,bytes);
+                    d2h_ms+=millis(t,Clock::now());
+                    t=Clock::now();
+                    std::memcpy(reinterpret_cast<uint8_t*>(capture->data())+size_t(off),
+                                pinned,bytes);
+                    host_memcpy_ms+=millis(t,Clock::now());
+                }
+                session.release_pinned(pinned);
+            } catch(...) {
+                session.release_pinned(pinned);
+                throw;
+            }
+        }
+        std::fprintf(stderr,
+            "[cuda-transfer] mode=fast d2h=%.3f host_copy=%.3f "
+            "sha_raw=0 sha_unique=0 dedup_scan=0 total=%.3f ms\n",
+            d2h_ms,host_memcpy_ms,millis(start,Clock::now()));
+        return FragmentDigests{};
+    }
     if (capture) {
         if (count > SIZE_MAX / sizeof(uint64_t))
             throw std::runtime_error("CUDA-only fragment capture size overflow");
@@ -164,7 +200,8 @@ int native_cuda_rtx4070_super_ordinal()
 
 NativeCudaPipelineResult native_cuda_run_k28s6(
     std::array<uint8_t,32> const& plot_id,int ordinal,
-    std::vector<uint64_t>* out_sorted_fragments)
+    std::vector<uint64_t>* out_sorted_fragments,
+    bool compute_digests)
 {
     using Clock = std::chrono::steady_clock;
     auto const started=Clock::now();
@@ -333,9 +370,12 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         cub_sort_keys_u64(scratch,cub_bytes,
             fragments_in,fragments_out,t3_count,0,56);
         double const t3_sort_ms=phase_ms();
-        std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
+        if(compute_digests)
+            std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
+        else
+            std::fprintf(stderr,"[cuda-only] T3 sorted; fast transfer (no SHA256)...\n");
         auto const digests=digest_fragments(
-            pool,fragments_out,t3_count,out_sorted_fragments);
+            pool,fragments_out,t3_count,out_sorted_fragments,compute_digests);
         double const digest_copy_ms=phase_ms();
         NativeCudaPipelineResult result{};
         result.t1_count=t1_count;

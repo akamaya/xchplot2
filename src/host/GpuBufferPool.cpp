@@ -72,23 +72,8 @@ inline std::string fmt_alloc_bytes(size_t bytes)
 inline void* sycl_alloc_device_or_throw(size_t bytes, sycl::queue& q,
                                         char const* what)
 {
-    // Throws InsufficientVramError, NOT a plain runtime_error, so a pool that
-    // does not fit FALLS BACK to the streaming pipeline instead of killing the
-    // run. It used to be fatal, which quietly made the whole graceful-
-    // degradation design conditional on the free-VRAM estimate being right.
-    //
-    // It cannot be right in general. On Level Zero there was no free-memory
-    // query at all until the Sysman probe below, so the picker sized against
-    // the device TOTAL; and even a perfect reading is stale the moment another
-    // process allocates. The estimate steers the choice; the allocation is the
-    // only thing that actually knows. Being wrong has to be survivable rather
-    // than prevented, or every backend without a memory counter is one
-    // compositor away from a fatal run.
-    //
-    // Caveat: only the pool's EAGER buffers get this treatment for free. A
-    // failure in ensure_pair_a() / ensure_pinned() happens mid-plot, past the
-    // point where switching pipelines is possible, and stays an error — just a
-    // better-typed one.
+    // Allocation failure is fatal in the pool-only configuration.
+    // Keep the typed error for callers and clear diagnostics.
     auto fail = [&](std::string detail) -> InsufficientVramError {
         InsufficientVramError e(
             std::string("sycl::malloc_device(") + what + ", " +
@@ -367,7 +352,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
                 " GiB runtime), only " +
                 std::to_string(to_gib(free_b)).substr(0, 5) +
                 " GiB free of " + std::to_string(to_gib(total_b)).substr(0, 5) +
-                " GiB total. Falling back to the streaming pipeline.");
+                " GiB total. Pooled GPU pipeline cannot start; no streaming fallback.");
             e.required_bytes = required_device + margin;
             e.free_bytes     = free_b;
             e.total_bytes    = total_b;

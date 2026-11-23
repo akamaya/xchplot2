@@ -210,9 +210,8 @@ struct GpuDeviceFragmentOutput {
 // the pinned T3 fragments into t3_fragments_storage so the result is
 // self-contained after the pool is destroyed.
 //
-// If XCHPLOT2_STREAMING=1 is set in the environment, this routes through
-// run_gpu_pipeline_streaming() instead — useful for exercising the low-VRAM
-// path from unchanged call sites.
+// Streaming is removed. An allocation or VRAM-admission failure
+// propagates to the caller as an error; the pool is never bypassed.
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg);
 
 // Batch path: runs the pipeline writing D2H into pool.h_pinned_t3[pinned_index]
@@ -231,23 +230,8 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
                                    GpuDeviceFragmentOutput const& output);
 
-// Streaming path: per-phase cudaMalloc / cudaFree instead of a persistent
-// pool. Targets GPUs where the full pool (~15 GB at k=28) will not fit.
-//
-// Two overloads:
-//   run_gpu_pipeline_streaming(cfg)
-//     Allocates an internal pinned staging buffer for the final D2H,
-//     copies fragments into an owning std::vector, frees the pinned
-//     buffer. Self-contained result. Simplest for one-shot callers.
-//
-//   run_gpu_pipeline_streaming(cfg, pinned_dst, pinned_capacity)
-//     Caller supplies a pinned host buffer (size ≥ cap × sizeof(uint64_t))
-//     that the pipeline uses as the D2H target. Result borrows into
-//     pinned_dst via external_fragments_ptr; caller must not overwrite
-//     pinned_dst while the consumer is still reading it. Use this from
-//     BatchPlotter's streaming fallback to amortise the ~600 ms
-//     cudaMallocHost cost across plots and double-buffer D2H with the
-//     FSE consumer thread the same way the pool path does.
+// Obsolete streaming entry points are ABI compatibility shims only.
+// Every call throws an error; no streaming implementation remains.
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg);
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
                                              uint64_t* pinned_dst,

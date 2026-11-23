@@ -75,9 +75,9 @@ T1Derived derive_t1(T1MatchParams const& params)
     d.fine_entries    = uint64_t(d.num_buckets) * fine_count + 1;
     d.bucket_bytes    = sizeof(uint64_t) * (d.num_buckets + 1);
     d.fine_bytes      = sizeof(uint64_t) * d.fine_entries;
-    d.temp_needed     = d.bucket_bytes + d.fine_bytes +
-        (t1_direct24_enabled(d.fine_bits, params.num_match_target_bits, d.num_buckets)
-             ? t1_direct24_bytes(d.num_buckets) : 0);
+    if (!t1_direct24_enabled(d.fine_bits, params.num_match_target_bits, d.num_buckets))
+        throw std::invalid_argument("T1 Direct24 requires k=28, strength=6 layout");
+    d.temp_needed = d.bucket_bytes + d.fine_bytes + t1_direct24_bytes(d.num_buckets);
     d.target_mask     = (params.num_match_target_bits >= 32)
                           ? 0xFFFFFFFFu
                           : ((1u << params.num_match_target_bits) - 1u);
@@ -126,14 +126,12 @@ void launch_t1_match_prepare(
         params.num_match_target_bits, d.fine_bits,
         d.num_buckets, d_fine_offsets, q);
     fine_timer.mark("fine_offsets", q);
-    if (t1_direct24_enabled(d.fine_bits, params.num_match_target_bits, d.num_buckets)) {
-        if (total > UINT32_MAX)
-            throw std::invalid_argument("T1 Direct24 needs <=u32 rows");
-        auto* d_direct = reinterpret_cast<uint32_t*>(d_fine_offsets + d.fine_entries);
-        launch_t1_direct24_build(d_sorted_xs, d_fine_offsets, total,
-                                  d.num_buckets, d_direct, q);
-        fine_timer.mark("direct24_build", q);
-    }
+    if (total > UINT32_MAX)
+        throw std::invalid_argument("T1 Direct24 needs <=u32 rows");
+    auto* d_direct = reinterpret_cast<uint32_t*>(d_fine_offsets + d.fine_entries);
+    launch_t1_direct24_build(d_sorted_xs, d_fine_offsets, total,
+                              d.num_buckets, d_direct, q);
+    fine_timer.mark("direct24_build", q);
     q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
 }
 

@@ -347,12 +347,10 @@ static void launch_t1_match_all_buckets_compact(
     uint32_t bucket_end,
     sycl::queue& q)
 {
-    bool const use_direct24 = t1_direct24_enabled(
-        fine_bits, num_match_target_bits, num_buckets);
-    uint32_t const* d_direct24 = use_direct24
-        ? reinterpret_cast<uint32_t const*>(
-              d_fine_offsets + (uint64_t(num_buckets) << fine_bits) + 1)
-        : nullptr;
+    if (!t1_direct24_enabled(fine_bits, num_match_target_bits, num_buckets))
+        throw std::invalid_argument("T1 Direct24 requires k28/s6 layout");
+    uint32_t const* d_direct24 = reinterpret_cast<uint32_t const*>(
+        d_fine_offsets + (uint64_t(num_buckets) << fine_bits) + 1);
     if (bucket_end <= bucket_begin) return;
     uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
 
@@ -427,30 +425,10 @@ static void launch_t1_match_all_buckets_compact(
                 if (l < l_end) {
                     x_l = d_sorted_xs[l].x;
                     uint32_t target_l = (use_last_round_partial ? pos2gpu::tezcan_target_last(keys_copy, 1u, match_key_r, uint64_t(x_l), sT, extra_rounds_bits) : pos2gpu::tezcan_target(keys_copy, 1u, match_key_r, uint64_t(x_l), sT, extra_rounds_bits)) & target_mask;
-                    if (use_direct24) {
-                        uint64_t const key =
-                            (uint64_t(r_bucket) << 24) | target_l;
-                        first = d_direct24[key];
-                        count = d_direct24[key + 1] - static_cast<uint32_t>(first);
-                    } else {
-                        uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
-                        uint32_t fine_key = target_l >> fine_shift;
-                        uint64_t fine_idx = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                        uint64_t lo = d_fine_offsets[fine_idx];
-                        uint64_t fine_hi = d_fine_offsets[fine_idx + 1];
-                        uint64_t hi = fine_hi;
-                        while (lo < hi) {
-                            uint64_t mid = lo + ((hi - lo) >> 1);
-                            uint32_t target_mid = d_sorted_xs[mid].match_info & target_mask;
-                            if (target_mid < target_l) lo = mid + 1;
-                            else hi = mid;
-                        }
-                        first = lo;
-                        for (uint64_t r = first; r < fine_hi; ++r) {
-                            if ((d_sorted_xs[r].match_info & target_mask) != target_l) break;
-                            ++count;
-                        }
-                    }
+                    uint64_t const key =
+                        (uint64_t(r_bucket) << 24) | target_l;
+                    first = d_direct24[key];
+                    count = d_direct24[key + 1] - static_cast<uint32_t>(first);
                 }
 
                 uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu

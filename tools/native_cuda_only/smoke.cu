@@ -1,5 +1,6 @@
 // Standalone nvcc-only GPU tests. No SYCL or AdaptiveCpp includes.
 #include "gpu/NativeCudaXs.hpp"
+#include "gpu/NativeCudaRuntime.hpp"
 #include "gpu/NativeCudaPipeline.hpp"
 #include "gpu/NativeCudaPeer.hpp"
 #include "gpu/NativeCudaTwoLevel.hpp"
@@ -64,6 +65,25 @@ int main() {
     }
     require(chosen>=0,"RTX 4070 SUPER not detected; refusing to test another GPU");
     ck(cudaSetDevice(chosen),"set RTX 4070 SUPER");
+    // Test the independent CUDA Runtime host facade: device discovery,
+    // pinned buffers, CUDA memory and synchronous transfers (no SYCL).
+    pos2gpu::NativeCudaSession session(chosen);
+    std::size_t free_bytes=0,total_bytes=0;
+    session.memory_info(free_bytes,total_bytes);
+    require(free_bytes>0 && total_bytes>=free_bytes,"CUDA memory info invalid");
+    auto* dev_tmp=session.allocate_device(1024);
+    auto* host_tmp=static_cast<uint8_t*>(session.allocate_pinned(1024));
+    require(dev_tmp && host_tmp,"CUDA native allocations failed");
+    for(int i=0;i<1024;++i)host_tmp[i]=uint8_t(i&255);
+    session.copy_h2d(dev_tmp,host_tmp,1024);
+    std::fill(host_tmp,host_tmp+1024,uint8_t(0));
+    session.copy_d2h(host_tmp,dev_tmp,1024);
+    for(int i=0;i<1024;++i)
+        require(host_tmp[i]==uint8_t(i&255),"native runtime transfer mismatch");
+    session.release_device(dev_tmp);
+    session.release_pinned(host_tmp);
+    std::puts("[native-cuda-smoke] CUDA Runtime session/pinned transfer PASS");
+
     std::printf("[native-cuda-smoke] CUDA ordinal=%d RTX 4070 SUPER\n",chosen);
     constexpr size_t n=4096;
     uint8_t plot_id[32];

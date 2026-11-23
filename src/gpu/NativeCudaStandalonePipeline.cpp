@@ -115,6 +115,18 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
 }
 }
 
+int native_cuda_rtx4070_super_ordinal()
+{
+    int ordinal = -1;
+    for (auto const& device : native_cuda_devices()) {
+        if (device.name.find("RTX 4070 SUPER") != std::string::npos)
+            ordinal = device.ordinal;
+    }
+    if (ordinal < 0)
+        throw std::runtime_error("native CUDA test needs RTX 4070 SUPER");
+    return ordinal;
+}
+
 NativeCudaPipelineResult native_cuda_run_k28s6(
     std::array<uint8_t,32> const& plot_id,int ordinal,
     std::vector<uint64_t>* out_sorted_fragments)

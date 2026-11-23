@@ -14,7 +14,6 @@
 #include "host/PlotFileWriterParallel.hpp"
 #if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
 #include "gpu/NativeCudaStandalonePipeline.hpp"
-#include "gpu/NativeCudaRuntime.hpp"
 #endif
 
 #include <filesystem>
@@ -127,13 +126,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         // worker still use the previously verified CUDA/SYCL hybrid.
         // Only the GPU computation is CUDA-only here. The existing,
         // well-tested CPU FSE/.gplot writer runs immediately afterward.
-        int ordinal = -1;
-        for (auto const& device : native_cuda_devices()) {
-            if (device.name.find("RTX 4070 SUPER") != std::string::npos)
-                ordinal = device.ordinal;
-        }
-        if (ordinal < 0)
-            throw std::runtime_error("native CUDA test needs RTX 4070 SUPER");
+        int const ordinal = native_cuda_rtx4070_super_ordinal();
         auto const result=native_cuda_run_k28s6(opts.plot_id,ordinal,&native_fragments);
         if (native_fragments.size()!=result.t3_count)
             throw std::runtime_error("native CUDA T3 captured count mismatch");

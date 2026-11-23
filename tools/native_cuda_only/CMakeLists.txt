@@ -17,6 +17,9 @@ get_filename_component(_x2_root "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 # to avoid the standalone build accidentally depending on clang++.
 set_source_files_properties(
     "${_x2_root}/src/gpu/NativeCudaRuntime.cpp"
+    "${_x2_root}/src/gpu/NativeCudaPool.cpp"
+    "${_x2_root}/src/gpu/SortCuda.cu"
+    "${_x2_root}/src/gpu/NativeCudaPool.cpp"
     PROPERTIES LANGUAGE CUDA)
 
 add_executable(native_cuda_smoke

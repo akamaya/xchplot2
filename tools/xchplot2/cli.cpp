@@ -26,7 +26,7 @@
 #include "BuildVersion.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 extern "C" {
-#include "sha/sha256.h"
+#include "pos/sha/sha256.h"
 }
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 

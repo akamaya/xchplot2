@@ -526,12 +526,20 @@ size_t write_plot_file_parallel(
     std::vector<char> iobuf(size_t{4} << 20);
     std::string partial = filename + ".partial.XXXXXX";
 #ifdef _WIN32
-    // Bench/test outputs without a memo contain no master key, so the SMB
-    // share may apply its own ACL. Farmable plots embed a master secret key
-    // in the memo and require an explicit trust decision for SMB output.
+    // A test plot with no caller memo is given an explicit 112-byte
+    // all-zero placeholder by GpuPlotter. It contains NO master secret,
+    // but memo.empty() alone incorrectly treated it like a farmable plot
+    // and required an owner-only Windows DACL that Samba cannot preserve.
+    // Only the exact zero-filled test placeholder is public here.
+    // Any memo containing even one nonzero byte retains the protected ACL
+    // requirement unless the user has explicitly trusted SMB output.
+    constexpr size_t kTestMemoBytes = 32 + 48 + 32;
+    bool const public_test_memo = memo.size() == kTestMemoBytes &&
+        std::all_of(memo.begin(), memo.end(),
+            [](uint8_t byte) { return byte == 0; });
     char const* trust_smb = std::getenv("POS2GPU_TRUST_SMB_PLOT_OUTPUT");
     bool const trusted = trust_smb && trust_smb[0] == '1' && trust_smb[1] == '\0';
-    int const fd = create_private_temp(partial, 0, memo.empty() || trusted);
+    int const fd = create_private_temp(partial, 0, memo.empty() || public_test_memo || trusted);
 #else
     int const fd = ::mkstemp(partial.data());
 #endif

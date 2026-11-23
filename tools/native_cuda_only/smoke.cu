@@ -197,7 +197,8 @@ int main() {
         void* temp=nullptr;ck(cudaMalloc(&temp,bytes),"CUB u32/u64 scratch");
         pos2gpu::cub_sort_pairs_u32_u64(temp,bytes,dk,out_key,
             in_meta,out_meta,n,0,28);
-        auto keys2=download(out_key,n),meta2=download(out_meta,n);
+        auto keys2 = download(out_key, n);
+        auto meta2 = download(out_meta, n);
         for(size_t i=0;i<n;++i)
             if(keys2[i]!=expected_pairs[i].first ||
                meta2[i]!=expected_pairs[i].second)

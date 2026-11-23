@@ -175,7 +175,7 @@ int main() {
         ck(cudaFree(tmp),"CUB scratch release");
         ck(cudaFree(sorted_keys),"sorted keys release");
         ck(cudaFree(sorted_vals),"sorted vals release");
-        std::printf("[native-cuda-smoke] CUDA CUB u32/u32 sort: %zu PASS\\n",n);
+        std::printf("[native-cuda-smoke] CUDA CUB u32/u32 sort: %zu PASS\n",n);
     }
     // Exact u32-key/u64-value sort used by Candidate D T1.
     {
@@ -206,7 +206,7 @@ int main() {
         ck(cudaFree(out_key),"free keys u32/u64");
         ck(cudaFree(in_meta),"free in meta");
         ck(cudaFree(out_meta),"free out meta");
-        std::printf("[native-cuda-smoke] CUDA CUB u32/u64 sort: %zu PASS\\n",n);
+        std::printf("[native-cuda-smoke] CUDA CUB u32/u64 sort: %zu PASS\n",n);
     }
     // 56-bit T3 fragment sort uses the third exact CUB entry point.
     {
@@ -226,7 +226,7 @@ int main() {
         ck(cudaFree(temp),"free CUB u64 scratch");
         ck(cudaFree(in),"free u64 in");
         ck(cudaFree(out),"free u64 out");
-        std::printf("[native-cuda-smoke] CUDA CUB u64 sort: %zu PASS\\n",n);
+        std::printf("[native-cuda-smoke] CUDA CUB u64 sort: %zu PASS\n",n);
     }
     // Full-size k28 Candidate D layout must match the verified pool.
     // This query DOES NOT allocate multi-GiB buffers.
@@ -241,7 +241,7 @@ int main() {
                 "Candidate D exact index scratch too small");
         std::printf("[native-cuda-smoke] Candidate D pool: %.3f GiB VRAM "
                     "(storage %.3f, pair A %.3f, pair B %.3f, "
-                    "scratch %.3f), planning PASS (no large alloc)\\n",
+                    "scratch %.3f), planning PASS (no large alloc)\n",
             plan.device_bytes()/double(1ull<<30),
             plan.storage_bytes/double(1ull<<30),
             plan.pair_a_bytes/double(1ull<<30),

@@ -17,7 +17,7 @@ This branch is based on `refactor/always-on-verified-gpu-optimizations-20261123`
 
 **Verified CUDA core (`4fafeb2d`): Windows RTX 4070 SUPER build, 25.13 s/plot (10 measured), Full Proof 114/114 PASS.** Follow-up peer/two-level/runtime changes still await a fresh build. The Plot CLI remains a CUDA GPU-core / SYCL-host **hybrid**, not yet fully CUDA-only. Host orchestration and other secondary SYCL paths are not removed until replaced. The previous **25.18 s/plot** is the verified *SYCL* baseline, not a CUDA measurement.
 
-See the [CUDA core port details, build and verification checklist](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md). A standalone [nvcc-only smoke test](tools/native_cuda_only/CMakeLists.txt) now checks native CUDA runtime, AES Xs and auxiliary kernels without AdaptiveCpp; the full Plot CLI still uses SYCL host orchestration. The native CUDA stages are **always selected when `XCHPLOT2_BUILD_CUDA=ON`** on this branch; there is no separate CUDA-core ON/OFF flag and no old runtime ON/OFF switches are restored.
+See the [CUDA core port details, build and verification checklist](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md). A standalone [nvcc-only smoke test](tools/native_cuda_only/CMakeLists.txt) already passed native CUDA runtime, AES Xs **4096/4096**, auxiliary kernels and pinned-memory checks without AdaptiveCpp. The next, **unverified Stage 2**, adds native CUB-sort parity and a Candidate-D 12 GB GPU pool with shared Direct24/20 scratch sizing; the full Plot CLI still uses SYCL host orchestration. The native CUDA stages are **always selected when `XCHPLOT2_BUILD_CUDA=ON`** on this branch; there is no separate CUDA-core ON/OFF flag and no old runtime ON/OFF switches are restored.
 
 ### Measured progress
 

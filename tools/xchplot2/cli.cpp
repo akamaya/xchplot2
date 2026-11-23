@@ -458,7 +458,7 @@ void print_command_help(char const* prog, std::string_view command, std::ostream
             "  --raw               write a temporary group member\n"
             "  -G, --gpu-all       run all phases on the GPU\n"
             "  -P, --profile       request phase timing\n"
-            "  --native-cuda       experimental CUDA-only Xs-T3 GPU compute; existing CPU writer\n"
+            "  --native-cuda       test-only CUDA Xs-T3 + existing CPU writer; --memo not allowed\n"
             "  --fragment-digest   print SHA256 of raw sorted T3 stream before .gplot compression\n";
     else if (command == "fragments-hash")
         out << " FILE\n"

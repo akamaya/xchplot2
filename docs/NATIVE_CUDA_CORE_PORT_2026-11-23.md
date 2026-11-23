@@ -70,16 +70,27 @@ The verified first CUDA core commit `4fafeb2d` is preserved as a separate rollba
 
 ### Standalone CUDA-only check (VS2022 Developer PowerShell, one line each)
 
+The first Windows standalone link attempt used AdaptiveCpp's `clang++.exe`
+as the CXX linker and failed with missing `cudadevrt.lib` /
+`cudart_static.lib` despite every CUDA object compiling. This is a
+Windows clang++/CMake CUDA implicit-library search-path issue, **not**
+a CUDA kernel compilation error. The standalone CMake project now
+enables only the CUDA language and uses nvcc for the C++ host facade
+and final executable link. A fresh build directory
+(`build/windows-native-cuda-only-nvcc`) is required to avoid
+reusing the old cached Clang CXX compiler. On Windows, run from
+VS2022 Developer PowerShell so nvcc can find MSVC `cl.exe`.
+
 ```powershell
-cd C:\dev\xchplot2; $env:PATH="$env:CUDA_PATH\bin;$env:PATH"; cmake -S .\tools\native_cuda_only -B .\build\windows-native-cuda-only -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
+cd C:\dev\xchplot2; $env:PATH="$env:CUDA_PATH\bin;$env:PATH"; cmake -S .\tools\native_cuda_only -B .\build\windows-native-cuda-only-nvcc -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
 ```
 
 ```powershell
-cd C:\dev\xchplot2; cmake --build .\build\windows-native-cuda-only -j 16
+cd C:\dev\xchplot2; cmake --build .\build\windows-native-cuda-only-nvcc -j 16
 ```
 
 ```powershell
-cd C:\dev\xchplot2; .\build\windows-native-cuda-only\native_cuda_smoke.exe; if ($LASTEXITCODE -ne 0) { throw 'native CUDA-only smoke failed' }
+cd C:\dev\xchplot2; .\build\windows-native-cuda-only-nvcc\native_cuda_smoke.exe; if ($LASTEXITCODE -ne 0) { throw 'native CUDA-only smoke failed' }
 ```
 
 This standalone target tests native GPU primitives and runtime independently. It is **not** a full Plot executable and does **not** validate the Feistel/Match kernels in isolation; the previously verified hybrid CLI covers those. A complete CUDA-only Plot CLI still requires the host pipeline, buffer pool, device/queue abstraction and residual SYCL kernels to be ported before AdaptiveCpp can be removed from the main CMake project.

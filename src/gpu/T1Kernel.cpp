@@ -22,6 +22,9 @@
 #include "gpu/AesHashGpu.cuh"
 #include "gpu/FineBucketConfig.hpp"
 #include "gpu/T1Direct24.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaIndex.hpp"
+#endif
 #include "gpu/T1Kernel.cuh"
 #include "gpu/T1Offsets.cuh"
 
@@ -129,8 +132,16 @@ void launch_t1_match_prepare(
     if (total > UINT32_MAX)
         throw std::invalid_argument("T1 Direct24 needs <=u32 rows");
     auto* d_direct = reinterpret_cast<uint32_t*>(d_fine_offsets + d.fine_entries);
-    launch_t1_direct24_build(d_sorted_xs, d_fine_offsets, total,
+    #ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_t1_direct24(d_sorted_xs, d_fine_offsets, total, d.num_buckets, d_direct);
+    } else
+#endif
+    {
+        launch_t1_direct24_build(d_sorted_xs, d_fine_offsets, total,
                               d.num_buckets, d_direct, q);
+    }
     fine_timer.mark("direct24_build", q);
     q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
 }

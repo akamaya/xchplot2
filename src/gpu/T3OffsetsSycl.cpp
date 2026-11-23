@@ -9,6 +9,9 @@
 #include "gpu/FineBucketDirect20.hpp"
 #include "gpu/MatchDiag.hpp"
 #include "gpu/SyclBackend.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaMatch.hpp"
+#endif
 #include "gpu/T3Offsets.cuh"
 #include "host/PoolSizing.hpp"
 
@@ -598,6 +601,23 @@ void launch_t3_match_all_buckets(
     uint32_t bucket_end,
     sycl::queue& q)
 {
+#if defined(XCHPLOT2_NATIVE_CUDA_MATCH)
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        // Keep nvcc away from SYCL headers, exactly like SortSyclCub.
+        // The pointer comes from the existing 4-table SYCL upload; T0 is its
+        // first 256 uint32 values.  Wait before launching on CUDA stream 0.
+        uint32_t const* d_t0 = sycl_backend::aes_tables_device(q);
+        q.wait();
+        if (!fine_direct20_enabled(fine_bits, num_match_target_bits, num_buckets))
+            throw std::invalid_argument("native CUDA T3 requires k28/s6 Direct20");
+        auto const* direct = fine_direct20_ptr(d_fine_offsets, num_buckets);
+        cuda_match_t3(keys, fk, d_sorted_meta, d_sorted_xbits, d_offsets,
+            direct, d_t0, num_match_keys, k, num_section_bits, target_mask,
+            num_test_bits, reinterpret_cast<uint64_t*>(d_out_pairings),
+            d_out_count, out_capacity, l_count_max, bucket_begin, bucket_end);
+        return;
+    }
+#endif
     launch_t3_match_all_buckets_compact(
             keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
             d_offsets, d_fine_offsets, num_match_keys, num_buckets, k,

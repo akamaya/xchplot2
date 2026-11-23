@@ -3,6 +3,9 @@
 // buffer from SyclBackend.hpp, pack is a pure grid-stride lambda.
 
 #include "gpu/SyclBackend.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaXs.hpp"
+#endif
 #include "gpu/XsKernels.cuh"
 
 #include <sycl/sycl.hpp>
@@ -18,6 +21,14 @@ void launch_xs_gen(
     uint32_t xor_const,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        uint32_t const* t0=sycl_backend::aes_tables_device(q);
+        q.wait();
+        cuda_xs_generate(keys, keys_out, vals_out, 0, total, k, xor_const, t0);
+        return;
+    }
+#endif
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
     constexpr size_t threads = 256;
@@ -59,6 +70,15 @@ void launch_xs_gen_range(
     uint32_t xor_const,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        if (pos_end <= pos_begin) return;
+        uint32_t const* t0=sycl_backend::aes_tables_device(q);
+        q.wait();
+        cuda_xs_generate(keys, keys_out, vals_out, pos_begin, pos_end-pos_begin, k, xor_const, t0);
+        return;
+    }
+#endif
     if (pos_end <= pos_begin) return;
     uint64_t const range_n = pos_end - pos_begin;
 
@@ -99,6 +119,13 @@ void launch_xs_pack(
     uint64_t total,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_xs_pack(keys_in, vals_in, d_out, total);
+        return;
+    }
+#endif
     constexpr size_t threads = 256;
     size_t   const groups    = (total + threads - 1) / threads;
 
@@ -118,6 +145,13 @@ void launch_xs_pack_range(
     uint64_t count,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_xs_pack(keys_in, vals_in, d_out, count);
+        return;
+    }
+#endif
     // Same body as launch_xs_pack — caller passes already-offset pointers
     // (keys_in, vals_in, d_out) and the slice count.
     if (count == 0) return;

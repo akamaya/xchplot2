@@ -5,6 +5,9 @@
 
 #include "gpu/PipelineKernels.cuh"
 #include "gpu/SyclBackend.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaPipeline.hpp"
+#endif
 
 #include <sycl/sycl.hpp>
 
@@ -25,6 +28,13 @@ inline size_t global_for(uint64_t count)
 void launch_init_u32_identity(
     uint32_t* d_vals, uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_init_u32_identity(d_vals,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -38,6 +48,13 @@ void launch_gather_u64(
     uint64_t const* d_src, uint32_t const* d_indices,
     uint64_t* d_dst, uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_gather_u64(d_src,d_indices,d_dst,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -51,6 +68,13 @@ void launch_gather_u32(
     uint32_t const* d_src, uint32_t const* d_indices,
     uint32_t* d_dst, uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_gather_u32(d_src,d_indices,d_dst,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -66,6 +90,13 @@ void launch_permute_t2(
     uint64_t* d_dst_meta, uint32_t* d_dst_xbits,
     uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_permute_t2(d_src_meta,d_src_xbits,d_indices,d_dst_meta,d_dst_xbits,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -87,6 +118,13 @@ void launch_compute_inverse_u32(
     uint32_t const* d_indices, uint32_t* d_inv,
     uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_inverse_u32(d_indices,d_inv,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -104,6 +142,13 @@ void launch_scatter_u64(
     uint64_t const* d_src, uint32_t const* d_inv_indices,
     uint64_t* d_dst, uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_scatter_u64(d_src,d_inv_indices,d_dst,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -117,6 +162,13 @@ void launch_scatter_u32(
     uint32_t const* d_src, uint32_t const* d_inv_indices,
     uint32_t* d_dst, uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_scatter_u32(d_src,d_inv_indices,d_dst,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -132,6 +184,13 @@ void launch_permute_t2_scatter(
     uint64_t* d_dst_meta, uint32_t* d_dst_xbits,
     uint64_t count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_permute_t2_scatter(d_src_meta,d_src_xbits,d_inv_indices,d_dst_meta,d_dst_xbits,count);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -149,6 +208,13 @@ void launch_merge_pairs_stable_2way_u32_u32(
     uint32_t* d_out_keys, uint32_t* d_out_vals, uint64_t total,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_merge_pairs_stable_2way_u32_u32(d_A_keys,d_A_vals,nA,d_B_keys,d_B_vals,nB,d_out_keys,d_out_vals,total);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(total), kThreads },
         [=](sycl::nd_item<1> it) {

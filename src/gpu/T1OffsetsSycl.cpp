@@ -17,6 +17,10 @@
 #include "gpu/MatchKernelCommon.cuh"
 #include "gpu/MatchDiag.hpp"
 #include "gpu/SyclBackend.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaMatch.hpp"
+#include "gpu/NativeCudaIndex.hpp"
+#endif
 #include "gpu/T1Offsets.cuh"
 #include "gpu/T1Direct24.hpp"
 #include "gpu/AesLastRoundSycl.hpp"
@@ -135,6 +139,13 @@ void launch_compute_bucket_offsets(
     uint64_t* d_offsets,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_t1_bucket_offsets(d_sorted, total, num_match_target_bits, num_buckets, d_offsets);
+        return;
+    }
+#endif
     constexpr size_t threads   = 256;
     size_t   const out_count   = static_cast<size_t>(num_buckets) + 1;
     size_t   const groups      = (out_count + threads - 1) / threads;
@@ -167,6 +178,13 @@ void launch_compute_fine_bucket_offsets(
     uint64_t* d_fine_offsets,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_t1_fine_offsets(d_sorted, d_bucket_offsets, num_match_target_bits, fine_bits, num_buckets, d_fine_offsets);
+        return;
+    }
+#endif
     constexpr size_t threads      = 256;
     uint32_t const   fine_count   = 1u << fine_bits;
     uint32_t const   total        = num_buckets * fine_count;
@@ -571,6 +589,25 @@ void launch_t1_match_all_buckets(
     uint32_t bucket_end,
     sycl::queue& q)
 {
+#if defined(XCHPLOT2_NATIVE_CUDA_MATCH)
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        // Keep nvcc away from SYCL headers, exactly like SortSyclCub.
+        // The pointer comes from the existing 4-table SYCL upload; T0 is its
+        // first 256 uint32 values.  Wait before launching on CUDA stream 0.
+        uint32_t const* d_t0 = sycl_backend::aes_tables_device(q);
+        q.wait();
+        if (!t1_direct24_enabled(fine_bits, num_match_target_bits, num_buckets))
+            throw std::invalid_argument("native CUDA T1 requires k28/s6 Direct24");
+        auto const* direct = reinterpret_cast<uint32_t const*>(
+            d_fine_offsets + (uint64_t(num_buckets) << fine_bits) + 1);
+        cuda_match_t1(keys, d_sorted_xs, d_offsets, direct, d_t0,
+            num_match_keys, k, num_section_bits, extra_rounds_bits,
+            target_mask, num_test_bits, num_match_info_bits,
+            d_out_meta, d_out_mi, d_out_count, out_capacity,
+            l_count_max, bucket_begin, bucket_end);
+        return;
+    }
+#endif
     launch_t1_match_all_buckets_compact(
             keys, d_sorted_xs, d_offsets, d_fine_offsets,
             num_match_keys, num_buckets, k, num_section_bits,

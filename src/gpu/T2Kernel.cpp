@@ -15,6 +15,9 @@
 #include "gpu/T2Kernel.cuh"
 #include "gpu/T2Offsets.cuh"
 #include "gpu/FineBucketDirect20.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaIndex.hpp"
+#endif
 #include "gpu/FineBucketIndex.hpp"
 #include "host/PoolSizing.hpp"
 
@@ -134,7 +137,15 @@ void launch_t2_match_prepare(
     fine_timer.mark("fine_offsets", q);
     auto* direct = fine_direct20_ptr(d_fine_offsets, d.num_buckets);
     FineBucketTimer direct_timer(2, d.fine_bits);
-    fine_direct20_build(d_sorted_mi, d_fine_offsets, direct, d.num_buckets, q);
+    #ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_t23_direct20(d_sorted_mi, d_fine_offsets, direct, d.num_buckets);
+    } else
+#endif
+    {
+        fine_direct20_build(d_sorted_mi, d_fine_offsets, direct, d.num_buckets, q);
+    }
     direct_timer.mark("direct20_build", q);
     q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
 }

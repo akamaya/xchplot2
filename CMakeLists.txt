@@ -146,6 +146,12 @@ set(X2_AMD_GFX "${_xchplot2_gfx}")
 include(cmake/TargetSelection.cmake)
 set(ACPP_TARGETS "${ACPP_TARGETS}" CACHE STRING "AdaptiveCpp target list" FORCE)
 option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ${XCHPLOT2_BUILD_CUDA})
+# NVIDIA native match (nvcc).  SYCL still performs Xs/offset builds and the
+# pooled host orchestration; only the three hot Compact match kernels use nvcc.
+option(XCHPLOT2_NATIVE_CUDA_MATCH "Use native CUDA for k28/s6 Compact T1/T2/T3 matching" ${XCHPLOT2_BUILD_CUDA})
+if(XCHPLOT2_NATIVE_CUDA_MATCH AND NOT XCHPLOT2_BUILD_CUDA)
+    message(FATAL_ERROR "XCHPLOT2_NATIVE_CUDA_MATCH requires XCHPLOT2_BUILD_CUDA=ON")
+endif()
 unset(_xchplot2_nvcc_probe CACHE)
 
 # On dual-toolchain hosts (CUDA Toolkit + ROCm both installed), the SYCL
@@ -861,6 +867,9 @@ if(XCHPLOT2_BUILD_CUDA)
         src/gpu/AesGpuBitsliced.cu
         src/gpu/DeviceMemCuda.cu
         src/gpu/SortCuda.cu)
+    if(XCHPLOT2_NATIVE_CUDA_MATCH)
+        list(APPEND POS2_GPU_CUDA_SRC src/gpu/NativeCudaMatch.cu src/gpu/NativeCudaIndex.cu src/gpu/NativeCudaXs.cu src/gpu/NativeCudaPipeline.cu)
+    endif()
     # SortSyclCub.cpp is the SYCL-typed adapter that bridges
     # sycl::queue → CUB. SortCuda.cu used to provide the SYCL-typed
     # entry points itself, but mixing nvcc + <sycl/sycl.hpp> in one
@@ -928,6 +937,9 @@ endif()
 # single tail call into SortSycl.cpp.
 if(XCHPLOT2_BUILD_CUDA)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_HAVE_CUB=1)
+endif()
+if(XCHPLOT2_NATIVE_CUDA_MATCH)
+    target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_NATIVE_CUDA_MATCH=1)
 endif()
 x2_add_sycl_to_target(TARGET pos2_gpu SOURCES ${POS2_GPU_SYCL_SRC})
 

@@ -16,6 +16,9 @@ struct NativeCudaPipelineResult {
     std::array<uint8_t,32> sha256_unique_fragments{};
     double seconds=0;
 };
+// Scan CUDA devices without exposing CUDA Runtime types in host headers.
+int native_cuda_rtx4070_super_ordinal();
+
 NativeCudaPipelineResult native_cuda_run_k28s6(
     std::array<uint8_t,32> const& plot_id, int cuda_ordinal,
     // Optional: return sorted 56-bit T3 fragments to the existing

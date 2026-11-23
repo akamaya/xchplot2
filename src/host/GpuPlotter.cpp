@@ -25,6 +25,7 @@
 #include <array>
 #include <iostream>
 #include <span>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -137,7 +138,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     // CPU path owns via cpu_fragments below.
     GpuPipelineResult pr;
     std::vector<uint64_t> cpu_fragments;
-    std::vector<uint64_t> native_fragments;
+    std::unique_ptr<NativeCudaPlotSession> native_session;
     std::span<uint64_t const> fragments;
     if (all_gpu && opts.native_cuda_test) {
 #if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
@@ -146,15 +147,16 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         // Only the GPU computation is CUDA-only here. The existing,
         // well-tested CPU FSE/.gplot writer runs immediately afterward.
         int const ordinal = native_cuda_rtx4070_super_ordinal();
-        auto const result=native_cuda_run_k28s6(opts.plot_id,ordinal,&native_fragments,
-                                                  /*compute_digests=*/false);
-        if (native_fragments.size()!=result.t3_count)
-            throw std::runtime_error("native CUDA T3 captured count mismatch");
-        fragments=std::span<uint64_t const>(native_fragments);
-        std::cerr << "[cuda-native-test] GPU T1=" << result.t1_count
-                  << " T2=" << result.t2_count
-                  << " T3=" << result.t3_count
-                  << " compute+capture=" << result.seconds << "s\n";
+        // Original batch-mode contract: Writer borrows a pinned T3 output
+        // slot from a persistent CUDA pool until file publication completes.
+        native_session=std::make_unique<NativeCudaPlotSession>(ordinal);
+        auto const frame=native_session->generate(opts.plot_id);
+        fragments=frame.fragments;
+        std::cerr << "[cuda-native-test] GPU T1=" << frame.stats.t1_count
+                  << " T2=" << frame.stats.t2_count
+                  << " T3=" << frame.stats.t3_count
+                  << " compute+capture=" << frame.stats.seconds << "s"
+                  << " transfer=pinned-direct\n";
 #else
         throw std::runtime_error("native CUDA test requires Windows CUDA-only core build");
 #endif

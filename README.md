@@ -17,7 +17,7 @@ This branch is based on `refactor/always-on-verified-gpu-optimizations-20261123`
 
 **Status: implementation committed, not yet nvcc-built or hardware-verified.** This is presently a CUDA GPU-core / SYCL-host **hybrid**, not a fully standalone CUDA-only build. Host orchestration and other secondary SYCL paths are not removed until replaced. The previous **25.18 s/plot** is the verified *SYCL* baseline, not a CUDA measurement.
 
-See the [CUDA core port details, build and verification checklist](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md). The compile-time switch is `XCHPLOT2_NATIVE_CUDA_MATCH=ON`, requiring `XCHPLOT2_BUILD_CUDA=ON`; no old runtime ON/OFF switches were reintroduced.
+See the [CUDA core port details, build and verification checklist](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md). The native CUDA stages are **always selected when `XCHPLOT2_BUILD_CUDA=ON`** on this branch; there is no separate CUDA-core ON/OFF flag and no old runtime ON/OFF switches are restored.
 
 ### Measured progress
 

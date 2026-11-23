@@ -1,6 +1,8 @@
 // Standalone nvcc-only GPU tests. No SYCL or AdaptiveCpp includes.
 #include "gpu/NativeCudaXs.hpp"
 #include "gpu/NativeCudaRuntime.hpp"
+#include "gpu/NativeCudaPool.hpp"
+#include "gpu/SortCubInternal.cuh"
 #include "gpu/NativeCudaPipeline.hpp"
 #include "gpu/NativeCudaPeer.hpp"
 #include "gpu/NativeCudaTwoLevel.hpp"
@@ -147,6 +149,105 @@ int main() {
     for(size_t i=0;i<n;++i)
         require(gathered[i]==generated[n-1-i],"CUDA gather mismatch");
     std::printf("[native-cuda-smoke] gather PASS\n");
+
+    // CUB sort: exact key order and stable value order; no SYCL queue.
+    {
+        auto expected_pairs=ref;
+        std::stable_sort(expected_pairs.begin(),expected_pairs.end(),
+            [](auto const& a,auto const& b){return a.first<b.first;});
+        uint32_t* sorted_keys=alloc<uint32_t>(n);
+        uint32_t* sorted_vals=alloc<uint32_t>(n);
+        size_t scratch_bytes=0;
+        upload(dk,generated);
+        upload(dv,values);
+        pos2gpu::cub_sort_pairs_u32_u32(nullptr,scratch_bytes,dk,sorted_keys,
+            dv,sorted_vals,n,0,28);
+        require(scratch_bytes!=0,"CUB sort sizing returned zero");
+        void* tmp=nullptr;ck(cudaMalloc(&tmp,scratch_bytes),"CUB scratch allocation");
+        pos2gpu::cub_sort_pairs_u32_u32(tmp,scratch_bytes,dk,sorted_keys,
+            dv,sorted_vals,n,0,28);
+        auto actual_k=download(sorted_keys,n),actual_v=download(sorted_vals,n);
+        for(size_t i=0;i<n;++i){
+            if(actual_k[i]!=expected_pairs[i].first ||
+               actual_v[i]!=expected_pairs[i].second)
+                throw std::runtime_error("CUB u32/u32 stable sort mismatch");
+        }
+        ck(cudaFree(tmp),"CUB scratch release");
+        ck(cudaFree(sorted_keys),"sorted keys release");
+        ck(cudaFree(sorted_vals),"sorted vals release");
+        std::printf("[native-cuda-smoke] CUDA CUB u32/u32 sort: %zu PASS\\n",n);
+    }
+    // Exact u32-key/u64-value sort used by Candidate D T1.
+    {
+        uint32_t* out_key=alloc<uint32_t>(n);
+        uint64_t* in_meta=alloc<uint64_t>(n);
+        uint64_t* out_meta=alloc<uint64_t>(n);
+        std::vector<uint64_t> metas(n);
+        std::vector<std::pair<uint32_t,uint64_t>> expected_pairs;
+        for(size_t i=0;i<n;++i){
+            metas[i]=(uint64_t(i)<<32)|uint64_t(17*i+5);
+            expected_pairs.emplace_back(generated[i],metas[i]);
+        }
+        std::stable_sort(expected_pairs.begin(),expected_pairs.end(),
+            [](auto const& a,auto const& b){return a.first<b.first;});
+        upload(dk,generated);upload(in_meta,metas);
+        size_t bytes=0;
+        pos2gpu::cub_sort_pairs_u32_u64(nullptr,bytes,dk,out_key,
+            in_meta,out_meta,n,0,28);
+        void* temp=nullptr;ck(cudaMalloc(&temp,bytes),"CUB u32/u64 scratch");
+        pos2gpu::cub_sort_pairs_u32_u64(temp,bytes,dk,out_key,
+            in_meta,out_meta,n,0,28);
+        auto keys2=download(out_key,n),meta2=download(out_meta,n);
+        for(size_t i=0;i<n;++i)
+            if(keys2[i]!=expected_pairs[i].first ||
+               meta2[i]!=expected_pairs[i].second)
+                throw std::runtime_error("CUB u32/u64 stable sort mismatch");
+        ck(cudaFree(temp),"free CUB u32/u64 scratch");
+        ck(cudaFree(out_key),"free keys u32/u64");
+        ck(cudaFree(in_meta),"free in meta");
+        ck(cudaFree(out_meta),"free out meta");
+        std::printf("[native-cuda-smoke] CUDA CUB u32/u64 sort: %zu PASS\\n",n);
+    }
+    // 56-bit T3 fragment sort uses the third exact CUB entry point.
+    {
+        std::vector<uint64_t> fragment(n);
+        for(size_t i=0;i<n;++i)
+            fragment[i]=((uint64_t(n-1-i)<<24) | uint64_t(i*13));
+        auto sorted_expected=fragment;
+        std::sort(sorted_expected.begin(),sorted_expected.end());
+        uint64_t* in=alloc<uint64_t>(n);
+        uint64_t* out=alloc<uint64_t>(n);
+        upload(in,fragment);
+        size_t bytes=0;
+        pos2gpu::cub_sort_keys_u64(nullptr,bytes,in,out,n,0,56);
+        void* temp=nullptr;ck(cudaMalloc(&temp,bytes),"CUB u64 scratch");
+        pos2gpu::cub_sort_keys_u64(temp,bytes,in,out,n,0,56);
+        require(download(out,n)==sorted_expected,"CUB u64 keys sort mismatch");
+        ck(cudaFree(temp),"free CUB u64 scratch");
+        ck(cudaFree(in),"free u64 in");
+        ck(cudaFree(out),"free u64 out");
+        std::printf("[native-cuda-smoke] CUDA CUB u64 sort: %zu PASS\\n",n);
+    }
+    // Full-size k28 Candidate D layout must match the verified pool.
+    // This query DOES NOT allocate multi-GiB buffers.
+    {
+        auto plan=pos2gpu::native_cuda_pool_plan(chosen);
+        require(plan.total_xs==(1ull<<28),"Candidate D Xs count mismatch");
+        require(plan.capacity>plan.total_xs,"Candidate D match cap too small");
+        require(plan.storage_bytes>=12*plan.capacity,"Candidate D storage too small");
+        require(plan.pair_b_bytes>=8*plan.total_xs,"Candidate D pair B too small");
+        require(plan.sort_and_index_scratch_bytes>=plan.index_t1_bytes &&
+                plan.sort_and_index_scratch_bytes>=plan.index_t23_bytes,
+                "Candidate D exact index scratch too small");
+        std::printf("[native-cuda-smoke] Candidate D pool: %.3f GiB VRAM "
+                    "(storage %.3f, pair A %.3f, pair B %.3f, "
+                    "scratch %.3f), planning PASS (no large alloc)\\n",
+            plan.device_bytes()/double(1ull<<30),
+            plan.storage_bytes/double(1ull<<30),
+            plan.pair_a_bytes/double(1ull<<30),
+            plan.pair_b_bytes/double(1ull<<30),
+            plan.sort_and_index_scratch_bytes/double(1ull<<30));
+    }
 
     ck(cudaFree(dt),"free dt");ck(cudaFree(dk),"free dk");ck(cudaFree(dv),"free dv");
     ck(cudaFree(d_hist),"free hist");ck(cudaFree(d_cursor),"free cursor");

@@ -378,6 +378,28 @@ void warm_writer_pool()
     (void)WriterThreadPool::instance();
 }
 
+std::array<uint8_t,32> raw_t3_fragments_sha256(
+    std::span<uint64_t const> fragments)
+{
+    // SHA-256 reference implementation from pos2-chip (already linked).
+    // Never pass a >32-bit length to sha256_update on Windows. Hash
+    // incrementally in bounded chunks, including duplicate fragments.
+    sha256 ctx{};
+    sha256_init(&ctx);
+    auto const* bytes=reinterpret_cast<uint8_t const*>(fragments.data());
+    size_t remaining=fragments.size()*sizeof(uint64_t);
+    constexpr size_t chunk_bytes=8u<<20;
+    while(remaining) {
+        size_t const step=std::min(remaining,chunk_bytes);
+        sha256_update(&ctx,bytes,static_cast<unsigned long>(step));
+        bytes+=step;
+        remaining-=step;
+    }
+    std::array<uint8_t,32> out{};
+    sha256_sum(&ctx,out.data());
+    return out;
+}
+
 std::array<uint8_t, 32> plot_id_for_group(
     std::array<uint8_t, 32> const& group_id, uint16_t index, uint8_t meta_group)
 {

@@ -10,6 +10,9 @@
 // preserved. Parity tests compare as a SET to absorb this.
 
 #include "gpu/SortDistributedPeer.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaPeer.hpp"
+#endif
 
 #include <sycl/sycl.hpp>
 
@@ -67,6 +70,13 @@ void launch_count_per_dest_u32(
     std::uint32_t N, int begin_bit, int end_bit,
     std::uint32_t* d_dst_count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_peer_count_u32(d_keys,count,N,begin_bit,end_bit,d_dst_count);
+        return;
+    }
+#endif
     if (count == 0) return;
     constexpr std::size_t threads = 256;
     std::size_t const groups = (count + threads - 1) / threads;
@@ -91,6 +101,13 @@ void launch_count_per_dest_u64(
     std::uint32_t N, int begin_bit, int end_bit,
     std::uint32_t* d_dst_count, sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_peer_count_u64(d_keys,count,N,begin_bit,end_bit,d_dst_count);
+        return;
+    }
+#endif
     if (count == 0) return;
     constexpr std::size_t threads = 256;
     std::size_t const groups = (count + threads - 1) / threads;
@@ -117,6 +134,13 @@ void launch_scatter_u32_u32(
     std::uint32_t* d_staging_keys, std::uint32_t* d_staging_vals,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_peer_scatter_u32_u32(d_keys_in,d_vals_in,count,N,begin_bit,end_bit,d_dst_offsets,d_dst_cur,d_staging_keys,d_staging_vals);
+        return;
+    }
+#endif
     if (count == 0) return;
     constexpr std::size_t threads = 256;
     std::size_t const groups = (count + threads - 1) / threads;
@@ -147,6 +171,13 @@ void launch_scatter_u32_u64(
     std::uint32_t* d_staging_keys, std::uint64_t* d_staging_vals,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_peer_scatter_u32_u64(d_keys_in,d_vals_in,count,N,begin_bit,end_bit,d_dst_offsets,d_dst_cur,d_staging_keys,d_staging_vals);
+        return;
+    }
+#endif
     if (count == 0) return;
     constexpr std::size_t threads = 256;
     std::size_t const groups = (count + threads - 1) / threads;
@@ -179,6 +210,13 @@ void launch_scatter_u32_u64u32(
     std::uint64_t* d_staging_va, std::uint32_t* d_staging_vb,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_peer_scatter_u32_u64u32(d_keys_in,d_va_in,d_vb_in,count,N,begin_bit,end_bit,d_dst_offsets,d_dst_cur,d_staging_keys,d_staging_va,d_staging_vb);
+        return;
+    }
+#endif
     if (count == 0) return;
     constexpr std::size_t threads = 256;
     std::size_t const groups = (count + threads - 1) / threads;
@@ -211,6 +249,13 @@ void launch_scatter_u64_keys(
     std::uint64_t* d_staging_keys,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_peer_scatter_u64_keys(d_keys_in,count,N,begin_bit,end_bit,d_dst_offsets,d_dst_cur,d_staging_keys);
+        return;
+    }
+#endif
     if (count == 0) return;
     constexpr std::size_t threads = 256;
     std::size_t const groups = (count + threads - 1) / threads;

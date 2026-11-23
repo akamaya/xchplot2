@@ -17,6 +17,7 @@
 #endif
 
 #include <filesystem>
+#include <chrono>
 #include <algorithm>
 #include <optional>
 #include <cstdio>
@@ -185,18 +186,32 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
                                               cpu_fragments.size());
     }
 
+    using Clock = std::chrono::steady_clock;
+    auto const to_ms=[](Clock::time_point a,Clock::time_point b) {
+        return std::chrono::duration<double,std::milli>(b-a).count();
+    };
     if (opts.fragment_digest || opts.native_cuda_test) {
+        auto const hash_start=Clock::now();
         auto const digest = raw_t3_fragments_sha256(fragments);
+        auto const hash_end=Clock::now();
         if (native_expected_raw_digest && digest != *native_expected_raw_digest)
             throw std::runtime_error("native CUDA T3 capture digest differs from GPU stream");
+        auto const sort_start=Clock::now();
         if (opts.native_cuda_test && !std::is_sorted(fragments.begin(),fragments.end()))
             throw std::runtime_error("native CUDA T3 output is not monotonically sorted");
+        auto const sort_end=Clock::now();
         std::fprintf(stderr,"[fragments-hash] raw sorted T3 SHA256=");
         for(uint8_t b:digest)std::fprintf(stderr,"%02x",unsigned(b));
         std::fprintf(stderr," count=%zu\n",fragments.size());
+        std::fprintf(stderr,"[host-timing] reference_sha256=%.3f verify_sorted=%.3f ms\n",
+                     to_ms(hash_start,hash_end),to_ms(sort_start,sort_end));
     }
 
+    auto const writer_start=Clock::now();
     write_plot_file_parallel(full_path.string(), fragments, entry);
+    if (opts.native_cuda_test || opts.fragment_digest)
+        std::fprintf(stderr,"[host-timing] writer_fse_nas=%.3f ms\n",
+                     to_ms(writer_start,Clock::now()));
 
     return full_path.string();
 }

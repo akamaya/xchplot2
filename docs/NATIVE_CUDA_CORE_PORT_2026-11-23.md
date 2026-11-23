@@ -88,6 +88,81 @@ the production CLI until that pipeline is in place.
 cd C:\dev\xchplot2; git pull --ff-only origin cuda/nvidia-12gb-k28s6; if ($LASTEXITCODE -ne 0) { throw 'git pull failed' }; cmake --build .\build\windows-native-cuda-only-nvcc -j 16; if ($LASTEXITCODE -ne 0) { throw 'nvcc build failed' }; .\build\windows-native-cuda-only-nvcc\native_cuda_smoke.exe; if ($LASTEXITCODE -ne 0) { throw 'CUDA smoke failed' }
 ```
 
+
+## CUDA-only Stage 3: independent complete GPU compute (UNVERIFIED)
+
+**Source-only milestone.** Stage 2 standalone tests have passed on RTX 4070
+SUPER, including CPU/GPU AES 4096/4096, CUDA CUB u32/u32 + u32/u64 + u64
+4096-entry parity and Candidate-D 8.172 GiB allocation **planning**.
+Stage 3 introduces a *separate* `native_cuda_pipeline.exe` without changing the
+already-verified production hybrid `xchplot2.exe`.
+
+### Implementation
+
+- `NativeCudaStandalonePipeline.cpp/.hpp`: the native Windows host
+  orchestrator runs Xs AES generation + CUB radix sort + Xs pack;
+  builds the T1 Direct24 index and T1 match; sorts T1 (u32/u64 CUB);
+  builds the T2 Direct20 index + T2 match; parks T2 xbits in reused
+  pair B memory while sorting T2; builds T3 Direct20 + Feistel match;
+  sorts T3 fragments (u64 CUB). All NVIDIA device execution uses
+  native CUDA; no SYCL queue, AdaptiveCpp allocation or runtime.
+- `tools/native_cuda_only/pos/FeistelCipher.hpp`: a local, independent
+  Windows CNG/BCrypt SHA-256 implementation of the PoS2 4-round key
+  schedule. The `FullRoundKey` ABI matches pos2-chip's header; this
+  private shim is included **only** by the standalone CUDA targets.
+  The regular hybrid CLI keeps using the external pos2-chip header.
+- `native_cuda_smoke` now tests four complete Feistel SHA-256 key
+  vectors against independent reference words. A Feistel test PASS is
+  required before trusting the new T3 CUDA-only path.
+- `pipeline_main.cu` offers `--plan` (default, no multi-GiB
+  allocation) and `--run` (opt-in full k28/s6 calculation on RTX 4070
+  SUPER). A custom plot ID can be passed as `--plot-id 64hex`.
+  The fixed demo plot ID is NOT intended for farming.
+- The result contains T1/T2/T3 counts and SHA-256 of the **sorted
+  64-bit T3 fragments**. It reads T3 output through a small
+  pinned-host tile so full output fits the existing 128 GiB host RAM
+  without allocating a second huge pinned buffer.
+
+**Boundary: no `.gplot` writer and no Full Proof verifier is linked to this
+standalone binary.** `COMPUTE OK` is not proof validation. Do not treat the
+runner as a finished plotter or replace a validated farming plot with
+these diagnostics. Integrating the on-disk plot writer remains separate.
+
+**Status: no Stage 3 Windows nvcc build, execution or correctness check
+has been run yet.** No performance claims can be made for Stage 3.
+
+### Build and staged checks (VS2022 Developer PowerShell)
+
+After `git pull --ff-only origin cuda/nvidia-12gb-k28s6`, rerun
+CMake to register the new executable and compile with 16 jobs:
+
+```powershell
+cd C:\dev\xchplot2; cmake -S .\tools\native_cuda_only -B .\build\windows-native-cuda-only-nvcc -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89; if ($LASTEXITCODE -ne 0) { throw 'CUDA-only configure failed' }; cmake --build .\build\windows-native-cuda-only-nvcc -j 16; if ($LASTEXITCODE -ne 0) { throw 'CUDA-only build failed' }
+```
+
+Run the updated smoke, including Feistel CNG key vectors:
+
+```powershell
+cd C:\dev\xchplot2; .\build\windows-native-cuda-only-nvcc\native_cuda_smoke.exe; if ($LASTEXITCODE -ne 0) { throw 'CUDA-only smoke failed' }
+```
+
+No large VRAM allocation in this plan query:
+
+```powershell
+cd C:\dev\xchplot2; .\build\windows-native-cuda-only-nvcc\native_cuda_pipeline.exe --plan; if ($LASTEXITCODE -ne 0) { throw 'CUDA-only plan failed' }
+```
+
+Only after compilation, smoke and plan pass, opt-in to the full
+compute-only RTX 4070 SUPER run:
+
+```powershell
+cd C:\dev\xchplot2; .\build\windows-native-cuda-only-nvcc\native_cuda_pipeline.exe --run; if ($LASTEXITCODE -ne 0) { throw 'CUDA-only full compute failed' }
+```
+
+On the first run, report the count/digest/first error to compare
+against the reference pipeline; **avoid rerunning the old ON/OFF benchmarks**.
+The compute-only diagnostic intentionally writes no plot or test files.
+
 ## Remaining native CUDA-only work
 
 AdaptiveCpp/SYCL is still required for device discovery, CUDA-USM allocation/queues, pooled GPU host orchestration, and some distributed/sharded/streaming and fallback kernels. Those are **not** removed because doing so before porting the host layer would break plot creation. The CUDA-specific branch isolates the new code without altering main or the refactor branch. There is no claimed speedup until the k28/s6 hardware verification above.

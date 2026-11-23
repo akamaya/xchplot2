@@ -2,6 +2,7 @@
 #include "gpu/NativeCudaXs.hpp"
 #include "gpu/NativeCudaRuntime.hpp"
 #include "gpu/NativeCudaPool.hpp"
+#include "gpu/FeistelCipherGpu.cuh"
 #include "gpu/SortCubInternal.cuh"
 #include "gpu/NativeCudaPipeline.hpp"
 #include "gpu/NativeCudaPeer.hpp"
@@ -91,6 +92,23 @@ int main() {
     uint8_t plot_id[32];
     for(int i=0;i<32;++i) plot_id[i]=uint8_t((i*29+7)&255);
     pos2gpu::AesHashKeys keys=pos2gpu::make_keys(plot_id);
+    // SHA256 round-key schedule: independently generated reference for
+    // plot_id[i] = (i*29+7)&255 using the upstream bit-extraction rules.
+    {
+        auto fk=pos2gpu::make_feistel_key(plot_id,28);
+        uint32_t const golden[4][3]={
+            {24494912u,130966106u,118182932u},
+            {239297506u,71721121u,12732245u},
+            {200835073u,77432689u,3115480u},
+            {27242478u,118085515u,111350572u}};
+        require(fk.k==28,"Feistel key k mismatch");
+        for(int r=0;r<4;++r){
+            auto const& key=fk.round_key.round[r];
+            require(key.b==golden[r][0]&&key.c==golden[r][1]&&
+                    key.d==golden[r][2],"Feistel SHA256 key schedule mismatch");
+        }
+        std::puts("[native-cuda-smoke] Windows CNG Feistel key schedule PASS");
+    }
     std::vector<uint32_t> tables(1024);
     for(int i=0;i<256;++i){
         tables[i]=pos2gpu::aes_tables::T0[i];

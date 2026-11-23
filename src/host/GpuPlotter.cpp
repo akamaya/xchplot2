@@ -146,10 +146,12 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         // Only the GPU computation is CUDA-only here. The existing,
         // well-tested CPU FSE/.gplot writer runs immediately afterward.
         int const ordinal = native_cuda_rtx4070_super_ordinal();
-        auto const result=native_cuda_run_k28s6(opts.plot_id,ordinal,&native_fragments);
+        auto const result=native_cuda_run_k28s6(opts.plot_id,ordinal,&native_fragments,
+                                                 opts.fragment_digest);
         if (native_fragments.size()!=result.t3_count)
             throw std::runtime_error("native CUDA T3 captured count mismatch");
-        native_expected_raw_digest=result.sha256_fragments;
+        if (opts.fragment_digest)
+            native_expected_raw_digest=result.sha256_fragments;
         fragments=std::span<uint64_t const>(native_fragments);
         std::cerr << "[cuda-native-test] GPU T1=" << result.t1_count
                   << " T2=" << result.t2_count
@@ -190,7 +192,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     auto const to_ms=[](Clock::time_point a,Clock::time_point b) {
         return std::chrono::duration<double,std::milli>(b-a).count();
     };
-    if (opts.fragment_digest || opts.native_cuda_test) {
+    if (opts.fragment_digest) {
         auto const hash_start=Clock::now();
         auto const digest = raw_t3_fragments_sha256(fragments);
         auto const hash_end=Clock::now();
@@ -206,6 +208,11 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         std::fprintf(stderr,"[host-timing] reference_sha256=%.3f verify_sorted=%.3f ms\n",
                      to_ms(hash_start,hash_end),to_ms(sort_start,sort_end));
     }
+
+    if (opts.native_cuda_test && !opts.fragment_digest)
+        std::fprintf(stderr,
+            "[cuda-native-test] fast path: skipped full-T3 SHA256 diagnostics; "
+            "the plot writer checks fragment order and on-disk Full Proof can be validated\n");
 
     auto const writer_start=Clock::now();
     write_plot_file_parallel(full_path.string(), fragments, entry);

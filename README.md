@@ -19,6 +19,24 @@ This branch is based on `refactor/always-on-verified-gpu-optimizations-20261123`
 
 See the [CUDA core port details, build and verification checklist](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md). A standalone [nvcc-only smoke test](tools/native_cuda_only/CMakeLists.txt) already passed native CUDA runtime, AES Xs **4096/4096**, auxiliary kernels and pinned-memory checks without AdaptiveCpp. The next, **unverified Stage 2**, adds native CUB-sort parity and a Candidate-D 12 GB GPU pool with shared Direct24/20 scratch sizing; the full Plot CLI still uses SYCL host orchestration. The native CUDA stages are **always selected when `XCHPLOT2_BUILD_CUDA=ON`** on this branch; there is no separate CUDA-core ON/OFF flag and no old runtime ON/OFF switches are restored.
 
+### CUDA-only Stage 3: independent GPU compute runner (unverified)
+
+The new `tools/native_cuda_only/pipeline_main.cu` and
+`src/gpu/NativeCudaStandalonePipeline.cpp` link a **SYCL-free** k28/s6
+Xs→T1→T2→T3 execution path. It uses the Candidate-D 8.172 GiB pooled
+layout, native CUB sorts, Direct24/Direct20 match indices and a
+Windows CNG SHA-256 Feistel key schedule. Run `native_cuda_pipeline.exe --plan`
+without allocating the full GPU pool; `--run` explicitly opts into
+a full RTX 4070 SUPER computation and reports match counts plus the
+SHA-256 of sorted T3 fragments. The updated `native_cuda_smoke`
+tests Feistel key derivation using independent SHA-256 reference vectors.
+
+**Stage 3 has not yet been built or tested on hardware.**
+This tool **does not write `.gplot` or perform Full Proof validation**.
+The production plot CLI is still the prior verified CUDA GPU-core /
+SYCL-host hybrid; it is not replaced. See
+[Stage 3 implementation and one-line commands](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
+
 ### Measured progress
 
 | Iteration | Steady-state time | What changed |

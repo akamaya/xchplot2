@@ -604,12 +604,14 @@ size_t write_plot_file_parallel(
     auto const after_write=WriterClock::now();
     if (std::fflush(guard.out) != 0)
         throw std::runtime_error("Failed to flush " + partial);
+    auto const after_fflush=WriterClock::now();
 #ifdef _WIN32
     if (::_commit(fd) != 0)
 #else
     if (::fsync(fd) != 0)
 #endif
         throw std::runtime_error("Failed to sync " + partial);
+    auto const after_commit=WriterClock::now();
     if (std::fclose(std::exchange(guard.out, nullptr)) != 0)
         throw std::runtime_error("Failed to close " + partial);
     auto const after_sync=WriterClock::now();
@@ -636,12 +638,15 @@ size_t write_plot_file_parallel(
         auto const finished=WriterClock::now();
         std::fprintf(stderr,
             "[writer-phase] boundary=%.3f compress=%.3f write=%.3f "
-            "flush_sync=%.3f publish=%.3f total=%.3f ms "
+            "fflush=%.3f fsync_commit=%.3f fclose=%.3f "
+            "publish=%.3f total=%.3f ms "
             "size=%.2f MiB threads=%u\n",
             to_ms(writer_started,after_boundaries),
             to_ms(after_boundaries,after_compression),
             to_ms(after_compression,after_write),
-            to_ms(after_write,after_sync),
+            to_ms(after_write,after_fflush),
+            to_ms(after_fflush,after_commit),
+            to_ms(after_commit,after_sync),
             to_ms(after_sync,finished),
             to_ms(writer_started,finished),
             double(bytes_written)/double(1ull<<20),thread_count);

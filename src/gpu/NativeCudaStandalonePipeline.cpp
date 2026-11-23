@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace pos2gpu {
 namespace {
@@ -115,7 +116,8 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
 }
 
 NativeCudaPipelineResult native_cuda_run_k28s6(
-    std::array<uint8_t,32> const& plot_id,int ordinal)
+    std::array<uint8_t,32> const& plot_id,int ordinal,
+    std::vector<uint64_t>* out_sorted_fragments)
 {
     auto const started=std::chrono::steady_clock::now();
     NativeCudaPool pool(ordinal);
@@ -270,6 +272,18 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
             fragments_in,fragments_out,t3_count,0,56);
         std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
         auto const digests=digest_fragments(pool,fragments_out,t3_count);
+        if (out_sorted_fragments) {
+            // Only the explicit CPU .gplot writer bridge requests the raw
+            // sorted output. The native compute-only runner keeps its
+            // original 8 MiB tiled digest path, with no huge host buffer.
+            // This allocation is pageable (not pinned), so it fits a 128 GB
+            // workstation without claiming another ~2 GiB of locked RAM.
+            if (t3_count > SIZE_MAX / sizeof(uint64_t))
+                throw std::runtime_error("CUDA-only fragment capture size overflow");
+            out_sorted_fragments->resize(static_cast<size_t>(t3_count));
+            session.copy_d2h(out_sorted_fragments->data(), fragments_out,
+                             static_cast<size_t>(t3_count)*sizeof(uint64_t));
+        }
         NativeCudaPipelineResult result{};
         result.t1_count=t1_count;
         result.t2_count=t2_count;

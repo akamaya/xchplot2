@@ -111,6 +111,11 @@ int main(int argc,char** argv) {
         std::printf("[cuda-only] Candidate D VRAM planned=%.3f GiB (excl. 128 MiB margin)\n",
             p.device_bytes()/double(1ull<<30));
         if(!run) {
+            if(explicit_group_id) {
+                std::printf("[cuda-only] group-derived plot ID: ");
+                print_hex(plot_id.data(),plot_id.size());
+                std::puts("");
+            }
             std::puts("[cuda-only] PLAN OK (no large VRAM allocation)");
             std::puts("[cuda-only] Use --run to execute the full experimental GPU pipeline");
             return 0;
@@ -125,6 +130,11 @@ int main(int argc,char** argv) {
             (unsigned long long)result.t3_count,result.seconds);
         std::printf("[cuda-only] sorted T3 fragment SHA256=");
         print_hex(result.sha256_fragments.data(),result.sha256_fragments.size());
+        std::puts("");
+        std::printf("[cuda-only] canonical unique T3 fragments=%llu SHA256=",
+            static_cast<unsigned long long>(result.unique_t3_count));
+        print_hex(result.sha256_unique_fragments.data(),
+                  result.sha256_unique_fragments.size());
         std::puts("");
         std::puts("[cuda-only] COMPUTE OK (not a Full Proof validation)");
         return 0;

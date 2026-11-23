@@ -868,7 +868,7 @@ if(XCHPLOT2_BUILD_CUDA)
         src/gpu/DeviceMemCuda.cu
         src/gpu/SortCuda.cu)
     if(XCHPLOT2_NATIVE_CUDA_MATCH)
-        list(APPEND POS2_GPU_CUDA_SRC src/gpu/NativeCudaMatch.cu src/gpu/NativeCudaIndex.cu src/gpu/NativeCudaXs.cu src/gpu/NativeCudaPipeline.cu)
+        list(APPEND POS2_GPU_CUDA_SRC src/gpu/NativeCudaMatch.cu src/gpu/NativeCudaIndex.cu src/gpu/NativeCudaXs.cu src/gpu/NativeCudaPipeline.cu src/gpu/NativeCudaPeer.cu)
     endif()
     # SortSyclCub.cpp is the SYCL-typed adapter that bridges
     # sycl::queue → CUB. SortCuda.cu used to provide the SYCL-typed

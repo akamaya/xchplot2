@@ -7,6 +7,9 @@
 #include "gpu/TwoLevelSort.cuh"
 #include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+#include "gpu/NativeCudaTwoLevel.hpp"
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -44,6 +47,13 @@ void launch_histogram(
     uint64_t count, int top_bit_offset, int num_top_bits,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_two_level_histogram(d_keys,d_hist,count,top_bit_offset,num_top_bits);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {
@@ -70,6 +80,13 @@ void launch_partition(
     uint64_t count, int top_bit_offset, int num_top_bits,
     sycl::queue& q)
 {
+#ifdef XCHPLOT2_NATIVE_CUDA_MATCH
+    if (count && q.get_device().get_backend() == sycl::backend::cuda) {
+        q.wait();
+        cuda_two_level_partition(d_keys_in,d_vals_in,d_keys_part,d_vals_part,d_cursors,count,top_bit_offset,num_top_bits);
+        return;
+    }
+#endif
     q.parallel_for(
         sycl::nd_range<1>{ global_for(count), kThreads },
         [=](sycl::nd_item<1> it) {

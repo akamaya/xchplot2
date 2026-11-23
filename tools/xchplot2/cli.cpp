@@ -214,7 +214,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "  " << prog << " fragments-hash FILE   (reference decoded T3 SHA256)\n"
         << "  " << prog << " test <group_id_hex> [plot_index] [meta_group] [verbose]\n"
         << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
-        << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
+        << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"        << "         [--native-cuda] [--fragment-digest] (test-only diagnostic options)\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
         << "         [-r|--resume] [--continue-on-error]\n"
         << "         [--progress|--no-progress] [-d|--devices <SPEC>]\n"
@@ -456,7 +456,9 @@ void print_command_help(char const* prog, std::string_view command, std::ostream
             "  -N, --out-name NAME  output filename\n"
             "  --raw               write a temporary group member\n"
             "  -G, --gpu-all       run all phases on the GPU\n"
-            "  -P, --profile       request phase timing\n";
+            "  -P, --profile       request phase timing\n"
+            "  --native-cuda       experimental CUDA-only Xs-T3 GPU compute; existing CPU writer\n"
+            "  --fragment-digest   print SHA256 of raw sorted T3 stream before .gplot compression\n";
     else if (command == "fragments-hash")
         out << " FILE\n"
             "Decode a single-member .gplot, print sorted T3 fragment count and SHA256.\n"
@@ -3540,6 +3542,15 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
             opts.t1 = opts.t2 = opts.t3 = pos2gpu::PhaseStrategy::Gpu;
         }
         else if  (a == "--profile"   || a == "-P") opts.profile = true;
+        else if (a == "--native-cuda") {
+            // Separate test-only native compute backend. Never change the
+            // default plotting/batch pipeline's GPU implementation.
+            opts.native_cuda_test = true;
+            opts.t1 = pos2gpu::PhaseStrategy::Gpu;
+            opts.t2 = pos2gpu::PhaseStrategy::Gpu;
+            opts.t3 = pos2gpu::PhaseStrategy::Gpu;
+        }
+        else if (a == "--fragment-digest") opts.fragment_digest = true;
         else if ((a == "--out"       || a == "-o") && i + 1 < argc) {
             output_dir = argv[++i];
         }

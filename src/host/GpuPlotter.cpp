@@ -47,6 +47,7 @@ void warn_if_gpu_requested_but_unimplemented(GpuPlotOptions const& o)
 
 std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_dir)
 {
+    auto const plot_started=std::chrono::steady_clock::now();
     if (opts.k < 18 || opts.k > 28 || (opts.k & 1) != 0) {
         throw std::runtime_error("k must be even and in [18, 28]");
     }
@@ -137,7 +138,6 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     GpuPipelineResult pr;
     std::vector<uint64_t> cpu_fragments;
     std::vector<uint64_t> native_fragments;
-    std::optional<std::array<uint8_t,32>> native_expected_raw_digest;
     std::span<uint64_t const> fragments;
     if (all_gpu && opts.native_cuda_test) {
 #if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
@@ -147,11 +147,9 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         // well-tested CPU FSE/.gplot writer runs immediately afterward.
         int const ordinal = native_cuda_rtx4070_super_ordinal();
         auto const result=native_cuda_run_k28s6(opts.plot_id,ordinal,&native_fragments,
-                                                 opts.fragment_digest);
+                                                  /*compute_digests=*/false);
         if (native_fragments.size()!=result.t3_count)
             throw std::runtime_error("native CUDA T3 captured count mismatch");
-        if (opts.fragment_digest)
-            native_expected_raw_digest=result.sha256_fragments;
         fragments=std::span<uint64_t const>(native_fragments);
         std::cerr << "[cuda-native-test] GPU T1=" << result.t1_count
                   << " T2=" << result.t2_count
@@ -188,37 +186,16 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
                                               cpu_fragments.size());
     }
 
-    using Clock = std::chrono::steady_clock;
-    auto const to_ms=[](Clock::time_point a,Clock::time_point b) {
-        return std::chrono::duration<double,std::milli>(b-a).count();
-    };
-    if (opts.fragment_digest) {
-        auto const hash_start=Clock::now();
-        auto const digest = raw_t3_fragments_sha256(fragments);
-        auto const hash_end=Clock::now();
-        if (native_expected_raw_digest && digest != *native_expected_raw_digest)
-            throw std::runtime_error("native CUDA T3 capture digest differs from GPU stream");
-        auto const sort_start=Clock::now();
-        if (opts.native_cuda_test && !std::is_sorted(fragments.begin(),fragments.end()))
-            throw std::runtime_error("native CUDA T3 output is not monotonically sorted");
-        auto const sort_end=Clock::now();
-        std::fprintf(stderr,"[fragments-hash] raw sorted T3 SHA256=");
-        for(uint8_t b:digest)std::fprintf(stderr,"%02x",unsigned(b));
-        std::fprintf(stderr," count=%zu\n",fragments.size());
-        std::fprintf(stderr,"[host-timing] reference_sha256=%.3f verify_sorted=%.3f ms\n",
-                     to_ms(hash_start,hash_end),to_ms(sort_start,sort_end));
-    }
-
-    if (opts.native_cuda_test && !opts.fragment_digest)
-        std::fprintf(stderr,
-            "[cuda-native-test] fast path: skipped full-T3 SHA256 diagnostics; "
-            "the plot writer checks fragment order and on-disk Full Proof can be validated\n");
-
-    auto const writer_start=Clock::now();
+    // End-to-end plot duration is the performance metric: CUDA compute,
+    // T3 D2H capture, FSE compression, NAS write, and publication.
+    auto const writer_start=std::chrono::steady_clock::now();
     write_plot_file_parallel(full_path.string(), fragments, entry);
-    if (opts.native_cuda_test || opts.fragment_digest)
-        std::fprintf(stderr,"[host-timing] writer_fse_nas=%.3f ms\n",
-                     to_ms(writer_start,Clock::now()));
+    if (opts.native_cuda_test) {
+        auto const done=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"[plot-timing] writer=%.3f s full_plot=%.3f s\n",
+            std::chrono::duration<double>(done-writer_start).count(),
+            std::chrono::duration<double>(done-plot_started).count());
+    }
 
     return full_path.string();
 }

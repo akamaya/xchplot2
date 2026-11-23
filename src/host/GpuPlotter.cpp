@@ -26,6 +26,12 @@
 #include <iostream>
 #include <span>
 #include <memory>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <stdexcept>
 #include <vector>
 
@@ -200,6 +206,166 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     }
 
     return full_path.string();
+}
+
+
+void plot_native_cuda_series(
+    GpuPlotOptions const& opts, std::string const& output_dir, unsigned count)
+{
+#if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
+    // The test batch deliberately has NO secret memo input. Unlike the
+    // generic farming batch it only writes dummy-memo single-member groups.
+    if (!opts.native_cuda_test || !opts.memo.empty() || opts.raw ||
+        opts.k!=28 || opts.strength!=6 || opts.plot_index!=0 ||
+        opts.testnet || count<2 || count>100)
+        throw std::invalid_argument(
+            "native CUDA test batch requires k28/s6, 2..100 plots, "
+            "index=0, no raw mode and NO private-key memo");
+    if(!opts.out_name.empty() &&
+       (std::filesystem::path(opts.out_name).has_parent_path() ||
+        std::filesystem::path(opts.out_name).extension()!=".gplot"))
+        throw std::invalid_argument(
+            "native CUDA batch filename prefix must be a .gplot basename");
+
+    struct Job {
+        BatchEntry entry;
+        std::string path;
+    };
+    std::vector<Job> jobs;
+    jobs.reserve(count);
+    std::filesystem::create_directories(output_dir);
+    for(unsigned i=0;i<count;++i) {
+        auto group_id=opts.group_id;
+        // Deterministic, public per-member identity. Plot 0 retains the
+        // seed group ID; plot i XORs a big-endian 64-bit index into its tail.
+        // Each group is a single-member group (plot_index remains 0).
+        for(unsigned byte=0;byte<8;++byte)
+            group_id[31-byte]^=uint8_t((uint64_t(i)>>(byte*8))&255u);
+        BatchEntry entry;
+        entry.k=28;
+        entry.strength=6;
+        entry.plot_index=0;
+        entry.meta_group=opts.meta_group;
+        entry.raw=false;
+        entry.group_id=group_id;
+        entry.plot_id=plot_id_for_group(group_id,0,uint8_t(opts.meta_group));
+        entry.memo.assign(112,0);
+        entry.out_dir=output_dir;
+        std::string const stem=opts.out_name.empty()
+            ? std::string("native_cuda_test")
+            : std::filesystem::path(opts.out_name).stem().string();
+        entry.out_name=stem+"_"+std::to_string(i)+".gplot";
+        validate_batch_entry(entry);
+        auto path=(std::filesystem::path(output_dir)/entry.out_name).string();
+        if(std::filesystem::exists(path))
+            throw std::runtime_error("native CUDA batch refuses existing plot: "+path);
+        jobs.push_back(Job{std::move(entry),std::move(path)});
+    }
+
+    using Clock=std::chrono::steady_clock;
+    auto const started=Clock::now();
+    // Original batch contract: construct the shared FSE pool on the
+    // producer thread before the consumer starts (thread-priority safety).
+    warm_writer_pool();
+    NativeCudaPlotSession session(native_cuda_rtx4070_super_ordinal());
+    struct Ready {
+        unsigned index=0;
+        int slot=0;
+        NativeCudaPlotFrame frame{};
+    };
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Ready> ready;
+    bool busy[2]{false,false};
+    bool producer_closed=false;
+    std::exception_ptr writer_error;
+    unsigned completed=0;
+    std::thread consumer([&] {
+        try {
+            for(;;) {
+                Ready item;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock,[&] { return producer_closed || !ready.empty(); });
+                    if(ready.empty())break;
+                    item=std::move(ready.front());
+                    ready.pop_front();
+                }
+                auto const wstart=Clock::now();
+                write_plot_file_parallel(
+                    jobs[item.index].path,item.frame.fragments,
+                    jobs[item.index].entry);
+                double const write_seconds=std::chrono::duration<double>(
+                    Clock::now()-wstart).count();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    busy[item.slot]=false; // the consumer no longer reads it
+                    ++completed;
+                }
+                cv.notify_all();
+                std::fprintf(stderr,
+                    "[cuda-batch] wrote %u/%u, writer=%.3f s: %s\n",
+                    item.index+1,count,write_seconds,jobs[item.index].path.c_str());
+            }
+        } catch(...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                writer_error=std::current_exception();
+                producer_closed=true;
+            }
+            cv.notify_all();
+        }
+    });
+
+    std::exception_ptr producer_error;
+    try {
+        for(unsigned i=0;i<count;++i) {
+            int const slot=int(i&1u);
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock,[&] { return !busy[slot] || bool(writer_error); });
+                if(writer_error)std::rethrow_exception(writer_error);
+                busy[slot]=true;
+            }
+            auto const gpu_start=Clock::now();
+            auto frame=session.generate(jobs[i].entry.plot_id,slot);
+            std::fprintf(stderr,
+                "[cuda-batch] GPU %u/%u T1=%llu T2=%llu T3=%llu elapsed=%.3f s\n",
+                i+1,count,
+                static_cast<unsigned long long>(frame.stats.t1_count),
+                static_cast<unsigned long long>(frame.stats.t2_count),
+                static_cast<unsigned long long>(frame.stats.t3_count),
+                std::chrono::duration<double>(Clock::now()-gpu_start).count());
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if(writer_error)std::rethrow_exception(writer_error);
+                ready.push_back(Ready{i,slot,std::move(frame)});
+            }
+            cv.notify_all();
+        }
+    } catch(...) {
+        producer_error=std::current_exception();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        producer_closed=true;
+    }
+    cv.notify_all();
+    consumer.join(); // never free pinned slots while writer may read them
+    if(producer_error)std::rethrow_exception(producer_error);
+    if(writer_error)std::rethrow_exception(writer_error);
+    if(completed!=count)
+        throw std::runtime_error("native CUDA batch did not publish all plots");
+    auto const elapsed=std::chrono::duration<double>(
+        Clock::now()-started).count();
+    std::fprintf(stderr,
+        "[cuda-batch] complete=%u wall=%.3f s throughput=%.3f s/plot "
+        "(including startup and final writer drain)\n",
+        completed,elapsed,elapsed/double(completed));
+#else
+    (void)opts;(void)output_dir;(void)count;
+    throw std::runtime_error("native CUDA test batch requires Windows CUDA build");
+#endif
 }
 
 } // namespace pos2gpu

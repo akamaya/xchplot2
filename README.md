@@ -46,6 +46,16 @@ canonical T3 SHA256, and a hybrid reference plot. Run the
 after rebuilding both binaries; it refuses to overwrite an existing
 reference plot. This is a **correctness check**, not another OFF benchmark.
 
+**Performance note (RTX 4070 SUPER):** measured native CUDA 26.947 s
+included 1.773 s of full-T3 Windows CNG SHA256 passes and 0.139 s of
+deduplication. Native Xs/T1/T2/T3 and CUB sorting totaled ~24.36 s;
+D2H took ~0.658 s. The `test --native-cuda` writer bridge now
+**skips both full-T3 SHA passes and the dedup scan by default**.
+Add `--fragment-digest` to perform the earlier independent hash
+verification when comparing backends. Fast path is unverified on
+Windows; rerun `verify --full` on newly generated test plots.
+See the [measured breakdown](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
+
 ### CUDA-only Stage 4: experimental native GPU -> existing CPU plot writer
 
 The Windows CUDA-core branch now has an opt-in

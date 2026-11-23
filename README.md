@@ -19,56 +19,38 @@ This branch is based on `refactor/always-on-verified-gpu-optimizations-20261123`
 
 See the [CUDA core port details, build and verification checklist](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md). A standalone [nvcc-only smoke test](tools/native_cuda_only/CMakeLists.txt) already passed native CUDA runtime, AES Xs **4096/4096**, auxiliary kernels and pinned-memory checks without AdaptiveCpp. The next, **unverified Stage 2**, adds native CUB-sort parity and a Candidate-D 12 GB GPU pool with shared Direct24/20 scratch sizing; the full Plot CLI still uses SYCL host orchestration. The native CUDA stages are **always selected when `XCHPLOT2_BUILD_CUDA=ON`** on this branch; there is no separate CUDA-core ON/OFF flag and no old runtime ON/OFF switches are restored.
 
-### CUDA-only Stage 3: independent GPU compute runner (unverified)
+### CUDA-only RTX 4070 SUPER test plotting
 
-The new `tools/native_cuda_only/pipeline_main.cu` and
-`src/gpu/NativeCudaStandalonePipeline.cpp` link a **SYCL-free** k28/s6
-Xs→T1→T2→T3 execution path. It uses the Candidate-D 8.172 GiB pooled
-layout, native CUB sorts, Direct24/Direct20 match indices and a
-Windows CNG SHA-256 Feistel key schedule. Run `native_cuda_pipeline.exe --plan`
-without allocating the full GPU pool; `--run` explicitly opts into
-a full RTX 4070 SUPER computation and reports match counts plus the
-SHA-256 of sorted T3 fragments. The updated `native_cuda_smoke`
-tests Feistel key derivation using independent SHA-256 reference vectors.
+The independent CUDA Xs→T1→T2→T3 engine uses Candidate D (8.172 GiB
+VRAM) and native CUB, with no SYCL GPU orchestration. The optional
+`xchplot2 test GROUP_ID --native-cuda` bridge passes its sorted output
+directly to the existing CPU FSE writer to create a dummy-memo
+(non-farmable) `.gplot`. The final executable still links the hybrid
+runtime for other code paths.
 
-**Stage 3 has not yet been built or tested on hardware.**
-This tool **does not write `.gplot` or perform Full Proof validation**.
-The production plot CLI is still the prior verified CUDA GPU-core /
-SYCL-host hybrid; it is not replaced. See
-[Stage 3 implementation and one-line commands](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
+**Verified result:** this CUDA test writer produced a complete NAS
+`.gplot` and passed 109/109 Full Proof checks on 100 trials.
+The native GPU pipeline itself measured 26.947 seconds before removing
+redundant diagnostics: T1 index+match 7.519s, T2 7.944s, T3 8.247s,
+D2H 0.658s. Two whole-T3 SHA-256 passes and a full dedup scan
+accounted for another ~1.912s, **unrelated to GPU kernels**.
 
-**RTX 4070 SUPER Stage 3 success:** native CUDA-only Xs→T1→T2→T3
-completed in 25.987 seconds, with T1/T2/T3 counts
-268396548/268356064/268266000. Full proof correctness is still pending.
-The next committed validation uses a shared Group ID, an independently decoded
-canonical T3 SHA256, and a hybrid reference plot. Run the
-[one-shot parity script](scripts/test/cuda_only_t3_parity_20261123.ps1)
-after rebuilding both binaries; it refuses to overwrite an existing
-reference plot. This is a **correctness check**, not another OFF benchmark.
+**Plot generation no longer includes fragment SHA-256 comparisons.**
+The `--fragment-digest` generation flag and raw SHA preflight have
+been removed. `test --native-cuda` only computes Xs→T3, transfers
+the sorted fragments, FSE-compresses and writes them to disk.
+Its `[plot-timing]` line reports the **entire plot duration including
+FSE and NAS write**, not just the GPU stages.
 
-**Performance note (RTX 4070 SUPER):** measured native CUDA 26.947 s
-included 1.773 s of full-T3 Windows CNG SHA256 passes and 0.139 s of
-deduplication. Native Xs/T1/T2/T3 and CUB sorting totaled ~24.36 s;
-D2H took ~0.658 s. The `test --native-cuda` writer bridge now
-**skips both full-T3 SHA passes and the dedup scan by default**.
-Add `--fragment-digest` to perform the earlier independent hash
-verification when comparing backends. Fast path is unverified on
-Windows; rerun `verify --full` on newly generated test plots.
-See the [measured breakdown](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
+After generation, validate independently with
+`xchplot2 verify FILE --full --trials 100`. Optional post-generation
+`xchplot2 fragments-hash FILE` is read-only and is never called
+by the generator. The standalone `native_cuda_pipeline.exe` continues
+to exist as a **separate diagnostic program** that hashes GPU fragments,
+not as the regular plot-generation path.
 
-### CUDA-only Stage 4: experimental native GPU -> existing CPU plot writer
-
-The Windows CUDA-core branch now has an opt-in
-`xchplot2 test GROUP_ID --native-cuda` path: Xs/T1/T2/T3 run
-without SYCL GPU orchestration and the existing CPU FSE writer
-then emits a test-only `.gplot`. It compares the captured 2+GiB raw
-fragment stream's SHA256 with the native CUDA streaming digest
-before writing. Use `--fragment-digest` with the normal hybrid
-`test -G` on the same Group ID to compare exact raw T3 streams.
-**Stage 4 is committed but not yet built or Full Proof-verified.**
-The `xchplot2` executable still links SYCL, and the `test` command
-produces dummy-memo unfarmable plots. See
-[Stage 4 validation](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
+**The streamlined generation build still awaits an RTX 4070 SUPER test.**
+See [native CUDA milestones and timings](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
 
 ### Measured progress
 

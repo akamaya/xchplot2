@@ -34,6 +34,7 @@
 | **Candidate D: pooled Xs/T1/T2 buffer remapping** | **26.08 s/plot (10 plots)** | **788.28 MiB** further saving; D OFF/ON 26.08 / 26.08 s/plot; 214/214 full proofs PASS |
 | **T1 Direct24 exact match** | **25.96 s/plot (10 plots)** | Direct24 build ~18.8 ms, 89/89 full proofs PASS; pool 8,336 MiB |
 | **T1 Direct24 + T2/T3 Direct20 exact match** | **25.56 s/plot (10 plots)** | ~0.40 s faster vs T1 Direct24-only; 87/87 full proofs PASS; pool 8,368 MiB |
+| **AES Experiment A: partial AES final round (T1/T2/T3)** | **25.18 s/plot (10 plots)** | 25.53 to 25.18 s/plot (-0.35 s, -1.37%); T2 -164 ms, T3 -189 ms; 90/90 full proofs PASS; `POS2GPU_AES_LAST_ROUND_PARTIAL=1` |
 
 **Earlier Candidate D 10-plot steady-state (2026-11-23):** **26.08 s/plot**
 with Candidates A+B+C+D enabled, after one excluded warmup (RTX 4070 SUPER,
@@ -240,6 +241,7 @@ Full-proof checks sample random challenges; they do **not** exhaustively certify
 - [T2 Local Compaction / Tezcan implementation and parity checks (Japanese)](docs/t2_gpu_optimization_2026-11-20.md)
 - [T3 Local Compaction / Tezcan implementation and proof verification (Japanese)](docs/t3_gpu_optimization_2026-11-20.md)
 - [AES experiments and production A/B (Shared16 direct-address adopted on T2/T3; rejected BitSlice / ILP / MIO / Hybrid / PairTable candidates)](docs/AES_EXPERIMENTS_2026-11-21.md)
+- [AES Experiment A: final-round partial computation, k28/s6 benchmark, and 90/90 full-proof validation (2026-11-23)](docs/AES_LAST_ROUND_PARTIAL_2026-11-23.md)
 - [Fine Bucket 16+4-bit direct lookup, 10-plot benchmarks (Japanese)](docs/FINE_BUCKET_OPTIMIZATION_2026-11-21.md)
 - [T1/T2/T3 candidate-capacity tuning, occupancy analysis (Japanese)](docs/GPU_PAIR_CAP_T1_T3_2026-11-21.md)
 - [AES V4INIT: research, SASS, 2-pair A/B and full-proof validation (Japanese)](docs/AES_V4INIT_OPTIMIZATION_2026-11-21.md)

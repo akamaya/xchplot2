@@ -1,5 +1,56 @@
 # RTX 4070 SUPER k28/s6 — CUDA core migration (2026-11-23)
 
+## Current generation path — speed-only; validation runs AFTER writing
+
+The user explicitly prioritizes **complete plot-generation time**, including
+CUDA compute, T3 transfer, CPU FSE compression, and NAS write. The
+pre-write SHA256 parity check was a design error: it scanned the full
+~2-GiB T3 stream three times and added ~1.912 s inside native CUDA
+compute before file writing, plus a separate slow software SHA256 on
+the host. Generation must not pay this cost.
+
+`xchplot2 test GROUP_ID --native-cuda` now ALWAYS uses the fast
+T3 D2H capture path (`compute_digests=false`), with no whole-T3 SHA256
+or dedup scan during generation. The `--fragment-digest` option and
+`raw_t3_fragments_sha256` preflight have been **removed**, not simply
+disabled. The ordinary Writer's already-required sortedness/range
+validation remains. The program now prints:
+
+- `[cuda-native-test] ... compute+capture=...s`
+- `[plot-timing] writer=...s full_plot=...s`
+
+`full_plot` starts at `plot_to_file` entry and ends after successful
+on-disk Writer completion/publication, including FSE and NAS time.
+
+**Do not use the historical commands below containing
+`--fragment-digest`; they have been superseded.** The independent,
+read-only `xchplot2 fragments-hash FILE` command and
+`xchplot2 verify FILE --full --trials 100` remain available for
+**post-generation** validation. The separate
+`native_cuda_pipeline.exe` remains a diagnostic compute-only executable
+and still performs SHA256 when invoked standalone; it is NOT used by
+the file-generation CLI.
+
+This removal and end-to-end timer have been committed, but have not
+yet been compiled and tested on Windows.
+
+### Build and measure a complete plot (VS2022 Developer PowerShell)
+
+~~~powershell
+cd C:\dev\xchplot2; git pull --ff-only origin cuda/nvidia-12gb-k28s6; if ($LASTEXITCODE -ne 0) { throw 'Git update failed' }; cmake --build .\build\windows-cuda-core --target xchplot2 -j 16; if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+~~~
+
+~~~powershell
+cd C:\dev\xchplot2; $dir='\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4'; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe test ('0'*64) --native-cuda -o $dir -N stage4_native_cuda_speed_v2.gplot; if ($LASTEXITCODE -ne 0) { throw 'Full plot generation failed' }
+~~~
+
+Afterward, separately:
+
+~~~powershell
+cd C:\dev\xchplot2; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe verify '\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4\stage4_native_cuda_speed_v2.gplot' --full --trials 100; if ($LASTEXITCODE -ne 0) { throw 'Post-generation Full Proof failed' }
+~~~
+
+
 ## Status and provenance
 
 - **Base**: refactor/always-on-verified-gpu-optimizations-20261123 at `f6646911faf1a793532abbd06cf55e2696bbe046` (not main).

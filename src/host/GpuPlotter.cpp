@@ -56,6 +56,18 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots; omit --testnet");
     if (!opts.raw && opts.plot_index != 0)
         throw std::invalid_argument("single-plot groups must start at plot index 0; use --raw for group members");
+    // The independent native CUDA path is deliberately limited to
+    // public, non-farmable test plots. Never accept a caller-provided
+    // secret-bearing memo (including a farmer master SK) in this path.
+    // Validate before GPU work or creating any output directory.
+    if (opts.native_cuda_test) {
+        if (!opts.memo.empty())
+            throw std::invalid_argument(
+                "native CUDA test is test-only: secret-bearing --memo is not supported");
+        if (opts.k != 28 || opts.strength != 6)
+            throw std::invalid_argument("native CUDA test supports only k28/s6");
+    }
+
 
     // Build output filename. Caller may override via opts.out_name (used
     // by integrations). Default includes the group identity and parameters.

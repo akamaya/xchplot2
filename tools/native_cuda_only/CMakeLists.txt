@@ -13,6 +13,7 @@ find_package(CUDAToolkit REQUIRED)
 get_filename_component(_x2_root "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 add_executable(native_cuda_smoke
     smoke.cu
+    "${_x2_root}/src/gpu/NativeCudaRuntime.cpp"
     "${_x2_root}/src/gpu/NativeCudaXs.cu"
     "${_x2_root}/src/gpu/NativeCudaIndex.cu"
     "${_x2_root}/src/gpu/NativeCudaPipeline.cu"

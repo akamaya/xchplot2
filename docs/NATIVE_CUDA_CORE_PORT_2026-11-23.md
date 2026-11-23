@@ -428,3 +428,74 @@ kernels. If GPU phases match the old hybrid run, first remove unnecessary
 full-T3 digest/scan passes and pool startup from the production
 timing, then compare properly warmed continuous throughput. Do not
 mix full-proof validation, a cold single plot, and steady-state results.
+
+
+## 2026-11-23: measured CUDA-only 26.947s breakdown and SHA regression fix
+
+Independent RTX 4070 SUPER / k28/s6 / 32-zero Group ID measurements:
+
+| Segment | Time |
+| --- | ---: |
+| Native pool setup | 13.195 ms |
+| Xs generate+sort | 288.145 ms |
+| T1 index+match | 7519.140 ms |
+| T1 sort | 78.516 ms |
+| T2 index+match | 7943.513 ms |
+| T2 sort+gather | 209.889 ms |
+| T3 index+match+Feistel | 8247.293 ms |
+| T3 sort | 76.736 ms |
+| T3 D2H pinned transfer | 657.633 ms |
+| Raw SHA256 (Windows CNG, entire T3) | 888.055 ms |
+| Dedup scan | 138.987 ms |
+| Unique SHA256 (Windows CNG, entire T3) | 884.720 ms |
+| Full run incl. diagnostics | **26.947 s** |
+
+**Root cause of the pre-writer regression:** the diagnostics added
+by Stage 3 execute two SHA256 passes on the ~2.0-GiB sorted T3
+result and deduplicate another ~268M elements, adding **1.912 s**.
+Without these diagnostic passes, the same observed run would be
+approximately **25.035 s** for compute, pool and D2H only,
+before pageable capture, FSE compression or NAS write.
+The tested native T1/T2/T3 kernel times themselves are close to
+the fastest historical hybrid times. Treat any comparison with
+25.13 s/plot *steady-state batch throughput* as non-equivalent,
+and do not attribute the post-compute software SHA or Writer
+times to GPU matching kernels.
+
+### Fix: opt-in full-T3 digest for standalone/batch bridge
+
+`native_cuda_run_k28s6` now has a `compute_digests` boolean
+parameter (defaults to true, to preserve the existing standalone
+`native_cuda_pipeline.exe --run` diagnostics and SHA baseline).
+The normal `xchplot2 test --native-cuda` bridge explicitly sets it to
+false unless `--fragment-digest` is supplied. In its fast path,
+the existing 8-MiB pinned tiles transfer raw T3 to a pageable host
+vector without SHA256 or dedup scan. It emits
+`[cuda-transfer] mode=fast` and the same `[cuda-phase]` timings.
+The Writer still checks sorted fragments and uses the same FSE
+encoding; on-disk `verify --full` remains the correctness gate.
+The test still rejects all `--memo` / private-key input.
+
+The second independent CPU SHA256 pass in `GpuPlotter.cpp` is
+also skipped unless `--fragment-digest` is explicitly enabled.
+With that flag the full original raw/unique SHA parity checks are
+preserved. This changes diagnostics, not match kernels or sorting.
+**The fast code has been committed but has not yet been built or
+run on Windows.**
+
+Run in VS2022 Developer PowerShell after pulling the branch:
+
+~~~powershell
+cd C:\dev\xchplot2; git pull --ff-only origin cuda/nvidia-12gb-k28s6; if ($LASTEXITCODE -ne 0) { throw 'Git update failed' }; cmake --build .\build\windows-cuda-core --target xchplot2 -j 16; if ($LASTEXITCODE -ne 0) { throw 'Native bridge build failed' }
+~~~
+
+~~~powershell
+cd C:\dev\xchplot2; $dir='\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4'; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe test ('0'*64) --native-cuda -o $dir -N stage4_native_cuda_fast.gplot; if ($LASTEXITCODE -ne 0) { throw 'Fast CUDA-native plot failed' }
+~~~
+
+~~~powershell
+cd C:\dev\xchplot2; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe verify '\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4\stage4_native_cuda_fast.gplot' --full --trials 100; if ($LASTEXITCODE -ne 0) { throw 'Fast native Full Proof failed' }
+~~~
+
+Do not overwrite the earlier passing
+`stage4_native_cuda.gplot`, which provides a baseline artifact.

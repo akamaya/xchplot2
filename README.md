@@ -37,6 +37,15 @@ The production plot CLI is still the prior verified CUDA GPU-core /
 SYCL-host hybrid; it is not replaced. See
 [Stage 3 implementation and one-line commands](docs/NATIVE_CUDA_CORE_PORT_2026-11-23.md).
 
+**RTX 4070 SUPER Stage 3 success:** native CUDA-only Xs→T1→T2→T3
+completed in 25.987 seconds, with T1/T2/T3 counts
+268396548/268356064/268266000. Full proof correctness is still pending.
+The next committed validation uses a shared Group ID, an independently decoded
+canonical T3 SHA256, and a hybrid reference plot. Run the
+[one-shot parity script](scripts/test/cuda_only_t3_parity_20261123.ps1)
+after rebuilding both binaries; it refuses to overwrite an existing
+reference plot. This is a **correctness check**, not another OFF benchmark.
+
 ### Measured progress
 
 | Iteration | Steady-state time | What changed |

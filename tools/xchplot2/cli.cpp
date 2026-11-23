@@ -215,7 +215,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "  " << prog << " test <group_id_hex> [plot_index] [meta_group] [verbose]\n"
         << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
-        << "         [--native-cuda] (test-only GPU backend, no secrets)\n"
+        << "         [--native-cuda] (test-only GPU backend, no secrets)\n"        << "         [--count N] (native CUDA only: 2 pinned slots, GPU+FSE overlap)\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
         << "         [-r|--resume] [--continue-on-error]\n"
         << "         [--progress|--no-progress] [-d|--devices <SPEC>]\n"
@@ -458,7 +458,8 @@ void print_command_help(char const* prog, std::string_view command, std::ostream
             "  --raw               write a temporary group member\n"
             "  -G, --gpu-all       run all phases on the GPU\n"
             "  -P, --profile       request phase timing\n"
-            "  --native-cuda       test-only CUDA Xs-T3 + existing CPU writer; --memo not allowed\n";
+            "  --native-cuda       test-only CUDA Xs-T3 + existing CPU writer; --memo not allowed\n"
+            "  --count N           native CUDA test batch: unique group IDs, 2 pinned slots, overlapped FSE\n";
     else if (command == "fragments-hash")
         out << " FILE\n"
             "Decode a single-member .gplot, print sorted T3 fragment count and SHA256.\n"
@@ -3518,6 +3519,7 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     std::optional<bool> verbose_flag;
     bool quiet = false, literal = false;
     bool memo_option_seen = false;
+    int native_count = 1;
 
     // Strip flags from argv into a positional vector.
     std::vector<std::string> pos;
@@ -3551,6 +3553,9 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
             opts.t2 = pos2gpu::PhaseStrategy::Gpu;
             opts.t3 = pos2gpu::PhaseStrategy::Gpu;
         }
+        else if (a == "--count" && i + 1 < argc) {
+            if (!parse_integer_arg(argv[++i], native_count, "count")) return 1;
+        }
         else if ((a == "--out"       || a == "-o") && i + 1 < argc) {
             output_dir = argv[++i];
         }
@@ -3578,6 +3583,11 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
         std::cerr << "Error: unexpected argument: " << pos[4] << '\n'; return 1;
     }
 
+    if (native_count < 1 || native_count > 100 ||
+        (native_count != 1 && !opts.native_cuda_test)) {
+        std::cerr << "Error: --count requires --native-cuda and must be 1..100\n";
+        return 1;
+    }
     if (opts.native_cuda_test && memo_option_seen) {
         std::cerr << "Error: --native-cuda creates test-only plots; --memo / private-key plots are not supported\n";
         return 1;
@@ -3609,8 +3619,13 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     opts.plot_id = pos2gpu::plot_id_for_group(opts.group_id, uint16_t(opts.plot_index), uint8_t(opts.meta_group));
 
     try {
-        std::string out = pos2gpu::plot_to_file(opts, output_dir);
-        std::cout << "Wrote: " << out << "\n";
+        if(native_count>1) {
+            pos2gpu::plot_native_cuda_series(opts,output_dir,
+                                             static_cast<unsigned>(native_count));
+        } else {
+            std::string out = pos2gpu::plot_to_file(opts, output_dir);
+            std::cout << "Wrote: " << out << "\n";
+        }
     } catch (std::exception const& e) {
         std::cerr << "Plotting failed: " << e.what() << "\n";
         return 2;

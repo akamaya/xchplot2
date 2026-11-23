@@ -3518,6 +3518,7 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     std::string output_dir = ".";
     std::optional<bool> verbose_flag;
     bool quiet = false, literal = false;
+    bool memo_option_seen = false;
 
     // Strip flags from argv into a positional vector.
     std::vector<std::string> pos;
@@ -3556,6 +3557,7 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
             output_dir = argv[++i];
         }
         else if ((a == "--memo"      || a == "-m") && i + 1 < argc) {
+            memo_option_seen = true;
             std::string memo_hex = argv[++i];
             if (!parse_hex_bytes(memo_hex, opts.memo)) {
                 std::cerr << "Error: --memo must be even-length hex\n";
@@ -3576,6 +3578,11 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     }
     if (pos.size() > 4) {
         std::cerr << "Error: unexpected argument: " << pos[4] << '\n'; return 1;
+    }
+
+    if (opts.native_cuda_test && memo_option_seen) {
+        std::cerr << "Error: --native-cuda creates test-only plots; --memo / private-key plots are not supported\n";
+        return 1;
     }
 
     opts.k = 28;

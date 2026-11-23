@@ -19,11 +19,13 @@
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T1Offsets.cuh"
 #include "gpu/T1Direct24.hpp"
+#include "gpu/AesLastRoundSycl.hpp"
 
 #include <sycl/sycl.hpp>
 #include <chrono>
 #include <new>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace pos2gpu {
 
@@ -85,6 +87,44 @@ static inline Result128 tezcan_pairing(
     return Result128{{s.w[0], s.w[1], s.w[2], s.w[3]}};
 }
 
+
+// Experiment A: only the final AESENC round has fewer required words.
+static inline uint32_t tezcan_target_last(
+    const AesHashKeys& keys, uint32_t table_id, uint32_t match_key,
+    uint64_t meta, const uint32_t* t, int extra)
+{
+    AesState s = set_int_vec_i128(int32_t(meta >> 32), int32_t(meta),
+                                  int32_t(match_key), int32_t(table_id));
+    const int pairs = kAesMatchingTargetRounds << extra;
+    #pragma unroll 2
+    for (int r = 0; r < pairs - 1; ++r) {
+        s = tezcan_round(s, keys.round_key_1, t);
+        s = tezcan_round(s, keys.round_key_2, t);
+    }
+    s = tezcan_round(s, keys.round_key_1, t);
+    return aes_t0_last_word<0>(s, keys.round_key_2, t);
+}
+
+static inline Result128 tezcan_pairing_last(
+    const AesHashKeys& keys, uint64_t l, uint64_t r,
+    const uint32_t* t, int extra, uint32_t test_mask)
+{
+    AesState s = set_int_vec_i128(int32_t(r >> 32), int32_t(r),
+                                  int32_t(l >> 32), int32_t(l));
+    const int pairs = kAesPairingRounds << extra;
+    #pragma unroll 2
+    for (int i = 0; i < pairs - 1; ++i) {
+        s = tezcan_round(s, keys.round_key_1, t);
+        s = tezcan_round(s, keys.round_key_2, t);
+    }
+    s = tezcan_round(s, keys.round_key_1, t);
+    Result128 res{{0u, 0u, 0u, 0u}};
+    res.r[3] = aes_t0_last_word<3>(s, keys.round_key_2, t);
+    // T1 requires match_info (word 0) only for accepted pairs.
+    if ((res.r[3] & test_mask) == 0)
+        res.r[0] = aes_t0_last_word<0>(s, keys.round_key_2, t);
+    return res;
+}
 
 
 void launch_compute_bucket_offsets(
@@ -322,6 +362,13 @@ static void launch_t1_match_all_buckets_compact(
     uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
     size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
 
+    // Experiment A: independent of the Direct24/Direct20 index selection.
+    // Read on host and capture a uniform flag; OFF leaves original behavior.
+    bool const use_last_round_partial = [] {
+        const char* v = std::getenv("POS2GPU_AES_LAST_ROUND_PARTIAL");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
 
@@ -382,9 +429,7 @@ static void launch_t1_match_all_buckets_compact(
                 uint32_t count = 0;
                 if (l < l_end) {
                     x_l = d_sorted_xs[l].x;
-                    uint32_t target_l = pos2gpu::tezcan_target(
-                        keys_copy, 1u, match_key_r, uint64_t(x_l),
-                        sT, extra_rounds_bits) & target_mask;
+                    uint32_t target_l = (use_last_round_partial ? pos2gpu::tezcan_target_last(keys_copy, 1u, match_key_r, uint64_t(x_l), sT, extra_rounds_bits) : pos2gpu::tezcan_target(keys_copy, 1u, match_key_r, uint64_t(x_l), sT, extra_rounds_bits)) & target_mask;
                     if (use_direct24) {
                         uint64_t const key =
                             (uint64_t(r_bucket) << 24) | target_l;
@@ -416,8 +461,7 @@ static void launch_t1_match_all_buckets_compact(
                 uint32_t info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
                                                                 : ((1u << num_match_info_bits) - 1u);
                 auto emit = [&](uint32_t a, uint32_t b) {
-                    Result128 res = pos2gpu::tezcan_pairing(
-                        keys_copy, uint64_t(a), uint64_t(b), sT, extra_rounds_bits);
+                    Result128 res = (use_last_round_partial ? pos2gpu::tezcan_pairing_last(keys_copy, uint64_t(a), uint64_t(b), sT, extra_rounds_bits, test_mask) : pos2gpu::tezcan_pairing(keys_copy, uint64_t(a), uint64_t(b), sT, extra_rounds_bits));
                     if ((res.r[3] & test_mask) != 0) return;
                     sycl::atomic_ref<unsigned long long,
                                      sycl::memory_order::relaxed,
@@ -552,6 +596,13 @@ void launch_t1_match_all_buckets(
     uint32_t bucket_end,
     sycl::queue& q)
 {
+    // A and B both specialize T1 target; measure them separately.
+    if (const char* a = std::getenv("POS2GPU_AES_LAST_ROUND_PARTIAL");
+        a && a[0] == '1') {
+        if (const char* b = std::getenv("POS2GPU_T1_FIRST_ROUND_FOLD");
+            b && b[0] == '1')
+            throw std::invalid_argument("Experiment A and B cannot both be ON for T1");
+    }
     // Experimental path: default OFF, unchanged fused kernel otherwise.
     if (const char* mode = std::getenv("POS2GPU_T1_COMPACT"); mode && mode[0] == '1') {
         launch_t1_match_all_buckets_compact(
@@ -571,6 +622,13 @@ void launch_t1_match_all_buckets(
     constexpr size_t threads = 256;
     uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
     size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
+
+    // Experiment A: independent of the Direct24/Direct20 index selection.
+    // Read on host and capture a uniform flag; OFF leaves original behavior.
+    bool const use_last_round_partial = [] {
+        const char* v = std::getenv("POS2GPU_AES_LAST_ROUND_PARTIAL");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
 
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
@@ -614,9 +672,7 @@ void launch_t1_match_all_buckets(
 
                 uint32_t x_l = d_sorted_xs[l].x;
 
-                uint32_t target_l = pos2gpu::tezcan_target(
-                                        keys_copy, 1u, match_key_r, uint64_t(x_l),
-                                        sT, extra_rounds_bits)
+                uint32_t target_l = (use_last_round_partial ? pos2gpu::tezcan_target_last(keys_copy, 1u, match_key_r, uint64_t(x_l), sT, extra_rounds_bits) : pos2gpu::tezcan_target(keys_copy, 1u, match_key_r, uint64_t(x_l), sT, extra_rounds_bits))
                                   & target_mask;
 
                 uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
@@ -643,8 +699,7 @@ void launch_t1_match_all_buckets(
                     if (target_r != target_l) break;
 
                     uint32_t x_r = d_sorted_xs[r].x;
-                    pos2gpu::Result128 res = pos2gpu::tezcan_pairing(
-                        keys_copy, uint64_t(x_l), uint64_t(x_r), sT, extra_rounds_bits);
+                    pos2gpu::Result128 res = (use_last_round_partial ? pos2gpu::tezcan_pairing_last(keys_copy, uint64_t(x_l), uint64_t(x_r), sT, extra_rounds_bits, test_mask) : pos2gpu::tezcan_pairing(keys_copy, uint64_t(x_l), uint64_t(x_r), sT, extra_rounds_bits));
 
                     uint32_t test_result = res.r[3] & test_mask;
                     if (test_result != 0) continue;

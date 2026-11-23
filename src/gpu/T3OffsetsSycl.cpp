@@ -14,6 +14,7 @@
 #include "host/PoolSizing.hpp"
 
 #include "gpu/AesDirectAddressSycl.hpp"
+#include "gpu/AesLastRoundSycl.hpp"
 #include <sycl/sycl.hpp>
 #include <chrono>
 #include <new>
@@ -68,6 +69,42 @@ static inline Result128 t3c_tezcan_pairing(
         int32_t(l >> 32), int32_t(l));
     s = t3c_tezcan_rounds(s, keys, kAesPairingRounds << extra, t, bank);
     return Result128{{s.w[0], s.w[1], s.w[2], s.w[3]}};
+}
+
+
+// Experiment A: T3 consumes only word 3 for the acceptance test.
+static inline uint32_t t3c_tezcan_target_last(
+    const AesHashKeys& keys, uint32_t table_id, uint32_t match_key,
+    uint64_t meta, const uint32_t* t, int extra, uint32_t bank)
+{
+    AesState s = set_int_vec_i128(int32_t(meta >> 32), int32_t(meta),
+                                  int32_t(match_key), int32_t(table_id));
+    const int pairs = kAesMatchingTargetRounds << extra;
+    #pragma unroll 2
+    for (int i = 0; i < pairs - 1; ++i) {
+        s = t3c_tezcan_round(s, keys.round_key_1, t, bank);
+        s = t3c_tezcan_round(s, keys.round_key_2, t, bank);
+    }
+    s = t3c_tezcan_round(s, keys.round_key_1, t, bank);
+    return aes_direct_last_word<0>(s, keys.round_key_2, t, bank);
+}
+
+static inline Result128 t3c_tezcan_pairing_last(
+    const AesHashKeys& keys, uint64_t l, uint64_t r,
+    const uint32_t* t, int extra, uint32_t bank)
+{
+    AesState s = set_int_vec_i128(int32_t(r >> 32), int32_t(r),
+                                  int32_t(l >> 32), int32_t(l));
+    const int pairs = kAesPairingRounds << extra;
+    #pragma unroll 2
+    for (int i = 0; i < pairs - 1; ++i) {
+        s = t3c_tezcan_round(s, keys.round_key_1, t, bank);
+        s = t3c_tezcan_round(s, keys.round_key_2, t, bank);
+    }
+    s = t3c_tezcan_round(s, keys.round_key_1, t, bank);
+    Result128 res{{0u, 0u, 0u, 0u}};
+    res.r[3] = aes_direct_last_word<3>(s, keys.round_key_2, t, bank);
+    return res;
 }
 
 
@@ -785,6 +822,13 @@ static void launch_t3_match_all_buckets_compact(
         return v && v[0] == '1';
     }();
 
+    // Experiment A: independent of the Direct24/Direct20 index selection.
+    // Read on host and capture a uniform flag; OFF leaves original behavior.
+    bool const use_last_round_partial = [] {
+        const char* v = std::getenv("POS2GPU_AES_LAST_ROUND_PARTIAL");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
 
@@ -851,8 +895,7 @@ static void launch_t3_match_all_buckets_compact(
                     meta_l = d_sorted_meta[l];
                     xb_l = d_sorted_xbits[l];
                     target_l = (use_tezcan
-                        ? t3c_tezcan_target(keys_copy, 3u, match_key_r, meta_l,
-                                           sT, 0, static_cast<uint32_t>(local_id) & 15u)
+                        ? (use_last_round_partial ? t3c_tezcan_target_last(keys_copy, 3u, match_key_r, meta_l, sT, 0, static_cast<uint32_t>(local_id) & 15u) : t3c_tezcan_target(keys_copy, 3u, match_key_r, meta_l, sT, 0, static_cast<uint32_t>(local_id) & 15u))
                         : pos2gpu::matching_target_smem(
                             keys_copy, 3u, match_key_r, meta_l, sT, 0)) & target_mask;
                     if (use_direct20) {
@@ -881,8 +924,7 @@ static void launch_t3_match_all_buckets_compact(
                     ? 0xFFFFFFFFu : ((1u << num_test_bits) - 1u);
                 auto emit = [&](uint64_t ml, uint64_t mr, uint32_t xl, uint32_t xr) {
                     pos2gpu::Result128 res = use_tezcan
-                        ? t3c_tezcan_pairing(keys_copy, ml, mr, sT, 0,
-                                             static_cast<uint32_t>(local_id) & 15u)
+                        ? (use_last_round_partial ? t3c_tezcan_pairing_last(keys_copy, ml, mr, sT, 0, static_cast<uint32_t>(local_id) & 15u) : t3c_tezcan_pairing(keys_copy, ml, mr, sT, 0, static_cast<uint32_t>(local_id) & 15u))
                         : pos2gpu::pairing_smem(keys_copy, ml, mr, sT, 0);
                     if ((res.r[3] & test_mask) != 0) return;
                     uint64_t all_x_bits = (uint64_t(xl) << k) | uint64_t(xr);

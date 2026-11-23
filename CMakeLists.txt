@@ -1789,3 +1789,10 @@ target_include_directories(sycl_aes_divergence_bench PRIVATE ${_xchplot2_cuda_in
 target_compile_features(sycl_aes_divergence_bench PRIVATE cxx_std_20)
 target_link_options(sycl_aes_divergence_bench PRIVATE ${_xchplot2_multiple_definitions})
 set_target_properties(sycl_aes_divergence_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+# Experiment A: no-device host validation of AESENC final-word specializations.
+add_executable(aes_last_round_test tools/parity/aes_last_round_test.cpp)
+# Use existing AdaptiveCpp compiler settings for GPU helper attributes.
+x2_add_sycl_to_target(TARGET aes_last_round_test SOURCES tools/parity/aes_last_round_test.cpp)
+target_include_directories(aes_last_round_test PRIVATE src)
+target_compile_features(aes_last_round_test PRIVATE cxx_std_20)
+set_target_properties(aes_last_round_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")

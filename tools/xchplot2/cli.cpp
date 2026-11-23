@@ -25,6 +25,9 @@
 #include "host/Json.hpp"
 #include "BuildVersion.hpp"
 #include "host/PlotFileWriterParallel.hpp"
+extern "C" {
+#include "sha/sha256.h"
+}
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
 #include <algorithm>
@@ -208,6 +211,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "  " << prog << " compute COMMAND [OPTIONS]\n"
         << "    Farming-layout preview, capacity-driven plotting, group growth and shared compute.\n"
         << "    Use COMMAND --help for its options. Previews write only requested plan or profile exports.\n"
+        << "  " << prog << " fragments-hash FILE   (reference decoded T3 SHA256)\n"
         << "  " << prog << " test <group_id_hex> [plot_index] [meta_group] [verbose]\n"
         << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
@@ -453,6 +457,10 @@ void print_command_help(char const* prog, std::string_view command, std::ostream
             "  --raw               write a temporary group member\n"
             "  -G, --gpu-all       run all phases on the GPU\n"
             "  -P, --profile       request phase timing\n";
+    else if (command == "fragments-hash")
+        out << " FILE\n"
+            "Decode a single-member .gplot, print sorted T3 fragment count and SHA256.\n"
+            "The grouped plot format removes duplicate fragment values.\n";
     else if (command == "verify")
         out << " [OPTIONS] [--] FILE\n"
             "Sample quality chains; use --full to solve and validate full proofs.\n"
@@ -1343,7 +1351,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     if (argc > 2) {
         std::string_view const command = argv[1];
         if ((command == "plot" || command == "batch" || command == "bench" || command == "test" ||
-             command == "verify" || command == "devices" || command == "parity-check") &&
+             command == "verify" || command == "fragments-hash" || command == "devices" || command == "parity-check") &&
             command_help(argv[0], command, argv[2])) return 0;
     }
 
@@ -2263,6 +2271,40 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             return batch_exit_code(res, entries.size());
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    if (mode == "fragments-hash") {
+        if (argc != 3) {
+            print_command_help(argv[0], mode, std::cerr);
+            return 1;
+        }
+        try {
+            // This is a read-only CPU operation; GPU/SYCL device selection
+            // and plot regeneration are unnecessary.
+            auto const fragments=pos2gpu::read_plot_file_fragments(argv[2]);
+            if (fragments.empty())throw std::runtime_error("no fragments decoded");
+            for(size_t i=1;i<fragments.size();++i)
+                if(fragments[i]<fragments[i-1])
+                    throw std::runtime_error("decoded T3 fragments not sorted");
+            sha256 context{};
+            sha256_init(&context);
+            constexpr size_t kTile=1u<<20;
+            for(size_t i=0;i<fragments.size();i+=kTile) {
+                size_t const n=std::min(kTile,fragments.size()-i);
+                sha256_update(&context,fragments.data()+i,
+                    static_cast<unsigned long>(n*sizeof(uint64_t)));
+            }
+            std::array<uint8_t,32> digest{};
+            sha256_sum(&context,digest.data());
+            std::cout << "[fragments-hash] decoded fragments="<<fragments.size()<<'\n';
+            std::cout << "[fragments-hash] sorted decoded T3 SHA256="
+                      << bytes_to_hex(digest) << '\n';
+            std::cout << "[fragments-hash] OK (not a Full Proof validation)\n";
+            return 0;
+        } catch(std::exception const& e) {
+            std::cerr << "[fragments-hash] FAILED: " << e.what() << '\n';
             return 2;
         }
     }

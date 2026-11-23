@@ -198,14 +198,13 @@ int native_cuda_rtx4070_super_ordinal()
     return ordinal;
 }
 
-NativeCudaPipelineResult native_cuda_run_k28s6(
-    std::array<uint8_t,32> const& plot_id,int ordinal,
+static NativeCudaPipelineResult run_native_cuda_pipeline_pooled(
+    NativeCudaPool& pool, std::array<uint8_t,32> const& plot_id,
     std::vector<uint64_t>* out_sorted_fragments,
-    bool compute_digests)
+    bool compute_digests, uint64_t* pinned_destination)
 {
     using Clock = std::chrono::steady_clock;
     auto const started=Clock::now();
-    NativeCudaPool pool(ordinal);
     auto phase_mark=Clock::now();
     auto phase_ms=[&]() {
         auto const t=Clock::now();
@@ -370,12 +369,26 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         cub_sort_keys_u64(scratch,cub_bytes,
             fragments_in,fragments_out,t3_count,0,56);
         double const t3_sort_ms=phase_ms();
-        if(compute_digests)
-            std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
-        else
-            std::fprintf(stderr,"[cuda-only] T3 sorted; fast transfer (no SHA256)...\n");
-        auto const digests=digest_fragments(
-            pool,fragments_out,t3_count,out_sorted_fragments,compute_digests);
+        FragmentDigests digests{};
+        if (pinned_destination) {
+            // Original pooled BatchPlotter handoff: one large pinned
+            // device->host copy, no intermediate pageable vector and
+            // no SHA256/duplicate scan in the generation hot path.
+            require(out_sorted_fragments==nullptr && !compute_digests,
+                    "native CUDA pinned output must not request diagnostics");
+            require(t3_count<=p.pinned_bytes/sizeof(uint64_t),
+                    "native CUDA pinned host capacity exceeded");
+            std::fprintf(stderr,"[cuda-only] T3 sorted; direct pinned transfer...\n");
+            session.copy_d2h(pinned_destination,fragments_out,
+                             size_t(t3_count)*sizeof(uint64_t));
+        } else {
+            if(compute_digests)
+                std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
+            else
+                std::fprintf(stderr,"[cuda-only] T3 sorted; fast transfer (no SHA256)...\n");
+            digests=digest_fragments(
+                pool,fragments_out,t3_count,out_sorted_fragments,compute_digests);
+        }
         double const digest_copy_ms=phase_ms();
         NativeCudaPipelineResult result{};
         result.t1_count=t1_count;
@@ -401,5 +414,46 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         session.release_device(table_memory);
         throw;
     }
+}
+
+NativeCudaPipelineResult native_cuda_run_k28s6(
+    std::array<uint8_t,32> const& plot_id,int ordinal,
+    std::vector<uint64_t>* out_sorted_fragments,
+    bool compute_digests)
+{
+    NativeCudaPool pool(ordinal);
+    return run_native_cuda_pipeline_pooled(
+        pool, plot_id, out_sorted_fragments, compute_digests, nullptr);
+}
+
+NativeCudaPlotSession::NativeCudaPlotSession(int ordinal)
+    : pool_(std::make_unique<NativeCudaPool>(ordinal)) {}
+
+NativeCudaPlotSession::~NativeCudaPlotSession() noexcept
+{
+    // Slot 0 is pool-owned, released by ~NativeCudaPool.
+    if(pinned_slots_[1]) {
+        try { pool_->session().release_pinned(pinned_slots_[1]); }
+        catch(...) {}
+    }
+}
+
+NativeCudaPlotFrame NativeCudaPlotSession::generate(
+    std::array<uint8_t,32> const& plot_id,int slot)
+{
+    if(slot<0 || slot>1)throw std::invalid_argument(
+        "native CUDA pinned output slot must be 0 or 1");
+    if(!pinned_slots_[slot]) {
+        pinned_slots_[slot]=(slot==0) ? pool_->ensure_pinned()
+            : static_cast<uint64_t*>(pool_->session().allocate_pinned(
+                  pool_->plan().pinned_bytes));
+    }
+    // Caller must not reuse a slot until the CPU FSE writer has finished
+    // reading it. This is identical to the original BatchPlotter contract.
+    auto result=run_native_cuda_pipeline_pooled(
+        *pool_,plot_id,nullptr,false,pinned_slots_[slot]);
+    return NativeCudaPlotFrame{result,
+        std::span<uint64_t const>{pinned_slots_[slot],
+                                  static_cast<size_t>(result.t3_count)}};
 }
 } // namespace pos2gpu

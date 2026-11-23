@@ -26,6 +26,10 @@ struct GpuPlotOptions {
     bool raw = false;
     bool verbose = false;
     bool profile = false;   // print GPU phase breakdown to stderr
+    // Explicit diagnostic-only test backend. The normal hybrid CUDA/SYCL
+    // plot path remains the default, and production batch is unchanged.
+    bool native_cuda_test = false;
+    bool fragment_digest = false;
     std::array<uint8_t, 32> plot_id{};
     std::array<uint8_t, 32> group_id{};
 

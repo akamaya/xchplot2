@@ -63,11 +63,6 @@ size_t write_plot_file_parallel(
 // Idempotent; cheap after the first call.
 void warm_writer_pool();
 
-// SHA-256 of the exact raw sorted T3 uint64 stream *before* the .gplot
-// writer's canonical duplicate removal. Used to compare the existing
-// verified hybrid path with the new native CUDA compute path.
-std::array<uint8_t,32> raw_t3_fragments_sha256(std::span<uint64_t const> fragments);
-
 // Run pos2-chip's CPU `Plotter` end-to-end and return the sorted T3
 // proof_fragment vector. Encapsulated here so other TUs don't need to
 // include plot/Plotter.hpp (and through it pos/aes/soft_aes.hpp).

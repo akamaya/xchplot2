@@ -877,10 +877,18 @@ if(XCHPLOT2_BUILD_CUDA)
                 src/gpu/NativeCudaPool.cpp
                 src/gpu/NativeCudaStandalonePipeline.cpp
                 PROPERTIES LANGUAGE CUDA)
-            list(APPEND POS2_GPU_CUDA_SRC
+            # Keep the experimental plot writer bridge out of
+            # pos2_gpu_cuda_obj, which gets pulled into every parity
+            # executable. Only the CLI needs this native host entry.
+            add_library(pos2_gpu_native_writer_bridge_obj OBJECT
                 src/gpu/NativeCudaRuntime.cpp
                 src/gpu/NativeCudaPool.cpp
                 src/gpu/NativeCudaStandalonePipeline.cpp)
+            target_include_directories(pos2_gpu_native_writer_bridge_obj PRIVATE src)
+            target_link_libraries(pos2_gpu_native_writer_bridge_obj PRIVATE pos2_chip_headers)
+            target_compile_features(pos2_gpu_native_writer_bridge_obj PRIVATE cxx_std_20)
+            set_target_properties(pos2_gpu_native_writer_bridge_obj PROPERTIES
+                POSITION_INDEPENDENT_CODE ON)
         endif()
     endif()
     # SortSyclCub.cpp is the SYCL-typed adapter that bridges
@@ -1170,6 +1178,10 @@ if(XCHPLOT2_BUILD_CUDA)
     target_sources(xchplot2_cli PRIVATE
         tools/xchplot2/cli_devlink.cu
         $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+    if(WIN32 AND XCHPLOT2_NATIVE_CUDA_MATCH)
+        target_sources(xchplot2_cli PRIVATE
+            $<TARGET_OBJECTS:pos2_gpu_native_writer_bridge_obj>)
+    endif()
 endif()
 set_target_properties(xchplot2_cli PROPERTIES
     POSITION_INDEPENDENT_CODE ON

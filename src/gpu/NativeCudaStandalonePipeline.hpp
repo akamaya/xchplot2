@@ -4,6 +4,7 @@
 // T3 fragments. The production plot-writing CLI is intentionally untouched.
 #include <array>
 #include <cstdint>
+#include <vector>
 
 namespace pos2gpu {
 struct NativeCudaPipelineResult {
@@ -16,5 +17,9 @@ struct NativeCudaPipelineResult {
     double seconds=0;
 };
 NativeCudaPipelineResult native_cuda_run_k28s6(
-    std::array<uint8_t,32> const& plot_id, int cuda_ordinal);
+    std::array<uint8_t,32> const& plot_id, int cuda_ordinal,
+    // Optional: return sorted 56-bit T3 fragments to the existing
+    // CPU .gplot writer. Default is compute/digest-only with no
+    // multi-GiB host allocation.
+    std::vector<uint64_t>* out_sorted_fragments = nullptr);
 } // namespace pos2gpu

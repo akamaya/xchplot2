@@ -1,5 +1,91 @@
 # RTX 4070 SUPER k28/s6 — CUDA core migration (2026-11-23)
 
+## 2026-11-23: original-equivalent pinned handoff and overlapping Writer (UNVERIFIED)
+
+**Observed, confirmed regression:** RTX 4070 SUPER, same 32-byte zero Group
+ID, native CUDA test `.gplot`, 268596076 T3 fragments:
+`compute+capture=25.4249s`, `writer=5.472s`,
+`full_plot=30.974s`. The user confirms that their original
+single-plot `.gplot` path achieved **26–27 s end-to-end**.
+Do not rationalize away the 5.472s Writer time as intrinsic.
+A source-to-source comparison found that the original
+`PlotFileWriterParallel.cpp` implementation is unchanged in its FSE
+and disk algorithms; the main CUDA-only difference was
+**how T3 buffers reach that Writer**.
+
+**Restored native CUDA behavior:**
+
+1. `NativeCudaPlotSession` owns one reusable `NativeCudaPool` and
+   1–2 CUDA-pinned host T3 output slots sized at the original
+   Candidate-D match capacity. `NativeCudaPlotSession::generate`
+   copies the fully sorted T3 stream directly to the selected pinned
+   slot in ONE synchronized D2H operation; no extra pageable
+   2-GiB vector, tiled host-copy, SHA256 or duplicate pass.
+   The returned `NativeCudaPlotFrame` borrows the pinned memory
+   until the CPU FSE Writer returns.
+2. Single `xchplot2 test ... --native-cuda` uses the same pinned
+   frame directly in the existing `write_plot_file_parallel` function.
+   `[plot-timing] full_plot` continues to include all setup,
+   GPU compute, transfer, CPU compression, NAS flushing and publication.
+3. `xchplot2 test ... --native-cuda --count N` with N=2..100 adds
+   the original **GPU producer + CPU Writer consumer** semantics:
+   one native GPU pool and two alternating pinned slots. GPU for plot
+   N+1 overlaps FSE + NAS for plot N. An acknowledgment gate forbids
+   GPU overwrites until the Writer has completely consumed the
+   corresponding slot. Producer failure / consumer failure closes
+   the queue, joins the consumer and throws; it does not delete or
+   overwrite previously completed output.
+   The first Group ID is the supplied 32-byte seed; subsequent
+   seeds are deterministic XORs of 64-bit indices into the trailing
+   eight bytes. Each group contains one member with index zero.
+   Test memos are exactly 112 zero bytes (not farmable); no
+   private-key memo is accepted. Output `prefix_0.gplot`, etc.
+4. `POS2GPU_WRITER_PHASES=1` prints optional
+   `[writer-phase]` boundary scan / FSE compression / fwrite /
+   flush+sync / publish timings and compressed bytes. The timer
+   adds NO additional passes, hashes or artificial comparison work.
+   This permits an **apples-to-apples comparison** against the same
+   old Writer under the same NAS/CPU workload.
+
+**Status: committed only; no Windows build, GPU run, file-generation
+benchmark or Full Proof validation for this pinned/overlap change has
+yet been performed.** A pinned buffer can have different CPU
+access behavior from a pageable buffer, so the exact single-plot speed
+must be measured, not assumed. Previous verified test plot remains
+untouched. The original production hybrid `batch` remains unchanged.
+
+VS2022 Developer PowerShell, command lines always one line:
+
+Build:
+~~~powershell
+cd C:\dev\xchplot2; git pull --ff-only origin cuda/nvidia-12gb-k28s6; if ($LASTEXITCODE -ne 0) { throw 'Git update failed' }; cmake --build .\build\windows-cuda-core --target xchplot2 -j 16; if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+~~~
+
+One complete pinned CUDA plot with optional stage timing:
+~~~powershell
+cd C:\dev\xchplot2; $dir='\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4'; $env:POS2GPU_WRITER_PHASES='1'; try { .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe test ('0'*64) --native-cuda -o $dir -N stage4_native_cuda_pinned_v3.gplot; if ($LASTEXITCODE -ne 0) { throw 'Pinned Plot failed' } } finally { Remove-Item Env:\POS2GPU_WRITER_PHASES -ErrorAction SilentlyContinue }
+~~~
+
+Independently check the finished plot after timing:
+~~~powershell
+cd C:\dev\xchplot2; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe verify '\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4\stage4_native_cuda_pinned_v3.gplot' --full --trials 100; if ($LASTEXITCODE -ne 0) { throw 'Full Proof failed' }
+~~~
+
+When the single plot builds, runs and verifies, measure the overlapped
+`--count 3` test (separate outputs, no secret memo or SHA in hot path):
+~~~powershell
+cd C:\dev\xchplot2; $dir='\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4'; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe test ('0'*64) --native-cuda --count 3 -o $dir -N stage4_native_series_v3.gplot; if ($LASTEXITCODE -ne 0) { throw 'Native CUDA overlap batch failed' }
+~~~
+
+The series results are `stage4_native_series_v3_0.gplot`,
+`stage4_native_series_v3_1.gplot`, and
+`stage4_native_series_v3_2.gplot`. Verify independently AFTER
+the run, not in the timed generation path. The `[cuda-batch]`
+line reports total elapsed seconds divided by actual finished plots;
+the first plot and drain overhead are included (not identical to
+a steady-state benchmark with warmup exclusions).
+
+
 ## Current generation path — speed-only; validation runs AFTER writing
 
 The user explicitly prioritizes **complete plot-generation time**, including

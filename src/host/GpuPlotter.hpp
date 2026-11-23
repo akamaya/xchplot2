@@ -51,4 +51,13 @@ std::string plot_to_file(
     GpuPlotOptions const& opts,
     std::string const& output_dir);
 
+// Native CUDA-only k28/s6 test batch using the same two-pinned-slot
+// producer/consumer overlap as the verified hybrid batch pipeline.
+// Every plot gets a distinct deterministic, public Group ID.
+// Private-key memos and raw members are not supported.
+void plot_native_cuda_series(
+    GpuPlotOptions const& opts,
+    std::string const& output_dir,
+    unsigned count);
+
 } // namespace pos2gpu

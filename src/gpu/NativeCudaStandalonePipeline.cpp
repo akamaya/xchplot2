@@ -144,8 +144,17 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
     std::array<uint8_t,32> const& plot_id,int ordinal,
     std::vector<uint64_t>* out_sorted_fragments)
 {
-    auto const started=std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    auto const started=Clock::now();
     NativeCudaPool pool(ordinal);
+    auto phase_mark=Clock::now();
+    auto phase_ms=[&]() {
+        auto const t=Clock::now();
+        double const elapsed=std::chrono::duration<double,std::milli>(t-phase_mark).count();
+        phase_mark=t;
+        return elapsed;
+    };
+    double const pool_setup_ms=std::chrono::duration<double,std::milli>(phase_mark-started).count();
     auto& session=pool.session();
     NativeCudaPoolPlan const& p=pool.plan();
     uint64_t const n=p.total_xs,cap=p.capacity;
@@ -195,6 +204,7 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         cub_sort_pairs_u32_u32(storage+size_t(n)*8,cub_xs,
             keys_in,keys_out,vals_in,vals_out,n,0,28);
         cuda_xs_pack(keys_out,vals_out,xs,n);
+        double const xs_ms=phase_ms();
         // The Xs source and pair_b sort buffers have now been consumed.
         auto* pair_a=static_cast<uint8_t*>(pool.ensure_pair_a());
         uint64_t* t1_meta=reinterpret_cast<uint64_t*>(pair_a);
@@ -220,6 +230,7 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
             (1u<<24)-1,2,28,t1_meta,t1_mi,pool.d_count(),
             cap,lmax,0,16);
         uint64_t const t1_count=counter(pool);
+        double const t1_ms=phase_ms();
         require(t1_count!=0,"CUDA-only T1 produced zero pairs");
         std::fprintf(stderr,"[cuda-only] T1 pairs=%llu\n",
             static_cast<unsigned long long>(t1_count));
@@ -230,6 +241,7 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         size_t cub_bytes=p.sort_and_index_scratch_bytes;
         cub_sort_pairs_u32_u64(scratch,cub_bytes,
             t1_mi,sorted_mi,t1_meta,sorted_meta,t1_count,0,28);
+        double const t1_sort_ms=phase_ms();
 
         // Candidate D T2 output: meta in pair A, mi in storage slot 1,
         // xbits in storage slot 2. The input sorted meta is in pair B.
@@ -253,6 +265,7 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
             (1u<<20)-1,6,28,14,t2_meta,t2_mi,t2_xbits,
             pool.d_count(),cap,lmax,0,256);
         uint64_t const t2_count=counter(pool);
+        double const t2_ms=phase_ms();
         require(t2_count!=0,"CUDA-only T2 produced zero pairs");
         std::fprintf(stderr,"[cuda-only] T2 pairs=%llu\n",
             static_cast<unsigned long long>(t2_count));
@@ -273,6 +286,7 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         uint32_t* sorted_xbits=reinterpret_cast<uint32_t*>(storage)+cap;
         cuda_gather_u32(parked_xbits,t2_sorted_indices,sorted_xbits,t2_count);
         cuda_gather_u64(t2_meta,t2_sorted_indices,sorted_meta,t2_count);
+        double const t2_sort_ms=phase_ms();
 
         std::fprintf(stderr,"[cuda-only] T3 Direct20 index + Feistel...\n");
         cuda_t23_bucket_offsets(sorted_mi,t2_count,20,256,coarse23);
@@ -285,6 +299,7 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
             direct23,t0,64,28,2,(1u<<20)-1,6,
             fragments_in,pool.d_count(),cap,lmax,0,256);
         uint64_t const t3_count=counter(pool);
+        double const t3_ms=phase_ms();
         require(t3_count!=0,"CUDA-only T3 produced zero pairs");
         std::fprintf(stderr,"[cuda-only] T3 fragments=%llu\n",
             static_cast<unsigned long long>(t3_count));
@@ -295,9 +310,11 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         cub_bytes=p.sort_and_index_scratch_bytes;
         cub_sort_keys_u64(scratch,cub_bytes,
             fragments_in,fragments_out,t3_count,0,56);
+        double const t3_sort_ms=phase_ms();
         std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
         auto const digests=digest_fragments(
             pool,fragments_out,t3_count,out_sorted_fragments);
+        double const digest_copy_ms=phase_ms();
         NativeCudaPipelineResult result{};
         result.t1_count=t1_count;
         result.t2_count=t2_count;
@@ -307,6 +324,15 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         result.unique_t3_count=digests.distinct;
         result.seconds=std::chrono::duration<double>(
             std::chrono::steady_clock::now()-started).count();
+        // Each native kernel wrapper synchronizes before returning; these
+        // host steady-clock spans include actual CUDA execution. The
+        // digest/capture entry is intentionally measured separately.
+        std::fprintf(stderr,
+            "[cuda-phase] pool=%.3f xs=%.3f t1_index_match=%.3f "
+            "t1_sort=%.3f t2_index_match=%.3f t2_sort_gather=%.3f "
+            "t3_index_match=%.3f t3_sort=%.3f digest_capture=%.3f ms\n",
+            pool_setup_ms,xs_ms,t1_ms,t1_sort_ms,t2_ms,t2_sort_ms,
+            t3_ms,t3_sort_ms,digest_copy_ms);
         session.release_device(table_memory);
         return result;
     } catch(...) {

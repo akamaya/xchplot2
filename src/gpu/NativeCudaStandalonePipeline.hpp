@@ -10,7 +10,9 @@ struct NativeCudaPipelineResult {
     uint64_t t1_count=0;
     uint64_t t2_count=0;
     uint64_t t3_count=0;
+    uint64_t unique_t3_count=0;
     std::array<uint8_t,32> sha256_fragments{};
+    std::array<uint8_t,32> sha256_unique_fragments{};
     double seconds=0;
 };
 NativeCudaPipelineResult native_cuda_run_k28s6(

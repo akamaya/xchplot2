@@ -5,7 +5,8 @@
 - **Base**: refactor/always-on-verified-gpu-optimizations-20261123 at `f6646911faf1a793532abbd06cf55e2696bbe046` (not main).
 - **Work branch**: `cuda/nvidia-12gb-k28s6`.
 - **No legacy runtime ON/OFF switches restored**. Verified Compact, Direct24/Direct20, Tezcan and AES Experiment A remain the fixed k28/s6 production profile.
-- **Implementation committed, not yet nvcc-compiled or hardware-verified.** The existing SYCL 25.18 s/plot result is a historical baseline, **not** a CUDA result.
+- **CUDA core commit `4fafeb2d` passed the user's Windows RTX 4070 SUPER build**, 11 plots (1 warmup + 10 measured), **25.13 s/plot** steady state, and retained-plot Full Proof validation **114/114 PASS** (100 trials). Historical SYCL baseline: **25.18 s/plot**; the 0.05 s difference is not significant.
+- **Later CUDA-only migration work (peer transport, two-level sort, runtime facade, standalone smoke) is not yet rebuilt or validated on hardware.** Never attribute the earlier 25.13 s figure to these later changes.
 - **This is a CUDA GPU-core port, NOT YET a pure CUDA-only build**: AdaptiveCpp still builds the host orchestration, buffer/queue management and remaining non-hot-path implementations.
 
 ## GPU work moved to native CUDA
@@ -49,9 +50,36 @@ The project may require the appropriate VS2022 MSVC/NVCC host toolchain and its 
 2. Confirm `xchplot2.exe devices` lists RTX 4070 SUPER as `gpu0`. Avoid accidentally benchmarking RTX 5070.
 3. Generate a retained k28/s6 .gplot on `\\NAS-UGREEN\personal_folder\plots_test` using the newly built binary; check exit code.
 4. `verify <file> --full --trials 100` should report `OK (full proof validation)`. This sampled test does not prove all possible inputs.
-5. Measure `bench -k 28 -s 6 -n 10 --warmup 1 --devices gpu0`. Compare with the **historical SYCL steady-state of 25.18 s/plot**. **No new OFF remeasurement is needed** unless the toolchain/environment changes.
+5. Measure `bench -n 10 --warmup 1 --devices gpu0` (k=28/s=6 are fixed and no longer accept `-k`/`-s`). Compare with the **validated CUDA 25.13 s/plot** and historical SYCL 25.18 s/plot. **No new OFF remeasurement is needed** unless the toolchain/environment changes.
 6. If possible, test one overflow-heavy synthetic case and independent exact-index parity. The build is not yet certified.
 
 ## Remaining native CUDA-only work
 
 AdaptiveCpp/SYCL is still required for device discovery, CUDA-USM allocation/queues, pooled GPU host orchestration, and some distributed/sharded/streaming and fallback kernels. Those are **not** removed because doing so before porting the host layer would break plot creation. The CUDA-specific branch isolates the new code without altering main or the refactor branch. There is no claimed speedup until the k28/s6 hardware verification above.
+
+## Follow-up migration: CUDA-only runtime foundation (unverified)
+
+The verified first CUDA core commit `4fafeb2d` is preserved as a separate rollback boundary. Later work adds:
+
+- `NativeCudaPeer.cu`: native peer/distributed radix-sort count and atomic scatter kernels (six entry points), dispatching through `SortDistributedPeer.cpp`.
+- `NativeCudaTwoLevel.cu`: native top-bit histogram and partition; segmented inner sort already uses CUDA CUB.
+- `NativeCudaRuntime.hpp/.cpp`: **SYCL-independent** host-side CUDA device enumeration, stream ownership, device/pinned allocations, synchronous H2D/D2H/D2D copies, memset and memory information. This is the basis for replacing the SYCL-dependent buffer pool/host pipeline later; it is **not yet wired into the plot CLI**.
+- `tools/native_cuda_only/`: standalone CUDA-only CMake project and `native_cuda_smoke`, which requires **neither AdaptiveCpp nor SYCL**. It checks that the selected CUDA device is RTX 4070 SUPER, exercises the native runtime, checks Xs AES output against a separate CPU T-table reference over 4096 items, tests two-level histogram/partition, peer count/scatter and gather (multiset-parity where order is intentionally nondeterministic).
+- The CMake CUDA build now selects the native CUDA core unconditionally; the separate `XCHPLOT2_NATIVE_CUDA_MATCH` user ON/OFF option was removed. This is a branch-specific policy, not a global main change.
+- The bench help was corrected: `-k` and `-s` are unsupported in the fixed k28/s6 profile.
+
+### Standalone CUDA-only check (VS2022 Developer PowerShell, one line each)
+
+```powershell
+cd C:\dev\xchplot2; $env:PATH="$env:CUDA_PATH\bin;$env:PATH"; cmake -S .\tools\native_cuda_only -B .\build\windows-native-cuda-only -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
+```
+
+```powershell
+cd C:\dev\xchplot2; cmake --build .\build\windows-native-cuda-only -j 16
+```
+
+```powershell
+cd C:\dev\xchplot2; .\build\windows-native-cuda-only\native_cuda_smoke.exe; if ($LASTEXITCODE -ne 0) { throw 'native CUDA-only smoke failed' }
+```
+
+This standalone target tests native GPU primitives and runtime independently. It is **not** a full Plot executable and does **not** validate the Feistel/Match kernels in isolation; the previously verified hybrid CLI covers those. A complete CUDA-only Plot CLI still requires the host pipeline, buffer pool, device/queue abstraction and residual SYCL kernels to be ported before AdaptiveCpp can be removed from the main CMake project.

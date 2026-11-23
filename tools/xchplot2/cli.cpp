@@ -215,7 +215,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "  " << prog << " test <group_id_hex> [plot_index] [meta_group] [verbose]\n"
         << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
-        << "         [--native-cuda] [--fragment-digest] (test-only diagnostic options)\n"
+        << "         [--native-cuda] (test-only GPU backend, no secrets)\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
         << "         [-r|--resume] [--continue-on-error]\n"
         << "         [--progress|--no-progress] [-d|--devices <SPEC>]\n"
@@ -458,8 +458,7 @@ void print_command_help(char const* prog, std::string_view command, std::ostream
             "  --raw               write a temporary group member\n"
             "  -G, --gpu-all       run all phases on the GPU\n"
             "  -P, --profile       request phase timing\n"
-            "  --native-cuda       test-only CUDA Xs-T3 + existing CPU writer; --memo not allowed\n"
-            "  --fragment-digest   print SHA256 of raw sorted T3 stream before .gplot compression\n";
+            "  --native-cuda       test-only CUDA Xs-T3 + existing CPU writer; --memo not allowed\n";
     else if (command == "fragments-hash")
         out << " FILE\n"
             "Decode a single-member .gplot, print sorted T3 fragment count and SHA256.\n"
@@ -3552,7 +3551,6 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
             opts.t2 = pos2gpu::PhaseStrategy::Gpu;
             opts.t3 = pos2gpu::PhaseStrategy::Gpu;
         }
-        else if (a == "--fragment-digest") opts.fragment_digest = true;
         else if ((a == "--out"       || a == "-o") && i + 1 < argc) {
             output_dir = argv[++i];
         }

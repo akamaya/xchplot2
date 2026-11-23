@@ -34,7 +34,7 @@ Key implementation details:
 Build in a **new** build directory under `C:\dev\xchplot2`, leaving the existing SYCL build environment intact. Use CUDA Toolkit 12.9 and the already-installed AdaptiveCpp and OpenSSL toolchain.
 
 ```powershell
-cd C:\dev\xchplot2; $env:ACPP_PREFIX=(Resolve-Path .\build\windows-toolchain\install).Path; $env:PATH="$env:ACPP_PREFIX\bin;$env:CUDA_PATH\bin;$env:PATH"; $openssl=(Resolve-Path .\build\windows-openssl\install).Path; cmake -S . -B .\build\windows-cuda-core -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER=$env:ACPP_PREFIX/bin/clang.exe" "-DCMAKE_CXX_COMPILER=$env:ACPP_PREFIX/bin/clang++.exe" "-DOPENSSL_ROOT_DIR:PATH=$openssl" -DOPENSSL_USE_STATIC_LIBS=ON '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON -DXCHPLOT2_NATIVE_CUDA_MATCH=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cd C:\dev\xchplot2; $env:ACPP_PREFIX=(Resolve-Path .\build\windows-toolchain\install).Path; $env:PATH="$env:ACPP_PREFIX\bin;$env:CUDA_PATH\bin;$env:PATH"; $openssl=(Resolve-Path .\build\windows-openssl\install).Path; cmake -S . -B .\build\windows-cuda-core -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER=$env:ACPP_PREFIX/bin/clang.exe" "-DCMAKE_CXX_COMPILER=$env:ACPP_PREFIX/bin/clang++.exe" "-DOPENSSL_ROOT_DIR:PATH=$openssl" -DOPENSSL_USE_STATIC_LIBS=ON '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
 ```
 
 ```powershell

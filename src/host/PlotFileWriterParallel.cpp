@@ -34,6 +34,8 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -399,6 +401,15 @@ size_t write_plot_file_parallel(
     BatchEntry const& entry,
     unsigned thread_count)
 {
+    using WriterClock = std::chrono::steady_clock;
+    auto const writer_started = WriterClock::now();
+    bool const writer_profile = [] {
+        char const* v = std::getenv("POS2GPU_WRITER_PHASES");
+        return v && v[0]=='1' && v[1]=='\0';
+    }();
+    auto to_ms=[](WriterClock::time_point a,WriterClock::time_point b) {
+        return std::chrono::duration<double,std::milli>(b-a).count();
+    };
     validate_batch_entry(entry);
     uint8_t const k = static_cast<uint8_t>(entry.k);
     auto const& memo = entry.memo;
@@ -413,6 +424,7 @@ size_t write_plot_file_parallel(
     uint64_t const range_per_chunk = 1ull << (k + (entry.raw
         ? PlotFile::CHUNK_SPAN_RANGE_BITS : PlotGroupFile::PROOFS_PER_CHUNK_BITS));
     auto const boundaries = chunk_boundaries_span(t3_fragments, range_per_chunk);
+    auto const after_boundaries=WriterClock::now();
     uint64_t const num_chunks = boundaries.size() - 1;
     if (!entry.raw && num_chunks != PlotGroupFile::getChunkCountForK(k))
         throw std::invalid_argument("incomplete group fragment range");
@@ -498,6 +510,8 @@ size_t write_plot_file_parallel(
                 "every later call. Check dmesg for xe/i915 reset lines.");
         }
     }
+
+    auto const after_compression=WriterClock::now();
 
     // Exclusive temporary file in the destination directory. Keep its open
     // descriptor through the durability barrier; never reopen a pathname.
@@ -587,6 +601,7 @@ size_t write_plot_file_parallel(
         auto const bytes = group_index.asBytes();
         write(bytes.data(), bytes.size());
     }
+    auto const after_write=WriterClock::now();
     if (std::fflush(guard.out) != 0)
         throw std::runtime_error("Failed to flush " + partial);
 #ifdef _WIN32
@@ -597,6 +612,7 @@ size_t write_plot_file_parallel(
         throw std::runtime_error("Failed to sync " + partial);
     if (std::fclose(std::exchange(guard.out, nullptr)) != 0)
         throw std::runtime_error("Failed to close " + partial);
+    auto const after_sync=WriterClock::now();
 
     // Preserve the existing replace policy: concurrent successful writers may
     // replace the destination, but each publishes its own complete file.
@@ -616,6 +632,20 @@ size_t write_plot_file_parallel(
     if (ec) throw std::runtime_error("Failed to publish " + filename + ": " + ec.message());
     guard.committed = true;
     fsync_parent_dir_best_effort(filename);
+    if(writer_profile) {
+        auto const finished=WriterClock::now();
+        std::fprintf(stderr,
+            "[writer-phase] boundary=%.3f compress=%.3f write=%.3f "
+            "flush_sync=%.3f publish=%.3f total=%.3f ms "
+            "size=%.2f MiB threads=%u\n",
+            to_ms(writer_started,after_boundaries),
+            to_ms(after_boundaries,after_compression),
+            to_ms(after_compression,after_write),
+            to_ms(after_write,after_sync),
+            to_ms(after_sync,finished),
+            to_ms(writer_started,finished),
+            double(bytes_written)/double(1ull<<20),thread_count);
+    }
     return bytes_written;
 }
 

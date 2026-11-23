@@ -436,7 +436,7 @@ void print_command_help(char const* prog, std::string_view command, std::ostream
     else if (command == "bench")
         out << " [OPTIONS]\n"
             "Measure plotting throughput using disposable synthetic plots.\n"
-            "  -k N                 test size, default 28; only k=28 represents farming\n"
+            "  k=28, strength=6     fixed verified plotting profile (no -k or -s)\n"
             "  -n N                 measured queue allowance per worker, default 10\n"
             "  --warmup N           warmup plots per worker, default 1\n"
             "  -d, --devices SPEC   cpu, gpu, all, or selected device IDs\n"

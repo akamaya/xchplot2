@@ -1,0 +1,86 @@
+// CUDA-only experimental compute runner. Does not write a gplot.
+// Usage: native_cuda_pipeline [--plan|--run] [--plot-id 64hex]
+// --plan is default and avoids any multi-GiB VRAM allocation.
+#include "gpu/NativeCudaStandalonePipeline.hpp"
+#include "gpu/NativeCudaPool.hpp"
+#include "gpu/NativeCudaRuntime.hpp"
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+namespace {
+unsigned hex_digit(char ch) {
+    if(ch>='0'&&ch<='9')return unsigned(ch-'0');
+    if(ch>='a'&&ch<='f')return unsigned(ch-'a'+10);
+    if(ch>='A'&&ch<='F')return unsigned(ch-'A'+10);
+    throw std::invalid_argument("invalid plot id hex character");
+}
+std::array<uint8_t,32> plot_id_from_hex(std::string_view hex) {
+    if(hex.size()!=64)throw std::invalid_argument(
+        "plot id must have exactly 64 hexadecimal characters");
+    std::array<uint8_t,32> id{};
+    for(size_t i=0;i<32;++i)id[i]=uint8_t(
+        (hex_digit(hex[2*i])<<4)|hex_digit(hex[2*i+1]));
+    return id;
+}
+void print_hex(uint8_t const* p,size_t len) {
+    for(size_t i=0;i<len;++i)std::printf("%02x",unsigned(p[i]));
+}
+}
+int main(int argc,char** argv) {
+    try {
+        bool run=false;
+        std::array<uint8_t,32> plot_id{};
+        // A constant, non-production test ID; can be replaced with --plot-id.
+        for(unsigned i=0;i<32;++i)plot_id[i]=uint8_t((i*29+7)&255u);
+        for(int i=1;i<argc;++i) {
+            std::string_view const arg=argv[i];
+            if(arg=="--plan")run=false;
+            else if(arg=="--run")run=true;
+            else if(arg=="--plot-id"&&i+1<argc)
+                plot_id=plot_id_from_hex(argv[++i]);
+            else if(arg=="--help") {
+                std::puts("native_cuda_pipeline [--plan|--run] [--plot-id 64hex]");
+                std::puts("  --plan  (default): only query memory and CUB workspace");
+                std::puts("  --run   : run complete CUDA Xs->T1->T2->T3 compute");
+                std::puts("            Output is counts+SHA256, NOT a .gplot file");
+                return 0;
+            } else throw std::invalid_argument("unknown native CUDA pipeline option");
+        }
+        int ordinal=-1;
+        auto const available=pos2gpu::native_cuda_devices();
+        for(auto const& d:available)
+            if(d.name.find("RTX 4070 SUPER")!=std::string::npos)ordinal=d.ordinal;
+        if(ordinal<0)throw std::runtime_error(
+            "RTX 4070 SUPER not detected; refusing to run on another device");
+        auto const p=pos2gpu::native_cuda_pool_plan(ordinal);
+        std::printf("[cuda-only] device %d RTX 4070 SUPER; k=28 s=6\n",ordinal);
+        std::printf("[cuda-only] Candidate D VRAM planned=%.3f GiB (excl. 128 MiB margin)\n",
+            p.device_bytes()/double(1ull<<30));
+        if(!run) {
+            std::puts("[cuda-only] PLAN OK (no large VRAM allocation)");
+            std::puts("[cuda-only] Use --run to execute the full experimental GPU pipeline");
+            return 0;
+        }
+        std::printf("[cuda-only] plot id: ");print_hex(plot_id.data(),plot_id.size());
+        std::puts("");
+        std::puts("[cuda-only] EXPERIMENTAL: native compute only, NOT a farmable .gplot");
+        auto const result=pos2gpu::native_cuda_run_k28s6(plot_id,ordinal);
+        std::printf("[cuda-only] T1=%llu T2=%llu T3=%llu seconds=%.3f\n",
+            (unsigned long long)result.t1_count,
+            (unsigned long long)result.t2_count,
+            (unsigned long long)result.t3_count,result.seconds);
+        std::printf("[cuda-only] sorted T3 fragment SHA256=");
+        print_hex(result.sha256_fragments.data(),result.sha256_fragments.size());
+        std::puts("");
+        std::puts("[cuda-only] COMPUTE OK (not a Full Proof validation)");
+        return 0;
+    } catch(std::exception const& e) {
+        std::fprintf(stderr,"[cuda-only] FAILED: %s\n",e.what());
+        return 1;
+    }
+}

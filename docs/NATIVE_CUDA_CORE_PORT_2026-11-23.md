@@ -53,6 +53,41 @@ The project may require the appropriate VS2022 MSVC/NVCC host toolchain and its 
 5. Measure `bench -n 10 --warmup 1 --devices gpu0` (k=28/s=6 are fixed and no longer accept `-k`/`-s`). Compare with the **validated CUDA 25.13 s/plot** and historical SYCL 25.18 s/plot. **No new OFF remeasurement is needed** unless the toolchain/environment changes.
 6. If possible, test one overflow-heavy synthetic case and independent exact-index parity. The build is not yet certified.
 
+## CUDA-only Stage 2: Candidate D pool and direct CUB checks (unverified)
+
+After the 4096/4096 pure-CUDA Xs parity and host-memory/peer/gather tests passed
+on the RTX 4070 SUPER, the standalone target was extended:
+
+- `src/gpu/NativeCudaPool.hpp/.cpp` implements a **SYCL-free**
+  `NativeCudaPoolPlan` / `NativeCudaPool` with the exact k28/s6
+  Candidate-D allocation/alias footprint of the validated hybrid pool:
+  `d_storage`, lazy `d_pair_a`, `d_pair_b`, shared
+  Direct24/Direct20/CUB scratch, 64-bit counter, and lazy pinned T3 output.
+  It uses the shared device-free `PoolSizing.hpp` and
+  `CompactDLayout.hpp` helpers rather than maintaining a different cap
+  formula. It checks `cudaMemGetInfo` and preserves a 128 MiB safety margin.
+- CUB `SortPairs(u32,u32)`, `SortPairs(u32,u64)`, and `SortKeys(u64)`
+  are linked directly from the existing `SortCuda.cu`, bypassing
+  `SortSyclCub.cpp`. The standalone smoke now verifies their exact
+  ordering and value correspondence against CPU references on 4096 keys.
+- The standalone smoke calls `native_cuda_pool_plan()` to check
+  Candidate-D dimensions, exact-match index scratch, and reported VRAM
+  footprint, **without allocating the full 8+ GiB pool**.
+
+This new work **has not been rebuilt or run on hardware yet**. The existing
+verified CUDA/SYCL hybrid Plot executable is unchanged by these independent
+CUDA-only pool/test sources. The remaining full native Plot work is to
+orchestrate Xs/T1/T2/T3 through the native APIs while retaining the precise
+input/output alias lifetimes, native Feistel key schedule, and the existing
+Plot writer/verification code. The pool is intentionally not connected to
+the production CLI until that pipeline is in place.
+
+### Stage 2 incremental compile and check (VS2022 Developer PowerShell)
+
+```powershell
+cd C:\dev\xchplot2; git pull --ff-only origin cuda/nvidia-12gb-k28s6; if ($LASTEXITCODE -ne 0) { throw 'git pull failed' }; cmake --build .\build\windows-native-cuda-only-nvcc -j 16; if ($LASTEXITCODE -ne 0) { throw 'nvcc build failed' }; .\build\windows-native-cuda-only-nvcc\native_cuda_smoke.exe; if ($LASTEXITCODE -ne 0) { throw 'CUDA smoke failed' }
+```
+
 ## Remaining native CUDA-only work
 
 AdaptiveCpp/SYCL is still required for device discovery, CUDA-USM allocation/queues, pooled GPU host orchestration, and some distributed/sharded/streaming and fallback kernels. Those are **not** removed because doing so before porting the host layer would break plot creation. The CUDA-specific branch isolates the new code without altering main or the refactor branch. There is no claimed speedup until the k28/s6 hardware verification above.

@@ -12,8 +12,15 @@
 #include "host/BatchPlotter.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
+#if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
+#include "gpu/NativeCudaStandalonePipeline.hpp"
+#include "gpu/NativeCudaRuntime.hpp"
+#endif
 
 #include <filesystem>
+#include <cstdio>
+#include <cstdint>
+#include <array>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -101,6 +108,8 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
                       && (opts.t2 == PhaseStrategy::Gpu)
                       && (opts.t3 == PhaseStrategy::Gpu);
 
+    if (opts.native_cuda_test && !all_gpu)
+        throw std::invalid_argument("native CUDA test requires full GPU T1/T2/T3");
     if (!all_gpu) {
         warn_if_gpu_requested_but_unimplemented(opts);
     }
@@ -110,8 +119,33 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     // CPU path owns via cpu_fragments below.
     GpuPipelineResult pr;
     std::vector<uint64_t> cpu_fragments;
+    std::vector<uint64_t> native_fragments;
     std::span<uint64_t const> fragments;
-    if (all_gpu) {
+    if (all_gpu && opts.native_cuda_test) {
+#if defined(_WIN32) && defined(XCHPLOT2_NATIVE_CUDA_MATCH)
+        // Deliberately diagnostic-only: the production pipeline and batch
+        // worker still use the previously verified CUDA/SYCL hybrid.
+        // Only the GPU computation is CUDA-only here. The existing,
+        // well-tested CPU FSE/.gplot writer runs immediately afterward.
+        int ordinal = -1;
+        for (auto const& device : native_cuda_devices()) {
+            if (device.name.find("RTX 4070 SUPER") != std::string::npos)
+                ordinal = device.ordinal;
+        }
+        if (ordinal < 0)
+            throw std::runtime_error("native CUDA test needs RTX 4070 SUPER");
+        auto const result=native_cuda_run_k28s6(opts.plot_id,ordinal,&native_fragments);
+        if (native_fragments.size()!=result.t3_count)
+            throw std::runtime_error("native CUDA T3 captured count mismatch");
+        fragments=std::span<uint64_t const>(native_fragments);
+        std::cerr << "[cuda-native-test] GPU T1=" << result.t1_count
+                  << " T2=" << result.t2_count
+                  << " T3=" << result.t3_count
+                  << " compute+capture=" << result.seconds << "s\n";
+#else
+        throw std::runtime_error("native CUDA test requires Windows CUDA-only core build");
+#endif
+    } else if (all_gpu) {
         // Run the full pipeline on GPU; hand the sorted T3 fragments to
         // the CPU PlotFile writer for FSE compression and serialization.
         GpuPipelineConfig cfg;
@@ -137,6 +171,13 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
             opts.verbose);
         fragments = std::span<uint64_t const>(cpu_fragments.data(),
                                               cpu_fragments.size());
+    }
+
+    if (opts.fragment_digest || opts.native_cuda_test) {
+        auto const digest = raw_t3_fragments_sha256(fragments);
+        std::fprintf(stderr,"[fragments-hash] raw sorted T3 SHA256=");
+        for(uint8_t b:digest)std::fprintf(stderr,"%02x",unsigned(b));
+        std::fprintf(stderr," count=%zu\n",fragments.size());
     }
 
     write_plot_file_parallel(full_path.string(), fragments, entry);

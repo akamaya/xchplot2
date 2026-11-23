@@ -237,6 +237,73 @@ These identity/hash parity changes are committed but have not been
 rebuilt, run, or cross-compared on Windows yet. Do not claim full plot
 correctness from the compute-only result alone.
 
+
+## Stage 4: native CUDA compute -> existing validated .gplot writer (UNVERIFIED)
+
+A new **opt-in, single-plot diagnostic writer bridge** has been
+committed to the Windows CUDA-core branch. It does not change the
+default Plot/Bench/Batch backend or the validated 25.13s/Plot hybrid
+code path.
+
+- `NativeCudaStandalonePipeline.cpp/.hpp` now accepts an optional
+  `std::vector<uint64_t>*`: the production-independent CUDA compute
+  routine copies the final **raw sorted** T3 fragments into host RAM
+  only when explicitly requested. The normal `native_cuda_pipeline.exe`
+  still computes counts/hashes without allocating a 2+GiB host vector.
+- `GpuPlotter.cpp` uses that result when `xchplot2 test --native-cuda`
+  is selected; the **same** `write_plot_file_parallel()` CPU FSE writer
+  as the verified hybrid then creates `.gplot`. No new plot format
+  encoder has been invented. Only the GPU compute portion is CUDA-only
+  in this path; the containing `xchplot2.exe` still links SYCL.
+- The writer bridge checks captured output against the original
+  GPU-stream SHA256 (computed through independently linked SHA256
+  implementations) and verifies monotonic ordering **before writing**.
+  It refuses to replace an existing test `.gplot`.
+- `xchplot2 test --fragment-digest` exposes the raw, **including
+  duplicates**, sorted T3 SHA256 for exact comparison between the native
+  and earlier hybrid GPU pipelines. Do not confuse this digest with
+  `xchplot2 fragments-hash FILE`, which hashes the **deduplicated,
+  decoded** on-disk fragment stream.
+- The native test path runs on RTX 4070 SUPER, k28/s6, and still writes
+  the normal all-zero dummy memo when no memo is supplied. This is a
+  **test-only unfarmable plot**, even if `verify --full` succeeds.
+- Native writer objects are isolated in
+  `pos2_gpu_native_writer_bridge_obj` and included in the CLI only:
+  adding CNG/Windows symbols to the shared native object library would
+  otherwise break parity tools that have no `bcrypt` link dependency.
+
+**Status: code committed but NOT compiled, executed, or proof-verified
+on Windows yet. No Stage 4 performance claims.**
+
+Suggested verification using **VS2022 Developer PowerShell**, fixed
+Group ID of 32 zero bytes, output only to NAS:
+
+```powershell
+cd C:\dev\xchplot2; git pull --ff-only origin cuda/nvidia-12gb-k28s6; if ($LASTEXITCODE -ne 0) { throw 'git pull failed' }; cmake -S . -B .\build\windows-cuda-core -DXCHPLOT2_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89; if ($LASTEXITCODE -ne 0) { throw 'configure failed' }; cmake --build .\build\windows-cuda-core --target xchplot2 -j 16; if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+```
+
+```powershell
+cd C:\dev\xchplot2; $dir='\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4'; New-Item -ItemType Directory -Force -Path $dir | Out-Null; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe test ('0'*64) --native-cuda -o $dir -N stage4_native_cuda.gplot; if ($LASTEXITCODE -ne 0) { throw 'native writer bridge failed' }
+```
+
+```powershell
+cd C:\dev\xchplot2; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe verify '\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4\stage4_native_cuda.gplot' --full --trials 100; if ($LASTEXITCODE -ne 0) { throw 'native gplot Full Proof invalid' }
+```
+
+If the native test plot passes, compare the hybrid source's raw T3
+digest for the exact same Group ID:
+
+```powershell
+cd C:\dev\xchplot2; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe test ('0'*64) -G --fragment-digest -o '\\NAS-UGREEN\personal_folder\plots_test\cuda_native_verify\stage4' -N stage4_hybrid_reference.gplot; if ($LASTEXITCODE -ne 0) { throw 'hybrid parity plot failed' }
+```
+
+The two `[fragments-hash] raw sorted T3 SHA256=` values and counts
+must be exactly equal. The native pipeline's previous fixed demo
+Plot ID `072441...` is NOT the same as the 32-zero-byte Group ID
+above, so never compare these digests directly. Passing raw parity
+and `verify --full` is the gate for removing the remaining SYCL
+writer dependency.
+
 ## Remaining native CUDA-only work
 
 AdaptiveCpp/SYCL is still required for device discovery, CUDA-USM allocation/queues, pooled GPU host orchestration, and some distributed/sharded/streaming and fallback kernels. Those are **not** removed because doing so before porting the host layer would break plot creation. The CUDA-specific branch isolates the new code without altering main or the refactor branch. There is no claimed speedup until the k28/s6 hardware verification above.

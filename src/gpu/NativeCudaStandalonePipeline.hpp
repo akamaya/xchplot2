@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+#include <memory>
+#include <span>
 
 namespace pos2gpu {
 struct NativeCudaPipelineResult {
@@ -16,6 +18,28 @@ struct NativeCudaPipelineResult {
     std::array<uint8_t,32> sha256_unique_fragments{};
     double seconds=0;
 };
+// Validated writer handoff: keep full T3 output in CUDA-pinned host RAM,
+// just as the original pooled batch path does. No pageable 2-GiB duplicate,
+// SHA-256, or deduplication during plot production. Two pinned slots permit
+// the CPU writer of plot N to overlap GPU computation of plot N+1.
+class NativeCudaPool;
+struct NativeCudaPlotFrame {
+    NativeCudaPipelineResult stats;
+    std::span<uint64_t const> fragments;
+};
+class NativeCudaPlotSession final {
+public:
+    explicit NativeCudaPlotSession(int ordinal);
+    ~NativeCudaPlotSession() noexcept;
+    NativeCudaPlotSession(NativeCudaPlotSession const&) = delete;
+    NativeCudaPlotSession& operator=(NativeCudaPlotSession const&) = delete;
+    NativeCudaPlotFrame generate(
+        std::array<uint8_t,32> const& plot_id, int slot = 0);
+private:
+    std::unique_ptr<NativeCudaPool> pool_;
+    uint64_t* pinned_slots_[2]{};
+};
+
 // Scan CUDA devices without exposing CUDA Runtime types in host headers.
 int native_cuda_rtx4070_super_ordinal();
 

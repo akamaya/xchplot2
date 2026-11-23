@@ -24,5 +24,9 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
     // Optional: return sorted 56-bit T3 fragments to the existing
     // CPU .gplot writer. Default is compute/digest-only with no
     // multi-GiB host allocation.
-    std::vector<uint64_t>* out_sorted_fragments = nullptr);
+    std::vector<uint64_t>* out_sorted_fragments = nullptr,
+    // Default preserves standalone diagnostic digests. Set false on
+    // the normal test-plot writer bridge: it already validates
+    // sorted fragments and can be Full Proof checked on disk.
+    bool compute_digests = true);
 } // namespace pos2gpu

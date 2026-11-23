@@ -636,3 +636,66 @@ cd C:\dev\xchplot2; .\build\windows-cuda-core\tools\xchplot2\xchplot2.exe verify
 
 Do not overwrite the earlier passing
 `stage4_native_cuda.gplot`, which provides a baseline artifact.
+
+
+## 2026-11-23: pinned writer validation and SMB durability latency
+
+The user ran the original-equivalent pinned writer handoff on
+RTX 4070 SUPER (Group ID 32 zero bytes), output to the NAS SMB share:
+
+- GPU k28s6 Xs→T1→T2→T3 + direct ~2-GiB pinned D2H:
+  **24.9937s**. T1=268455895, T2=268506769,
+  T3=268596076. Stages T1 7532.399ms, T2 7950.424ms,
+  T3 8238.571ms, D2H 652.109ms.
+- The complete .gplot was written correctly; Full Proof
+  **81/81 PASS** over 100 challenges.
+- Writer **15.1339s**: boundaries 260.547ms, parallel FSE
+  130.598ms, file write 3632.401ms, **fflush+_commit+
+  fclose 11105.089ms**, publish 5.238ms.
+  End-to-end complete plot **40.443s**.
+- This 11.105s durability barrier is intermittent:
+  the same NAS destination with the 3-plot native series
+  produced Writer times 5.579 / 5.587 / 5.843s.
+  **The 15s single Writer is an outlier, not proof that
+  reading from pinned memory slowed FSE.**
+
+The 3-plot run had GPU produce times 25.126, 25.293,
+25.049s (sum 75.468s), including direct pinned transfers.
+The Writer overlapped GPU work successfully: wall
+**81.414s total, 27.138s/plot inclusive of startup and final
+Writer drain**. This is NOT steady-state throughput; with a
+longer sequence and a warmup, ~25s/plot is plausible but
+needs actual measurement. Full Proof was independently
+checked on the earlier single pinned plot; the three batch
+outputs have not yet undergone separate proof verification.
+
+The original/hybrid branch and CUDA-only bridge share
+essentially identical FSE Writer code. Therefore restoring the
+pinned buffers and overlapped consumer does NOT by itself
+eliminate the NAS write+durability time on a single plot.
+The user reports 26–27s for a single original plot;
+do not dismiss that report: measure the original -G path
+on this exact NAS share, same output Group ID, and record
+full wall and Writer-phase details before changing algorithms.
+
+The optional `POS2GPU_WRITER_PHASES=1` diagnostic has
+now been split into **fflush**, **fsync_commit**
+(Windows `_commit(fd)`) and **fclose** individually.
+This is a passive timer: the default writer still provides the
+same flush/sync durability and no hash, reread or synthetic
+data work is introduced. **The new split has not yet been
+rebuilt or run on Windows**. Do not silently skip `_commit`
+to manufacture a lower benchmark number: that would
+change on-disk durability semantics.
+
+Next steps after rebuilding the CLI:
+- Check where the sporadic sync latency occurs
+  (`fflush` vs `fsync_commit`) on both the hybrid `-G`
+  and native CUDA path with matching Group IDs.
+- If timing differs materially on identical NAS conditions,
+  inspect the actual source-memory and buffering interaction.
+  If similar, investigate Windows SMB/durable flush performance
+  independently from GPU compute.
+- Optionally test writing a dummy plot under the permitted
+  `C:\dev\xchplot2` path to differentiate disk/NAS latency.
+

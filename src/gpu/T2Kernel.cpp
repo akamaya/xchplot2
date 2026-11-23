@@ -43,7 +43,7 @@ T2MatchParams make_t2_params(int k, int strength)
 namespace {
 
 // Fine-bucket pre-index; see T3Kernel.cu for the scheme.
-// Fine bits are runtime-configurable via POS2GPU_T2_FINE_BITS.
+// Fixed profile uses Fine16 for T2 Direct20.
 
 // Shared parameter derivation so launch_t2_match, launch_t2_match_prepare,
 // and launch_t2_match_range all agree on bucket counts, offset layout,
@@ -78,7 +78,7 @@ T2Derived derive_t2(T2MatchParams const& params)
     d.bucket_bytes    = layout.bucket_bytes;
     d.fine_bytes      = layout.fine_bytes;
     d.temp_needed     = layout.total_bytes();
-    d.direct20_enabled = fine_direct20_enabled(d.fine_bits, params.num_match_target_bits);
+    d.direct20_enabled = fine_direct20_enabled(d.fine_bits, params.num_match_target_bits, d.num_buckets);
     d.direct_enabled  = !d.direct20_enabled &&
         fine_direct16_enabled(d.fine_bits, params.num_match_target_bits);
     if (d.direct20_enabled) d.temp_needed += fine_direct20_bytes(d.num_buckets);

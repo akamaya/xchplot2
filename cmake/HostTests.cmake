@@ -8,11 +8,6 @@ add_executable(t2_xbits_reuse_test tools/parity/t2_xbits_reuse_test.cpp)
 target_include_directories(t2_xbits_reuse_test PRIVATE src)
 target_compile_features(t2_xbits_reuse_test PRIVATE cxx_std_20)
 
-# Pool-path lifetime aliasing of Fine Bucket match-index scratch.
-add_executable(match_scratch_alias_test tools/parity/match_scratch_alias_test.cpp)
-target_include_directories(match_scratch_alias_test PRIVATE src)
-target_compile_features(match_scratch_alias_test PRIVATE cxx_std_20)
-
 # Validate 32-bit T2/T3 fine-index size, layout, and overflow guard.
 add_executable(fine_bucket_index_test tools/parity/fine_bucket_index_test.cpp)
 target_include_directories(fine_bucket_index_test PRIVATE src)

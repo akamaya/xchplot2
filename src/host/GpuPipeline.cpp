@@ -11,7 +11,6 @@
 
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
-#include "host/MatchScratchAlias.hpp"
 #include "host/T2XbitsReuse.hpp"
 #include "host/XsPairAAlias.hpp"
 #include "host/VramBudget.hpp"
@@ -483,28 +482,11 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // on single-plot runs (only slot 0 gets allocated). See
     // GpuBufferPool::ensure_pinned header comment for rationale.
     uint64_t*       h_pinned_t3    = sink || device_output ? nullptr : pool.ensure_pinned(pinned_index);
-    // Match-index scratch is built/read entirely within each Match phase.
-    // Borrow the d_storage suffix not used by that phase's live input.
-    // T1 still reads Xs[total_xs] from the prefix; T2/T3 still read the
-    // sorted match-info keys from the first u32[cap]. Sort phases run after
-    // each match and may overwrite the borrowed memory only once it is dead.
-    auto const t1_match_idle = match_scratch_idle_suffix(
-        pool.storage_bytes, static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu) +
-            (pool.compact_d ? static_cast<size_t>(cap) * sizeof(uint32_t) : 0));
-    auto const t2_match_idle = match_scratch_idle_suffix(
-        pool.storage_bytes, pool.compact_d
-            ? static_cast<size_t>(cap) * 3 * sizeof(uint32_t)
-            : xs_pair_a_t2_match_live_prefix(
-                static_cast<size_t>(cap), pool.xs_pair_a_alias));
-    auto const t3_match_idle = match_scratch_idle_suffix(
-        pool.storage_bytes, t3_match_live_prefix_bytes(
-            static_cast<size_t>(cap), pool.t2_xbits_reuse));
-    bool const alias_match_scratch = match_scratch_alias_enabled();
-    auto select_match_temp = [&](size_t required, MatchScratchRegion region) -> void* {
-        if (match_scratch_can_alias(alias_match_scratch, region, required))
-            return static_cast<uint8_t*>(pool.d_storage) + region.offset;
+    // T1/T2/T3 exact indexes and radix sorting take turns using the
+    // same dedicated scratch allocation. Nothing aliases live d_storage.
+    auto select_match_temp = [&](size_t required) -> void* {
         if (required > pool.sort_scratch_bytes)
-            throw std::runtime_error("Fine Bucket match index exceeds pooled fallback scratch");
+            throw std::runtime_error("Match index exceeds pooled scratch");
         return d_sort_scratch;
     };
 
@@ -656,7 +638,7 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           nullptr, nullptr, d_count, cap,
                           nullptr, &t1_temp_bytes, q);
-    void* const t1_match_temp = select_match_temp(t1_temp_bytes, t1_match_idle);
+    void* const t1_match_temp = select_match_temp(t1_temp_bytes);
     // The queue is out-of-order: wait so the counter zeroing can't be
     // scheduled after the match kernel that increments it.
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
@@ -708,7 +690,7 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
                           nullptr, nullptr, nullptr, d_count, cap,
                           nullptr, &t2_temp_bytes, q);
-    void* const t2_match_temp = select_match_temp(t2_temp_bytes, t2_match_idle);
+    void* const t2_match_temp = select_match_temp(t2_temp_bytes);
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t2 = begin_phase("T2 match");
     launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
@@ -773,7 +755,7 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
                           nullptr, t2_count,
                           d_t3, d_count, cap,
                           nullptr, &t3_temp_bytes, q);
-    void* const t3_match_temp = select_match_temp(t3_temp_bytes, t3_match_idle);
+    void* const t3_match_temp = select_match_temp(t3_temp_bytes);
     q.memset(d_count, 0, sizeof(uint64_t)).wait();
     int p_t3 = begin_phase("T3 match + Feistel");
     launch_t3_match(cfg.plot_id.data(), t3p,

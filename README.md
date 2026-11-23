@@ -1,5 +1,7 @@
 # xchplot2
 
+> **Refactor branch:** k=28 / strength=6 fixed for generation; verified SYCL GPU optimizations selected automatically. See [refactor notes](docs/VERIFIED_GPU_ALWAYS_ON_2026-11-23.md). Earlier experimental switch examples below are historical only.
+
 <!-- BEGIN XCHPLOT2-FORK-OPTIMIZATION -->
 
 > [!NOTE]

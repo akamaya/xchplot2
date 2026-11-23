@@ -7,7 +7,6 @@
 // CUDA host code share the same primary CUDA context).
 
 #include "host/GpuBufferPool.hpp"
-#include "host/MatchScratchAlias.hpp"
 #include "host/CompactDLayout.hpp"
 #include "host/T2XbitsReuse.hpp"
 #include "host/XsPairAAlias.hpp"
@@ -294,57 +293,21 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
             static_cast<size_t>(cap), pair_b_bytes, storage_bytes,
             xs_pair_a_alias))
         throw std::runtime_error("T2 xbits reuse: insufficient pool layout");
-    // The Fine Bucket match-index scratch aliases the idle suffix of
-    // d_storage during each match. Only match-index requests that do not fit
-    // their phase's free suffix need dedicated d_sort_scratch storage.
-    // Sort and match never run concurrently in this pool path; this avoids a
-    // separate ~320 MiB Fine16 Direct allocation on the k28 u32 path.
+    // Full-key exact indexes reuse the shared sort/match buffer.
     {
         uint8_t dummy_plot_id[32] = {};
-        size_t t1_match_bytes = 0;
-        size_t t2_match_bytes = 0;
-        size_t t3_match_bytes = 0;
+        size_t t1_bytes = 0, t2_bytes = 0, t3_bytes = 0;
         launch_t1_match_prepare(dummy_plot_id, make_t1_params(k, strength),
-                                nullptr, total_xs, nullptr, nullptr,
-                                &t1_match_bytes, q);
+                                nullptr, total_xs, nullptr, nullptr, &t1_bytes, q);
         launch_t2_match_prepare(dummy_plot_id, make_t2_params(k, strength),
-                                nullptr, 0, nullptr, nullptr,
-                                &t2_match_bytes, q);
+                                nullptr, 0, nullptr, nullptr, &t2_bytes, q);
         launch_t3_match_prepare(dummy_plot_id, make_t3_params(k, strength),
-                                nullptr, 0, nullptr, nullptr,
-                                &t3_match_bytes, q);
-        auto const t1_idle = match_scratch_idle_suffix(
-            storage_bytes,
-            static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu) +
-                (compact_d ? static_cast<size_t>(cap) * sizeof(uint32_t) : 0));
-        auto const t2_idle = match_scratch_idle_suffix(
-            storage_bytes, compact_d
-                ? static_cast<size_t>(cap) * 3 * sizeof(uint32_t)
-                : xs_pair_a_t2_match_live_prefix(
-                    static_cast<size_t>(cap), xs_pair_a_alias));
-        // T3 additionally keeps sorted T2 xbits in d_storage's vals_in slot.
-        auto const t3_idle = match_scratch_idle_suffix(
-            storage_bytes, t3_match_live_prefix_bytes(
-                static_cast<size_t>(cap), t2_xbits_reuse));
-        bool const alias_enabled = match_scratch_alias_enabled();
-        size_t const previous_bytes = std::max({sort_scratch_bytes,
-                                                 t1_match_bytes, t2_match_bytes,
-                                                 t3_match_bytes});
-        sort_scratch_bytes = match_scratch_backing_bytes(
-            sort_scratch_bytes, t1_match_bytes, t2_match_bytes, t3_match_bytes,
-            t1_idle, t2_idle, t3_idle, alias_enabled);
-        if (std::getenv("POS2GPU_POOL_DEBUG")) {
+                                nullptr, 0, nullptr, nullptr, &t3_bytes, q);
+        sort_scratch_bytes = std::max({sort_scratch_bytes, t1_bytes, t2_bytes, t3_bytes});
+        if (std::getenv("POS2GPU_POOL_DEBUG"))
             std::fprintf(stderr,
-                "[pool] match-index bytes: T1=%zu T2=%zu T3=%zu; "
-                "shared sort_scratch=%zu; alias T1=%d T2=%d T3=%d; "
-                "saved=%zu bytes\n",
-                t1_match_bytes, t2_match_bytes, t3_match_bytes,
-                sort_scratch_bytes,
-                int(match_scratch_can_alias(alias_enabled, t1_idle, t1_match_bytes)),
-                int(match_scratch_can_alias(alias_enabled, t2_idle, t2_match_bytes)),
-                int(match_scratch_can_alias(alias_enabled, t3_idle, t3_match_bytes)),
-                previous_bytes - sort_scratch_bytes);
-        }
+                "[pool] exact-index scratch: T1=%zu T2=%zu T3=%zu; shared=%zu bytes\n",
+                t1_bytes, t2_bytes, t3_bytes, sort_scratch_bytes);
     }
     pinned_bytes = sizes.pinned_bytes;
     if (std::getenv("POS2GPU_POOL_DEBUG")) {

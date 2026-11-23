@@ -11,8 +11,7 @@ namespace pos2gpu {
 // Explicit opt-in. Leave A+B+C as the default until GPU parity and A/B pass.
 inline bool compact_d_requested() noexcept
 {
-    char const* v = std::getenv("POS2GPU_COMPACT_D");
-    return v && v[0] == '1' && v[1] == '\0';
+    return true;
 }
 
 constexpr bool compact_d_layout_fits(

@@ -13,28 +13,13 @@ namespace pos2gpu {
 
 inline int fine_bucket_bits(int table_id, int target_bits)
 {
-    const char* name;
-    int max_bits;
-    switch (table_id) {
-    case 1: name = "POS2GPU_T1_FINE_BITS"; max_bits = 18; break;
-    case 2: name = "POS2GPU_T2_FINE_BITS"; max_bits = 16; break;
-    case 3: name = "POS2GPU_T3_FINE_BITS"; max_bits = 16; break;
-    default: throw std::invalid_argument("invalid fine bucket table id");
-    }
-
-    int bits = 8;
-    if (const char* value = std::getenv(name); value && value[0] != '\0') {
-        char* end = nullptr;
-        errno = 0;
-        long const parsed = std::strtol(value, &end, 10);
-        if (errno != 0 || end == value || *end != '\0' || parsed < 1 || parsed > max_bits)
-            throw std::invalid_argument(std::string(name) + " must be in [1, " +
-                                        std::to_string(max_bits) + "]");
-        bits = static_cast<int>(parsed);
-    }
+    if (table_id < 1 || table_id > 3)
+        throw std::invalid_argument("invalid fine bucket table id");
+    int const bits = table_id == 1 && target_bits == 24 ? 18
+                   : (table_id == 2 || table_id == 3) && target_bits == 20 ? 16
+                   : 8; // non-28 shape for test/compatibility code only
     if (bits >= target_bits)
-        throw std::invalid_argument(std::string(name) + " must be less than num_match_target_bits (" +
-                                    std::to_string(target_bits) + ")");
+        throw std::invalid_argument("fine index bits exceed target bits");
     return bits;
 }
 

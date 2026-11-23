@@ -47,7 +47,7 @@ T1MatchParams make_t1_params(int k, int strength)
 
 namespace {
 
-// Fine bits are runtime-configurable via POS2GPU_T1_FINE_BITS.
+// Fixed profile uses Fine18 for T1 Direct24; other shapes retain safe sizing.
 
 struct T1Derived {
     uint32_t num_sections;

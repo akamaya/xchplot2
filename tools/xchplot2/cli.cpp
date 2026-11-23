@@ -208,7 +208,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "  " << prog << " compute COMMAND [OPTIONS]\n"
         << "    Farming-layout preview, capacity-driven plotting, group growth and shared compute.\n"
         << "    Use COMMAND --help for its options. Previews write only requested plan or profile exports.\n"
-        << "  " << prog << " test <k> <group_id_hex> [strength] [plot_index] [meta_group] [verbose]\n"
+        << "  " << prog << " test <group_id_hex> [plot_index] [meta_group] [verbose]\n"
         << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
@@ -219,15 +219,15 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "    The gplot-v2-grouped format adds a final member count.\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
-        << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [-d|--devices SPEC]\n"
+        << "  " << prog << " bench [-n N] [-o DIR] [-d|--devices SPEC]\n"
         << "         [--tier T] [--cpu] [--warmup W] [--keep]\n"
         << "         [--target-size TiB] [--compute-only] [--json] [-q|--quiet]\n"
         << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
         << "    synthetic unfarmable plots (default queue: 1 warmup + 10 measured\n"
         << "    plots/worker). Always writes real .gplot files; deletes them\n"
         << "    on exit unless --keep is set.\n"
-        << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
-        << "         [-s S] [-o DIR] [-i N] [-g N] [-S HEX] [-v] [-q]\n"
+        << "  " << prog << " plot -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
+        << "         [-o DIR] [-i N] [-g N] [-S HEX] [-v] [-q]\n"
         << "         [-r|--resume] [--manifest FILE] [--continue-on-error]\n"
         << "         [--group-members N] [--construction auto|incremental|staged|merged|external]\n"
         << "         [--compute auto|off] [--compute-local on|off] [--compute-directory DIR]\n"
@@ -238,12 +238,10 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "        --pool-ph HEX               : 64 hex chars (raw puzzle hash).\n"
         << "    -c, --pool-contract-address ADR : Chia bech32m address (xch1.../txch1...);\n"
         << "                                      decoded internally to a 32-byte hash.\n"
-        << "    -k, --k K                       : k size: 28 for farming (default); smaller sizes for testing.\n"
         << "    -n, --num N                     : number of plots to create.\n"
         << "    --group-members N               : members per file, 1..65535.\n"
         << "                                      -n still counts files; default is one member per file.\n"
         << "    -j, --workers N                 : shared plotting CPU budget for grouped jobs.\n"
-        << "    -s, --strength S                : v2 PoS strength (default 2).\n"
         << "    -o, --out DIR                   : output directory.\n"
         << "    --manifest FILE                 : save/reuse this job manifest (default: unique\n"
         << "                                      xchplot2-job-*.tsv in the output directory).\n"
@@ -390,9 +388,8 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "    @FILE          insert whitespace-separated arguments (no shell quoting).\n"
         << "\n"
         << "  test-mode positional args:\n"
-        << "    <k>            : even integer in [18, 28]\n"
         << "    <group_id_hex>  : 64 hex characters\n"
-        << "    [strength]     : optional, defaults to 2\n"
+        << "    k / strength : fixed at 28 / 6\n"
         << "    [plot_index]   : optional, defaults to 0\n"
         << "    [meta_group]   : optional, defaults to 0\n"
         << "    [verbose]      : optional, 0/1, default 0\n"
@@ -1658,8 +1655,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     }
 
     if (mode == "bench") {
-        int k = 28;
-        int strength = 2;
+        constexpr int k = 28;
+        constexpr int strength = 6;
         int measured = 10;
         int warmup = 1;
         bool keep = false;
@@ -1681,9 +1678,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 return true;
             };
-            if      ((a == "--k" || a == "-k") && need(1)) { if (!parse_integer_arg(argv[++i], k, a)) return 1; }
-            else if ((a == "--strength" || a == "-s") && need(1)) { if (!parse_integer_arg(argv[++i], strength, a)) return 1; }
-            else if ((a == "--num" || a == "-n") && need(1)) { if (!parse_integer_arg(argv[++i], measured, a)) return 1; }
+            if ((a == "--num" || a == "-n") && need(1)) { if (!parse_integer_arg(argv[++i], measured, a)) return 1; }
             else if (a == "--warmup" && need(1)) { if (!parse_integer_arg(argv[++i], warmup, a)) return 1; }
             else if ((a == "--out" || a == "-o") && need(1)) out_dir = argv[++i];
             else if (a == "--json") json = true;
@@ -2431,8 +2426,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
     if (mode == "plot") {
         // Standalone farmable-plot path: derive plot_id + memo internally.
-        int k = 28;
-        int strength = 2;
+        constexpr int k = 28;
+        constexpr int strength = 6;
         int num = 1;
         int group_members = 1;
         bool group_requested = false;
@@ -2487,9 +2482,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 if (a != "--compute" && a != "--compute-directory") group_requested = true;
                 group_options.insert(group_options.end(), {a, argv[++i]});
             }
-            else if ((a == "--k"          || a == "-k") && need(1)) { if (!parse_integer_arg(argv[++i], k, a)) return 1; }
             else if ((a == "--num"        || a == "-n") && need(1)) { if (!parse_integer_arg(argv[++i], num, a)) return 1; }
-            else if ((a == "--strength"   || a == "-s") && need(1)) { if (!parse_integer_arg(argv[++i], strength, a)) return 1; }
             else if ((a == "--out"        || a == "-o") && need(1)) out_dir  = argv[++i];
             else if ((a == "--farmer-pk"  || a == "-f") && need(1)) farmer_pk_hex = argv[++i];
             else if ((a == "--pool-pk"    || a == "-p") && need(1)) pool_pk_hex   = argv[++i];
@@ -3012,7 +3005,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --broker-port --worker-port --firewall --from --zone --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --num --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --broker-port --worker-port --firewall --from --zone --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -n -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill || "${COMP_WORDS[1]}" == status || "${COMP_WORDS[1]}" == pause || "${COMP_WORDS[1]}" == drain || "${COMP_WORDS[1]}" == resume || "${COMP_WORDS[1]}" == retire ]]; then
@@ -3232,7 +3225,7 @@ _xchplot2() {
         '--warmup[Warmup plots per worker]:count:' \
         '--keep[Retain benchmark plots]' '--compute-only[Add RAM-backed pass]' \
         '--target-size[Target size in TiB]:size:' '--json[Benchmark JSON on stdout]' \
-        '-k[Plot size]:k:' '-n[Plot count]:count:' '-s[Strength]:strength:' \
+        '-n[Plot count]:count:' \
         '-f[Farmer public key]:hex:' '-p[Pool public key]:hex:' \
         '--pool-ph[Pool puzzle hash]:hex:' '-c[Pool contract address]:address:' \
         '-i[Plot index]:index:' '-g[Meta group]:group:' '-S[Seed]:hex:' \
@@ -3433,8 +3426,6 @@ complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l cpu       -d
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l shard-plot     -d 'Single-plot multi-GPU (experimental)'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l pipeline-plot  -d 'Pipeline-parallel multi-stage'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s o -l out  -r -d 'Output dir'
-complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s k -l k -x -d 'Plot size'
-complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s s -l strength -x -d 'Strength'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s f -l farmer-pk -x -d 'Farmer public key'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s p -l pool-pk -x -d 'Pool public key'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s c -l pool-contract-address -x -d 'Pool contract address'
@@ -3525,25 +3516,25 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
         }
     }
 
-    if (pos.size() < 2) {
+    if (pos.size() < 1) {
         print_command_help(argv[0], mode, std::cerr);
         return 1;
     }
-    if (pos.size() > 6) {
-        std::cerr << "Error: unexpected argument: " << pos[6] << '\n'; return 1;
+    if (pos.size() > 4) {
+        std::cerr << "Error: unexpected argument: " << pos[4] << '\n'; return 1;
     }
 
-    if (!parse_integer_arg(pos[0], opts.k, "k")) return 1;
-    if (!parse_hex(pos[1], opts.group_id)) {
+    opts.k = 28;
+    opts.strength = 6;
+    if (!parse_hex(pos[0], opts.group_id)) {
         std::cerr << "Error: group_id must be 64 hex characters\n";
         return 1;
     }
-    if (pos.size() >= 3 && !parse_integer_arg(pos[2], opts.strength, "strength")) return 1;
-    if (pos.size() >= 4 && !parse_integer_arg(pos[3], opts.plot_index, "plot_index")) return 1;
-    if (pos.size() >= 5 && !parse_integer_arg(pos[4], opts.meta_group, "meta_group")) return 1;
-    if (pos.size() >= 6) {
+    if (pos.size() >= 2 && !parse_integer_arg(pos[1], opts.plot_index, "plot_index")) return 1;
+    if (pos.size() >= 3 && !parse_integer_arg(pos[2], opts.meta_group, "meta_group")) return 1;
+    if (pos.size() >= 4) {
         int verbose = 0;
-        if (!parse_integer_arg(pos[5], verbose, "verbose")) return 1;
+        if (!parse_integer_arg(pos[3], verbose, "verbose")) return 1;
         opts.verbose = verbose != 0;
     }
     if (verbose_flag) opts.verbose = *verbose_flag;

@@ -54,8 +54,7 @@ constexpr bool t2_xbits_reuse_layout_fits(std::size_t cap,
 // keep that choice on the pool object for the lifetime of a plot/batch.
 inline bool t2_xbits_reuse_enabled() noexcept
 {
-    char const* v = std::getenv("POS2GPU_T2_XBITS_REUSE");
-    return !(v && v[0] == '0' && v[1] == '\0');
+    return true;
 }
 
 } // namespace pos2gpu

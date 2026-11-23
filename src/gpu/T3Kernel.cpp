@@ -51,7 +51,7 @@ T3MatchParams make_t3_params(int k, int strength)
 
 namespace {
 
-// Fine bits are runtime-configurable via POS2GPU_T3_FINE_BITS.
+// Fixed profile uses Fine16 for T3 Direct20.
 
 struct T3Derived {
     uint32_t num_sections;
@@ -81,7 +81,7 @@ T3Derived derive_t3(T3MatchParams const& params)
     d.bucket_bytes    = layout.bucket_bytes;
     d.fine_bytes      = layout.fine_bytes;
     d.temp_needed     = layout.total_bytes();
-    d.direct20_enabled = fine_direct20_enabled(d.fine_bits, params.num_match_target_bits);
+    d.direct20_enabled = fine_direct20_enabled(d.fine_bits, params.num_match_target_bits, d.num_buckets);
     d.direct_enabled  = !d.direct20_enabled &&
         fine_direct16_enabled(d.fine_bits, params.num_match_target_bits);
     if (d.direct20_enabled) d.temp_needed += fine_direct20_bytes(d.num_buckets);

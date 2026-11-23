@@ -4111,6 +4111,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // the single- and multi-device paths share the same error surface.
     int  const pool_k        = entries[0].k;
     int  const pool_strength = entries[0].strength;
+    if (pool_k != 28 || pool_strength != 6)
+        throw std::invalid_argument("This optimized build generates only k=28, strength=6 plots");
     bool const pool_testnet  = entries[0].testnet;
     for (size_t i = 1; i < entries.size(); ++i) {
         if (entries[i].k != pool_k

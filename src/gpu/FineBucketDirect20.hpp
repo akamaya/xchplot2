@@ -1,5 +1,5 @@
 // FineBucketDirect20.hpp — experimental full 20-bit exact T2/T3 lookup.
-// POS2GPU_T23_DIRECT20=1, k=28, strength=6, fine_bits=16, 256 buckets.
+// Automatically enabled for the fixed k28/s6 T2/T3 Fine16 compact profile.
 // Layout: existing bucket offsets + u32 Fine16 lower bounds +
 //         u32 Direct20 lower bounds[256 * (1<<20) + 1].
 // The first/last values for (bucket,target) are direct[key], direct[key+1].
@@ -24,14 +24,11 @@ inline constexpr uint32_t kFineDirect20NumBuckets = 256;
 inline constexpr uint32_t kFineDirect20SuffixBits = 4;
 inline constexpr uint32_t kFineDirect20SuffixCount = 16;
 
-inline bool fine_direct20_enabled(int fine_bits, int target_bits)
+inline bool fine_direct20_enabled(int fine_bits, int target_bits, uint32_t num_buckets = 256)
 {
-    char const* v = std::getenv("POS2GPU_T23_DIRECT20");
-    if (!(v && v[0] == '1' && v[1] == '\0')) return false;
-    if (fine_bits != kFineDirect20FineBits || target_bits != kFineDirect20TargetBits)
-        throw std::invalid_argument(
-            "POS2GPU_T23_DIRECT20=1 requires T2/T3 fine_bits=16 and target_bits=20 (k28 s6)");
-    return true;
+    return fine_bits == kFineDirect20FineBits &&
+           target_bits == kFineDirect20TargetBits &&
+           num_buckets == kFineDirect20NumBuckets;
 }
 
 inline size_t fine_direct20_bytes(uint32_t num_buckets)

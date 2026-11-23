@@ -1,5 +1,5 @@
 // T1Direct24.hpp — experimental full 24-bit exact-match index (SYCL path).
-// Enabled only by POS2GPU_T1_DIRECT24=1 with k28/T1 fine_bits=18 and Compact.
+// Automatically enabled for the fixed k28/s6 T1 Fine18 compact profile.
 // The index is a u32 lower-bound table of 16 * 2^24 + 1 elements.
 // Reuses the T1 match-prepare scratch; never change the environment mid-process.
 #pragma once
@@ -22,19 +22,9 @@ inline constexpr uint32_t kT1Direct24NumBuckets = 16;
 
 inline bool t1_direct24_enabled(int fine_bits, int target_bits, uint32_t num_buckets)
 {
-    char const* v = std::getenv("POS2GPU_T1_DIRECT24");
-    if (!v || v[0] != '1' || v[1] != '\0') return false;
-    if (fine_bits != kT1Direct24FineBits ||
-        target_bits != kT1Direct24TargetBits ||
-        num_buckets != kT1Direct24NumBuckets)
-        throw std::invalid_argument(
-            "POS2GPU_T1_DIRECT24=1 requires k=28 T1: "
-            "POS2GPU_T1_FINE_BITS=18, 24 target bits and 16 buckets");
-    char const* compact = std::getenv("POS2GPU_T1_COMPACT");
-    if (!compact || compact[0] != '1' || compact[1] != '\0')
-        throw std::invalid_argument(
-            "POS2GPU_T1_DIRECT24=1 requires POS2GPU_T1_COMPACT=1");
-    return true;
+    return fine_bits == kT1Direct24FineBits &&
+           target_bits == kT1Direct24TargetBits &&
+           num_buckets == kT1Direct24NumBuckets;
 }
 
 inline size_t t1_direct24_bytes(uint32_t num_buckets)

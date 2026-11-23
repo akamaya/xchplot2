@@ -17,8 +17,7 @@ namespace pos2gpu {
 
 inline bool xs_pair_a_alias_requested() noexcept
 {
-    char const* v = std::getenv("POS2GPU_XS_PAIR_A_ALIAS");
-    return !(v && v[0] == '0' && v[1] == '\0');
+    return true;
 }
 
 constexpr bool xs_pair_a_alias_fits(bool requested, bool t2_reuse,

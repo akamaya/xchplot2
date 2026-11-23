@@ -1,5 +1,5 @@
 // FineBucketDirect.hpp — experimental 16+4 exact target lookup for T2/T3.
-// POS2GPU_FINE_DIRECT=1; requires fine_bits=16 and target_bits=20.
+// Retired 16+4 direct index: the fixed profile uses Direct20 instead.
 // Layout: u32 fine_offsets[256*65536+1], then u8 suffix_start[256*2^20].
 // Each 16-bit group stores 16 lower_bound relative offsets (0..254).
 // A group containing >=255 rows uses 0xFF for all suffixes and falls back
@@ -18,12 +18,9 @@ namespace pos2gpu {
 
 inline bool fine_direct16_enabled(int fine_bits, int target_bits)
 {
-    char const* v = std::getenv("POS2GPU_FINE_DIRECT");
-    if (!(v && v[0] == '1')) return false;
-    if (fine_bits != 16 || target_bits != 20)
-        throw std::invalid_argument(
-            "POS2GPU_FINE_DIRECT=1 requires T2/T3 fine bits=16 and target bits=20 (k28 s6)");
-    return true;
+    (void)fine_bits;
+    (void)target_bits;
+    return false;
 }
 
 inline size_t fine_direct16_bytes(uint32_t num_buckets)

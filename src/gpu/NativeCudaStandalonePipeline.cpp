@@ -48,7 +48,8 @@ struct FragmentDigests {
     uint64_t distinct=0;
 };
 FragmentDigests digest_fragments(NativeCudaPool& pool,
-                                 uint64_t const* fragments,uint64_t count) {
+                                 uint64_t const* fragments,uint64_t count,
+                                 std::vector<uint64_t>* capture) {
     auto& session=pool.session();
     // Stream sorted T3 output in 8-MiB pinned tiles. SHA256 of the raw
     // fragment bytes must match earlier validated CUDA-only results.
@@ -56,6 +57,11 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
     // fragments, so also hash a deduplicated monotonic stream. Keep this
     // second hash separate rather than silently changing the raw one.
     constexpr size_t tile_bytes=8u<<20;
+    if (capture) {
+        if (count > SIZE_MAX / sizeof(uint64_t))
+            throw std::runtime_error("CUDA-only fragment capture size overflow");
+        capture->resize(static_cast<size_t>(count));
+    }
     void* pinned=session.allocate_pinned(tile_bytes);
     BCRYPT_ALG_HANDLE algorithm=nullptr;
     BCRYPT_HASH_HANDLE raw_hash=nullptr, unique_hash=nullptr;
@@ -72,6 +78,13 @@ FragmentDigests digest_fragments(NativeCudaPool& pool,
         for(uint64_t off=0;off<total_bytes;off+=tile_bytes) {
             size_t bytes=size_t(std::min<uint64_t>(tile_bytes,total_bytes-off));
             session.copy_d2h(pinned,src+off,bytes);
+            // Save the exact raw sorted stream before the in-place
+            // duplicate-compaction used for the canonical unique digest.
+            // Pageable host RAM is reached through this small pinned tile;
+            // do not issue a multi-GiB cudaMemcpyAsync to pageable memory.
+            if(capture)
+                std::memcpy(reinterpret_cast<uint8_t*>(capture->data())+size_t(off),
+                            pinned,bytes);
             if(BCryptHashData(raw_hash,static_cast<PUCHAR>(pinned),ULONG(bytes),0)<0)
                 throw std::runtime_error("SHA-256 raw BCryptHashData failed");
             // Compact only within this tile. The global previous-value state
@@ -283,19 +296,8 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         cub_sort_keys_u64(scratch,cub_bytes,
             fragments_in,fragments_out,t3_count,0,56);
         std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
-        auto const digests=digest_fragments(pool,fragments_out,t3_count);
-        if (out_sorted_fragments) {
-            // Only the explicit CPU .gplot writer bridge requests the raw
-            // sorted output. The native compute-only runner keeps its
-            // original 8 MiB tiled digest path, with no huge host buffer.
-            // This allocation is pageable (not pinned), so it fits a 128 GB
-            // workstation without claiming another ~2 GiB of locked RAM.
-            if (t3_count > SIZE_MAX / sizeof(uint64_t))
-                throw std::runtime_error("CUDA-only fragment capture size overflow");
-            out_sorted_fragments->resize(static_cast<size_t>(t3_count));
-            session.copy_d2h(out_sorted_fragments->data(), fragments_out,
-                             static_cast<size_t>(t3_count)*sizeof(uint64_t));
-        }
+        auto const digests=digest_fragments(
+            pool,fragments_out,t3_count,out_sorted_fragments);
         NativeCudaPipelineResult result{};
         result.t1_count=t1_count;
         result.t2_count=t2_count;

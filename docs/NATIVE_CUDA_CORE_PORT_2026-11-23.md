@@ -189,6 +189,42 @@ On the first run, report the count/digest/first error to compare
 against the reference pipeline; **avoid rerunning the old ON/OFF benchmarks**.
 The compute-only diagnostic intentionally writes no plot or test files.
 
+
+## Stage 3: same-Group-ID T3 parity against the verified hybrid (not yet run)
+
+The CUDA-only Xs/T1/T2/T3 calculation completed on RTX 4070 SUPER:
+T1=268396548, T2=268356064, T3=268266000 and 25.987 seconds
+including sorted raw T3 fragment SHA256. The full independent smoke
+suite and Windows CNG Feistel key schedule passed. This is still not
+an on-disk Full Proof check.
+
+To compare both engines on exactly the same identity:
+
+- The native CUDA runner now accepts --group-id HEX (32 bytes), derives
+  index=0/meta=0 Plot ID by SHA256(group_id || 0000 || 00), and keeps
+  --plot-id HEX for direct compute-only experiments. They are exclusive.
+- The native runner reports both the raw sorted T3 digest and the
+  canonical UNIQUE sorted T3 digest and distinct count. The group plot
+  compressor discards equal adjacent fragments, so its decoded digest
+  must be compared with the unique variant, not the raw variant.
+- The hybrid xchplot2 CLI now supports fragments-hash FILE.gplot.
+  It uses the existing single-member plot reader and the upstream
+  CPU SHA256 implementation, and prints decoded T3 count and digest.
+  Decoding a full k28 plot needs about 2.1 GiB of host RAM plus overhead.
+- Generate the reference using the matching Group ID and index=0/meta=0
+  via xchplot2.exe test GROUPID 0 0 0 -G, compare both digests and
+  counts, and verify the produced reference with --full --trials 100.
+  A mismatch must block direct writer integration.
+
+Reproducible non-farming test Group ID: 64 zero hex digits.
+Its expected index-0/meta-0 Plot ID is
+0d5535e13cc9708d0ff0289af2fae27e564b6bcbcd9242f5140d96957744a517.
+
+Existing hybrid GPU algorithms and plot writing remain unchanged.
+These identity/hash parity changes are committed but have not been
+rebuilt, run, or cross-compared on Windows yet. Do not claim full plot
+correctness from the compute-only result alone.
+
 ## Remaining native CUDA-only work
 
 AdaptiveCpp/SYCL is still required for device discovery, CUDA-USM allocation/queues, pooled GPU host orchestration, and some distributed/sharded/streaming and fallback kernels. Those are **not** removed because doing so before porting the host layer would break plot creation. The CUDA-specific branch isolates the new code without altering main or the refactor branch. There is no claimed speedup until the k28/s6 hardware verification above.

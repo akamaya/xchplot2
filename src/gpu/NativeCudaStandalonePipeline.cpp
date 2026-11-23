@@ -42,37 +42,73 @@ uint64_t counter(NativeCudaPool& pool) {
     require(count<=pool.plan().capacity,"CUDA-only: match output exceeds Candidate D capacity");
     return count;
 }
-std::array<uint8_t,32> digest_fragments(NativeCudaPool& pool,
-                                        uint64_t const* fragments,uint64_t count) {
+struct FragmentDigests {
+    std::array<uint8_t,32> raw{}, unique{};
+    uint64_t distinct=0;
+};
+FragmentDigests digest_fragments(NativeCudaPool& pool,
+                                 uint64_t const* fragments,uint64_t count) {
     auto& session=pool.session();
+    // Stream sorted T3 output in 8-MiB pinned tiles. SHA256 of the raw
+    // fragment bytes must match earlier validated CUDA-only results.
+    // Canonical single-member .gplot FSE compression removes duplicate
+    // fragments, so also hash a deduplicated monotonic stream. Keep this
+    // second hash separate rather than silently changing the raw one.
     constexpr size_t tile_bytes=8u<<20;
     void* pinned=session.allocate_pinned(tile_bytes);
     BCRYPT_ALG_HANDLE algorithm=nullptr;
-    BCRYPT_HASH_HANDLE hash=nullptr;
+    BCRYPT_HASH_HANDLE raw_hash=nullptr, unique_hash=nullptr;
     try {
         if(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)<0)
             throw std::runtime_error("SHA-256 BCryptOpenAlgorithmProvider failed");
-        if(BCryptCreateHash(algorithm,&hash,nullptr,0,nullptr,0,0)<0)
+        if(BCryptCreateHash(algorithm,&raw_hash,nullptr,0,nullptr,0,0)<0 ||
+           BCryptCreateHash(algorithm,&unique_hash,nullptr,0,nullptr,0,0)<0)
             throw std::runtime_error("SHA-256 BCryptCreateHash failed");
         auto const* src=reinterpret_cast<uint8_t const*>(fragments);
         uint64_t const total_bytes=count*sizeof(uint64_t);
+        uint64_t prev=0,unique_count=0;
+        bool first=true;
         for(uint64_t off=0;off<total_bytes;off+=tile_bytes) {
-            size_t n=size_t(std::min<uint64_t>(tile_bytes,total_bytes-off));
-            session.copy_d2h(pinned,src+off,n);
-            if(BCryptHashData(hash,static_cast<PUCHAR>(pinned),ULONG(n),0)<0)
-                throw std::runtime_error("SHA-256 BCryptHashData failed");
+            size_t bytes=size_t(std::min<uint64_t>(tile_bytes,total_bytes-off));
+            session.copy_d2h(pinned,src+off,bytes);
+            if(BCryptHashData(raw_hash,static_cast<PUCHAR>(pinned),ULONG(bytes),0)<0)
+                throw std::runtime_error("SHA-256 raw BCryptHashData failed");
+            // Compact only within this tile. The global previous-value state
+            // also filters duplicates that straddle adjacent tile boundaries.
+            auto* rows=static_cast<uint64_t*>(pinned);
+            size_t const n=bytes/sizeof(uint64_t);
+            size_t write=0;
+            for(size_t i=0;i<n;++i){
+                uint64_t const v=rows[i];
+                if(!first && v<prev)
+                    throw std::runtime_error("CUDA-only sorted T3 is not monotonic");
+                if(first||v!=prev) {
+                    rows[write++]=v;
+                    ++unique_count;
+                }
+                prev=v;
+                first=false;
+            }
+            if(write && BCryptHashData(unique_hash,reinterpret_cast<PUCHAR>(rows),
+                                       ULONG(write*sizeof(uint64_t)),0)<0)
+                throw std::runtime_error("SHA-256 unique BCryptHashData failed");
         }
-        std::array<uint8_t,32> digest{};
-        if(BCryptFinishHash(hash,digest.data(),ULONG(digest.size()),0)<0)
+        FragmentDigests result{};
+        result.distinct=unique_count;
+        if(BCryptFinishHash(raw_hash,result.raw.data(),ULONG(result.raw.size()),0)<0 ||
+           BCryptFinishHash(unique_hash,result.unique.data(),
+                            ULONG(result.unique.size()),0)<0)
             throw std::runtime_error("SHA-256 BCryptFinishHash failed");
-        (void)BCryptDestroyHash(hash);
-        (void)BCryptCloseAlgorithmProvider(algorithm,0);
-        session.release_pinned(pinned);
-        return digest;
+        (void)BCryptDestroyHash(raw_hash);raw_hash=nullptr;
+        (void)BCryptDestroyHash(unique_hash);unique_hash=nullptr;
+        (void)BCryptCloseAlgorithmProvider(algorithm,0);algorithm=nullptr;
+        session.release_pinned(pinned);pinned=nullptr;
+        return result;
     } catch(...) {
-        if(hash)(void)BCryptDestroyHash(hash);
+        if(raw_hash)(void)BCryptDestroyHash(raw_hash);
+        if(unique_hash)(void)BCryptDestroyHash(unique_hash);
         if(algorithm)(void)BCryptCloseAlgorithmProvider(algorithm,0);
-        session.release_pinned(pinned);
+        if(pinned)session.release_pinned(pinned);
         throw;
     }
 }
@@ -233,12 +269,14 @@ NativeCudaPipelineResult native_cuda_run_k28s6(
         cub_sort_keys_u64(scratch,cub_bytes,
             fragments_in,fragments_out,t3_count,0,56);
         std::fprintf(stderr,"[cuda-only] T3 sorted; hashing fragments...\n");
-        auto const digest=digest_fragments(pool,fragments_out,t3_count);
+        auto const digests=digest_fragments(pool,fragments_out,t3_count);
         NativeCudaPipelineResult result{};
         result.t1_count=t1_count;
         result.t2_count=t2_count;
         result.t3_count=t3_count;
-        result.sha256_fragments=digest;
+        result.sha256_fragments=digests.raw;
+        result.sha256_unique_fragments=digests.unique;
+        result.unique_t3_count=digests.distinct;
         result.seconds=std::chrono::duration<double>(
             std::chrono::steady_clock::now()-started).count();
         session.release_device(table_memory);

@@ -30,8 +30,8 @@ add_executable(native_cuda_smoke
     "${_x2_root}/src/gpu/NativeCudaPipeline.cu"
     "${_x2_root}/src/gpu/NativeCudaPeer.cu"
     "${_x2_root}/src/gpu/NativeCudaTwoLevel.cu")
-target_include_directories(native_cuda_smoke PRIVATE "${_x2_root}/src")
-target_link_libraries(native_cuda_smoke PRIVATE CUDA::cudart)
+target_include_directories(native_cuda_smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${_x2_root}/src")
+target_link_libraries(native_cuda_smoke PRIVATE CUDA::cudart bcrypt)
 target_compile_options(native_cuda_smoke PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 set_target_properties(native_cuda_smoke PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF

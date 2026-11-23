@@ -240,6 +240,39 @@ correctness from the compute-only result alone.
 
 ## Stage 4: native CUDA compute -> existing validated .gplot writer (UNVERIFIED)
 
+### Native CUDA test plots have NO private-key support
+
+At the user's request, the experimental native CUDA Writer bridge is
+**strictly test-only**. The `--native-cuda` option **rejects `-m/--memo`
+regardless of option order**, and the host bridge also rejects nonempty
+`GpuPlotOptions::memo` from non-CLI callers before any GPU execution.
+Only the fixed k28/s6 GPU profile is accepted. The writer embeds its
+existing **112-byte all-zero dummy memo**, which contains no master
+secret and cannot produce a farmable plot.
+
+An RTX 4070 SUPER Stage 4 attempt generated 268596076 raw T3 fragments,
+raw SHA256 `a86509e3a2dd905a2b1d508d7ad357e929ac4eccaf70e50411e44187ff08b422`,
+then failed **after GPU calculation** with a Windows owner-only DACL
+check while saving to a Samba/SMB NAS share. The Writer previously
+treated the all-zero test memo like a private farmer master-key memo.
+That defect has been corrected: only an empty memo or exactly 112
+zero bytes qualify for server-side SMB plot ACLs; any nonzero memo
+continues to require a protected owner-only DACL unless the existing
+explicit SMB trust policy applies. Other storage paths (job manifests,
+private temporary spills) retain their original restrictions.
+
+These security-scope and test-mode changes are committed but **have
+not yet been rebuilt or verified on the user's hardware**. Rebuild the
+hybrid `xchplot2` target, then rerun the same NAS test output path
+and `verify --full --trials 100` before claiming Stage 4 success.
+
+This change does not remove the legacy farmable `plot`/`batch`
+subcommands from the rest of xchplot2, since they have separate user
+interfaces and must not be silently broken while porting the CUDA
+test engine. Native CUDA itself accepts NO secret-bearing memo.
+
+
+
 A new **opt-in, single-plot diagnostic writer bridge** has been
 committed to the Windows CUDA-core branch. It does not change the
 default Plot/Bench/Batch backend or the validated 25.13s/Plot hybrid
